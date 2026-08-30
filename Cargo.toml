@@ -1,0 +1,36 @@
+[package]
+name = "kelpie"
+version = "0.1.0"
+edition = "2024"
+description = "Durable inter-agent coordination over Herdr"
+license = "MIT"
+repository = "https://github.com/dcadenas/kelpie"
+readme = "README.md"
+include = [
+    "src/**/*",
+    "migrations/*.sql",
+    "skills/kelpie/SKILL.md",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "SPEC.md",
+    "docs/**/*",
+    "LICENSE*",
+]
+
+[dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+uuid = { version = "1.24.0", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
