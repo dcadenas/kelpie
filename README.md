@@ -1,5 +1,7 @@
 # Kelpie
 
+[![CI](https://github.com/dcadenas/kelpie/actions/workflows/ci.yml/badge.svg)](https://github.com/dcadenas/kelpie/actions/workflows/ci.yml)
+
 > **Structured messaging semantics for agents running in Herdr.**
 
 [Herdr](https://github.com/herdrdev/herdr) can deliver text to an agent. Kelpie
