@@ -36,10 +36,11 @@ pub fn escape_body(body: &str) -> String {
 /// # Errors
 ///
 /// Returns an error when `from` is empty or unsafe as an unquoted attribute.
-pub fn render_tell(from: &str, body: &str) -> Result<String, EnvelopeError> {
+pub fn render_tell(from: &str, message_id: &str, body: &str) -> Result<String, EnvelopeError> {
     let from = validated_attr("from", from)?;
+    let message_id = validated_attr("msg", message_id)?;
     Ok(format!(
-        "<kelpie from={from}>\n{}\n</kelpie>",
+        "<kelpie from={from} msg={message_id}>\n{}\n</kelpie>",
         escape_body(body)
     ))
 }
@@ -53,7 +54,7 @@ pub fn render_ask(from: &str, reply_to: &str, body: &str) -> Result<String, Enve
     let from = validated_attr("from", from)?;
     let reply_to = validated_attr("reply-to", reply_to)?;
     Ok(format!(
-        "<kelpie from={from} reply-to={reply_to}>\n{}\n</kelpie>",
+        "<kelpie from={from} msg={reply_to} reply-to={reply_to}>\n{}\n</kelpie>",
         escape_body(body)
     ))
 }
@@ -63,11 +64,17 @@ pub fn render_ask(from: &str, reply_to: &str, body: &str) -> Result<String, Enve
 /// # Errors
 ///
 /// Returns an error when any attribute is empty or unsafe unquoted.
-pub fn render_progress(from: &str, re: &str, body: &str) -> Result<String, EnvelopeError> {
+pub fn render_progress(
+    from: &str,
+    re: &str,
+    message_id: &str,
+    body: &str,
+) -> Result<String, EnvelopeError> {
     let from = validated_attr("from", from)?;
     let re = validated_attr("re", re)?;
+    let message_id = validated_attr("msg", message_id)?;
     Ok(format!(
-        "<kelpie from={from} re={re} progress>\n{}\n</kelpie>",
+        "<kelpie from={from} msg={message_id} re={re} progress>\n{}\n</kelpie>",
         escape_body(body)
     ))
 }
@@ -77,25 +84,34 @@ pub fn render_progress(from: &str, re: &str, body: &str) -> Result<String, Envel
 /// # Errors
 ///
 /// Returns an error when any attribute is empty or unsafe unquoted.
-pub fn render_final(from: &str, re: &str, body: &str) -> Result<String, EnvelopeError> {
+pub fn render_final(
+    from: &str,
+    re: &str,
+    message_id: &str,
+    body: &str,
+) -> Result<String, EnvelopeError> {
     let from = validated_attr("from", from)?;
     let re = validated_attr("re", re)?;
+    let message_id = validated_attr("msg", message_id)?;
     Ok(format!(
-        "<kelpie from={from} re={re} final>\n{}\n</kelpie>",
+        "<kelpie from={from} msg={message_id} re={re} final>\n{}\n</kelpie>",
         escape_body(body)
     ))
 }
 
-/// Render a protocol reminder for one unresolved ask.
+/// Render a protocol reminder for one unresolved ask, carrying the original
+/// question: the reminder is the amnesia protocol, and a renewed or restarted
+/// agent must be able to answer without asking the sender to repeat itself.
 ///
 /// # Errors
 ///
 /// Returns an error when the waiting address or ask ID is unsafe.
-pub fn render_reminder(waiting: &str, reply_to: &str) -> Result<String, EnvelopeError> {
+pub fn render_reminder(waiting: &str, reply_to: &str, body: &str) -> Result<String, EnvelopeError> {
     let waiting = validated_attr("waiting", waiting)?;
     let reply_to = validated_attr("reply-to", reply_to)?;
     Ok(format!(
-        "<kelpie-reminder waiting={waiting} reply-to={reply_to}>\nPending final reply. Reply with: kelpie reply {reply_to} --final --file PATH\n</kelpie-reminder>"
+        "<kelpie-reminder waiting={waiting} reply-to={reply_to}>\nPending final reply. Reply with: kelpie reply {reply_to} --final --file PATH\n\nThe question you owe an answer to:\n{}\n</kelpie-reminder>",
+        escape_body(body)
     ))
 }
 
@@ -225,14 +241,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tell_omits_ids_and_escapes_body() {
-        let rendered = render_tell("alice", "hi <bob> & co\n</kelpie>").expect("tell");
+    fn tell_carries_its_message_id_and_escapes_body() {
+        let rendered = render_tell(
+            "alice",
+            "0193abcdef-0123-7890-abcd-ef0123456789",
+            "hi <bob> & co\n</kelpie>",
+        )
+        .expect("tell");
         assert_eq!(
             rendered,
-            "<kelpie from=alice>\nhi &lt;bob&gt; &amp; co\n&lt;/kelpie&gt;\n</kelpie>"
+            "<kelpie from=alice msg=0193abcdef-0123-7890-abcd-ef0123456789>\nhi &lt;bob&gt; &amp; co\n&lt;/kelpie&gt;\n</kelpie>"
         );
+        // A tell has no reply expectation, but it always carries its message id:
+        // the receiver's only dedupe and provenance handle.
         assert!(!rendered.contains("reply-to"));
-        assert!(!rendered.contains("message"));
     }
 
     #[test]
@@ -241,32 +263,37 @@ mod tests {
         let rendered = render_ask("alice", message_id, "please answer").expect("ask");
         assert_eq!(
             rendered,
-            format!("<kelpie from=alice reply-to={message_id}>\nplease answer\n</kelpie>")
+            format!(
+                "<kelpie from=alice msg={message_id} reply-to={message_id}>\nplease answer\n</kelpie>"
+            )
         );
         assert!(!rendered.contains(" kind="));
         assert!(!rendered.contains(" to="));
     }
 
     #[test]
-    fn progress_and_final_use_boolean_flags_and_re() {
+    fn progress_and_final_use_boolean_flags_re_and_msg() {
         let ask_id = "0193abcdef-0123-7890-abcd-ef0123456789";
+        let msg_id = "0193abcdef-ffff-7890-abcd-ef0123456789";
         assert_eq!(
-            render_progress("bob", ask_id, "working").expect("progress"),
-            format!("<kelpie from=bob re={ask_id} progress>\nworking\n</kelpie>")
+            render_progress("bob", ask_id, msg_id, "working").expect("progress"),
+            format!("<kelpie from=bob msg={msg_id} re={ask_id} progress>\nworking\n</kelpie>")
         );
         assert_eq!(
-            render_final("bob", ask_id, "done & dusted").expect("final"),
-            format!("<kelpie from=bob re={ask_id} final>\ndone &amp; dusted\n</kelpie>")
+            render_final("bob", ask_id, msg_id, "done & dusted").expect("final"),
+            format!(
+                "<kelpie from=bob msg={msg_id} re={ask_id} final>\ndone &amp; dusted\n</kelpie>"
+            )
         );
     }
 
     #[test]
-    fn reminder_names_exact_obligation_and_command() {
+    fn reminder_names_exact_obligation_and_command_and_carries_the_question() {
         let ask_id = "0193abcdef-0123-7890-abcd-ef0123456789";
         assert_eq!(
-            render_reminder("coordinator", ask_id).expect("reminder"),
+            render_reminder("coordinator", ask_id, "What changed in the API?").expect("reminder"),
             format!(
-                "<kelpie-reminder waiting=coordinator reply-to={ask_id}>\nPending final reply. Reply with: kelpie reply {ask_id} --final --file PATH\n</kelpie-reminder>"
+                "<kelpie-reminder waiting=coordinator reply-to={ask_id}>\nPending final reply. Reply with: kelpie reply {ask_id} --final --file PATH\n\nThe question you owe an answer to:\nWhat changed in the API?\n</kelpie-reminder>"
             )
         );
     }
@@ -369,9 +396,12 @@ mod tests {
 
     #[test]
     fn unsafe_or_empty_attributes_fail_closed() {
-        assert_eq!(render_tell("", "body"), Err(EnvelopeError::EmptyAttribute));
+        assert_eq!(
+            render_tell("", "msg-id", "body"),
+            Err(EnvelopeError::EmptyAttribute)
+        );
         assert!(matches!(
-            render_tell("alice smith", "body"),
+            render_tell("alice smith", "msg-id", "body"),
             Err(EnvelopeError::UnsafeAttribute(_))
         ));
         assert!(matches!(

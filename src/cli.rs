@@ -97,6 +97,9 @@ pub enum Command {
     NameInfo {
         name: String,
     },
+    AskInfo {
+        ask_id: String,
+    },
     Rename {
         target: Option<Caller>,
         name: String,
@@ -418,6 +421,7 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
         "attribution" => render_attribution(&result),
         "report" => render_report(&result),
         "name.info" => render_name_info(&result),
+        "ask.info" => render_ask_info(&result),
         "rename" => format!(
             "rename name={} agent={} incarnation={}\n",
             field(&result, "public_name"),
@@ -494,6 +498,7 @@ Commands:
   recover
   whoami [alias]
   name-info <alias>
+  ask-info <ask-id>
   attribution [alias] | --pane ID | --agent-id ID | --incarnation-id ID
        [--refresh]
   report [--live] [--active]
@@ -539,6 +544,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         "whoami" => parse_whoami(args),
         "name-info" => parse_name_info(args),
+        "ask-info" => parse_ask_info(args),
         "attribution" => parse_attribution(args),
         "rename" => {
             let mut tokens = Tokens::new(&args[1..]);
@@ -895,6 +901,15 @@ fn parse_whoami(args: &[String]) -> Result<Command, String> {
     let target = take_single_target(&mut tokens, "whoami")?;
     tokens.finish("whoami")?;
     Ok(Command::Whoami { target })
+}
+
+fn parse_ask_info(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let ask_id = tokens
+        .take_positional()
+        .ok_or("usage: kelpie ask-info <ask-id>")?;
+    tokens.finish("ask-info")?;
+    Ok(Command::AskInfo { ask_id })
 }
 
 fn parse_name_info(args: &[String]) -> Result<Command, String> {
@@ -1753,6 +1768,37 @@ fn render_name_info(result: &Value) -> String {
         );
     }
     text.push('\n');
+    text
+}
+
+/// Render ask-info: the durable content of one ask and its parties. This is
+/// the amnesia-recovery read — a renewed agent re-reads what it was asked.
+fn render_ask_info(result: &Value) -> String {
+    let mut text = format!(
+        "ask-info {} state={}",
+        field(result, "ask_message_id"),
+        field(result, "state")
+    );
+    let asker = &result["asker"];
+    let responder = &result["responder"];
+    let _ = write!(
+        text,
+        "\n  asked-by {} ({})\n  responder {} ({})\n  created={} last-activity={}",
+        asker["name"].as_str().unwrap_or("?"),
+        asker["agent_id"].as_str().unwrap_or("?"),
+        responder["name"].as_str().unwrap_or("?"),
+        responder["agent_id"].as_str().unwrap_or("?"),
+        result["created_at_ms"]
+            .as_i64()
+            .map_or("?".into(), format_utc_ms),
+        result["last_activity_at_ms"]
+            .as_i64()
+            .map_or("?".into(), format_utc_ms),
+    );
+    if let Some(reason) = result["cancellation_reason"].as_str() {
+        let _ = write!(text, "\n  cancellation-reason {reason}");
+    }
+    let _ = write!(text, "\n\n{}\n", field(result, "body"));
     text
 }
 

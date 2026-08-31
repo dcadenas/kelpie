@@ -197,6 +197,23 @@ pub struct PendingObligation {
     pub state: ObligationState,
 }
 
+/// One ask's durable content and parties — the amnesia-recovery read: a
+/// renewed or restarted agent re-reads what it was asked through the id its
+/// reminder carries. Read-only.
+#[derive(Debug, Clone)]
+pub struct AskInfo {
+    pub ask_message_id: String,
+    pub body: String,
+    pub asker_agent_id: String,
+    pub asker_name: String,
+    pub responder_agent_id: String,
+    pub responder_name: String,
+    pub state: String,
+    pub created_at_ms: i64,
+    pub last_activity_at_ms: i64,
+    pub cancellation_reason: Option<String>,
+}
+
 /// One of the agent's waits that was cancelled while it had no Ready
 /// incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +247,10 @@ pub struct DueReminder {
     pub pane_id: String,
     pub terminal_id: String,
     pub interval_ms: i64,
+    /// The ask's original question. The reminder is the amnesia protocol: a
+    /// renewed or restarted agent may owe an answer it can no longer remember,
+    /// so the reminder always carries what it was asked.
+    pub body: String,
 }
 
 /// An unanswered ask eligible for stopped-boundary observation.
@@ -3357,6 +3378,82 @@ impl Store {
         Ok((ask_id, reason.to_string()))
     }
 
+    /// Re-read one ask's durable content and parties by its message id — the
+    /// amnesia-recovery read behind a reminder's reply-to id. Read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the id does not name an ask obligation.
+    pub fn ask_info(&self, ask_message_id: MessageId) -> Result<AskInfo, StoreError> {
+        type AskInfoRow = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+        );
+        let row: Option<AskInfoRow> = self
+            .connection
+            .query_row(
+                "SELECT m.body, o.waiting_agent_id, wa.public_name, o.owing_agent_id,
+                            ra.public_name, o.state, o.created_at_ms, o.last_activity_at_ms,
+                            o.cancellation_reason
+                     FROM obligations o
+                     JOIN messages m ON m.id = o.ask_message_id
+                     JOIN logical_agents wa ON wa.id = o.waiting_agent_id
+                     JOIN logical_agents ra ON ra.id = o.owing_agent_id
+                     WHERE o.ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            body,
+            asker_agent_id,
+            asker_name,
+            responder_agent_id,
+            responder_name,
+            state,
+            created,
+            last_activity,
+            reason,
+        )) = row
+        else {
+            return Err(StoreError::Conflict(
+                "ask message does not name an obligation".into(),
+            ));
+        };
+        Ok(AskInfo {
+            ask_message_id: ask_message_id.to_string(),
+            body,
+            asker_agent_id,
+            asker_name,
+            responder_agent_id,
+            responder_name,
+            state,
+            created_at_ms: created,
+            last_activity_at_ms: last_activity,
+            cancellation_reason: reason,
+        })
+    }
+
+    /// Cancellations of this agent's waits that no pane has received, from the
     /// Cancellations of this agent's waits that no pane has received, from the
     /// lifetime of the binding before the current one. Read-only.
     ///
@@ -3631,9 +3728,11 @@ impl Store {
     pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<DueReminder>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
-                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms
+                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
+                    m.body
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
+             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state IN ('open','in_progress')
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -3658,11 +3757,12 @@ impl Store {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         let mut due = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms) = row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, body) = row?;
             due.push(DueReminder {
                 ask_message_id: parse_message_id(&ask)?,
                 owing_agent_id: parse_logical_agent_id(&owing)?,
@@ -3671,6 +3771,7 @@ impl Store {
                 pane_id: pane,
                 terminal_id: terminal,
                 interval_ms,
+                body,
             });
         }
         Ok(due)
@@ -3685,9 +3786,10 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
                     i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
-                    r.saw_working_at_ms IS NOT NULL
+                    r.saw_working_at_ms IS NOT NULL, m.body
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
+             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state = 'open'
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -3714,11 +3816,13 @@ impl Store {
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, bool>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let mut reminders = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working) = row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working, body) =
+                row?;
             reminders.push(BoundaryReminder {
                 reminder: DueReminder {
                     ask_message_id: parse_message_id(&ask)?,
@@ -3728,6 +3832,7 @@ impl Store {
                     pane_id: pane,
                     terminal_id: terminal,
                     interval_ms,
+                    body,
                 },
                 saw_working,
             });

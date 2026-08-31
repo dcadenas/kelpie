@@ -209,6 +209,7 @@ fn build_typed(
         }
         Command::Recover => Ok(("recover".into(), json!({}))),
         Command::NameInfo { name } => Ok(("name.info".into(), json!({ "name": name }))),
+        Command::AskInfo { ask_id } => Ok(("ask.info".into(), json!({ "ask_message_id": ask_id }))),
         Command::Whoami { target } => {
             let caller = target
                 .or_else(env_caller)

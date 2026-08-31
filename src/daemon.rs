@@ -470,6 +470,7 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
         "reply" => dispatch_reply(request.params, kelpie),
         "pending" => dispatch_pending(request.params, kelpie),
         "name.info" => dispatch_name_info(request.params, kelpie),
+        "ask.info" => dispatch_ask_info(request.params, kelpie),
         "attribution" => dispatch_attribution(request.params, kelpie),
         "report" => dispatch_report(request.params, kelpie),
         "rename" => dispatch_rename(request.params, kelpie),
@@ -598,6 +599,30 @@ fn dispatch_whoami(
             "public_name": identity.public_name
         })
     })
+}
+
+/// Re-read one ask's durable content and parties by its message id — the
+/// amnesia-recovery read behind a reminder's reply-to id. Read-only.
+fn dispatch_ask_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<AskInfoParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let info = kelpie.ask_info(params.ask_message_id)?;
+    Ok(serde_json::json!({
+        "ask_message_id": info.ask_message_id,
+        "body": info.body,
+        "asker": {
+            "agent_id": info.asker_agent_id,
+            "name": info.asker_name,
+        },
+        "responder": {
+            "agent_id": info.responder_agent_id,
+            "name": info.responder_name,
+        },
+        "state": info.state,
+        "created_at_ms": info.created_at_ms,
+        "last_activity_at_ms": info.last_activity_at_ms,
+        "cancellation_reason": info.cancellation_reason,
+    }))
 }
 
 /// Report every logical agent holding a public name and every unresolved ask
@@ -1480,6 +1505,11 @@ struct WhoamiParams {
 #[derive(Debug, Deserialize)]
 struct PendingParams {
     agent_id: LogicalAgentId,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskInfoParams {
+    ask_message_id: MessageId,
 }
 
 #[derive(Debug, Deserialize)]

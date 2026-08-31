@@ -191,7 +191,15 @@ fn typed_tell_file_body_preserves_metacharacters_and_does_not_need_jq() {
     assert!(stdout.contains("delivery=accepted"), "{stdout}");
     assert!(!stdout.contains('`'));
     let prompt = prompt_rx.recv().expect("prompt");
-    assert_eq!(prompt, envelope::render_tell("alice", body).expect("env"));
+    let message_id = stdout
+        .split("message=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("receipt carries the message id");
+    assert_eq!(
+        prompt,
+        envelope::render_tell("alice", message_id, body).expect("env")
+    );
     server.join().expect("server");
     herdr.join().expect("herdr");
 }
@@ -224,7 +232,15 @@ fn typed_tell_stdin_preserves_metacharacters_to_herdr() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("delivery=accepted"), "{stdout}");
     let prompt = prompt_rx.recv().expect("prompt");
-    assert_eq!(prompt, envelope::render_tell("alice", body).expect("env"));
+    let message_id = stdout
+        .split("message=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("receipt carries the message id");
+    assert_eq!(
+        prompt,
+        envelope::render_tell("alice", message_id, body).expect("env")
+    );
     assert!(prompt.contains("`ls`"));
     assert!(prompt.contains("$(ls)"));
     assert!(prompt.contains("\"quotes\""));

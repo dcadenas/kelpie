@@ -559,6 +559,7 @@ fn prompt_spacing_includes_submitted_reminders() {
         pane_id: "w:p1".into(),
         terminal_id: "term-1".into(),
         interval_ms: 60_000,
+        body: "question".into(),
     };
     let reminder_started_at_ms = store_clock_ms().expect("clock") + 61_000;
     store

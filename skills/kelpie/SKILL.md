@@ -136,6 +136,10 @@ out, having held the answer the whole time.
 - `kelpie pending` lists asks you owe, then any of your asks cancelled while
   you had no Ready binding (state `cancelled`, with the reason). It does not
   list tells.
+- A `<kelpie-reminder …>` for an ask you don't remember is the amnesia
+  protocol: your context was replaced but the obligation is real, and the
+  reminder carries the original question. `kelpie ask-info <ask-id>` re-reads
+  the full ask any time. Answer it or cancel it — never ignore it.
 
 ## Writing renew prompts
 

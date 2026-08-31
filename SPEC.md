@@ -286,7 +286,11 @@ initial reminder before the interval when no reply activity has occurred.
 Progress and final-reply activity reset its interval. An
 unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
 a reminder MUST NOT resolve its obligation. Reminders are not cron and MUST NOT
-require receiver acknowledgement. Cancel of a scheduled delivery is legal only
+require receiver acknowledgement. Every reminder MUST carry the original ask
+body: the obligation is durable while the owing agent's context may have been
+replaced by a renew, a restart, or a clear, so the reminder is the amnesia
+protocol — the agent must be able to answer what it was asked without asking
+the sender to repeat itself. Cancel of a scheduled delivery is legal only
 before the first Herdr write. After submit, existing no-resend and unknown
 rules apply. The due clock is Unix epoch milliseconds from the host
 `SystemTime`. A delivery is due when `now_ms >= scheduled_at_ms`. A due time
@@ -586,6 +590,8 @@ Kelpie MUST expose semantic operations equivalent to:
 - `ask(recipient, payload)`;
 - `reply(message_id, payload, progress|final)`;
 - `pending(agent)`;
+- `ask-info(message_id)` — read-only re-read of one ask's durable body,
+  parties, and state, through the id its reminder carries;
 - `cancel(message_id, reason)` where authorization permits it.
 
 Cancelling an ask settles its obligation `cancelled` with the stated reason,
