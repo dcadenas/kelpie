@@ -73,6 +73,7 @@ fn real_herdr_start_ask_and_correlated_reply() {
     kelpie
         .reply(
             ask.message_id,
+            started.logical_agent_id,
             "explicit integration completion",
             ReplyDisposition::Final,
             &format!("real-final-{}", uuid::Uuid::now_v7()),

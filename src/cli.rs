@@ -67,6 +67,7 @@ pub enum Command {
     },
     Reply {
         reply_to: String,
+        requester: Option<Caller>,
         body: BodySource,
         disposition: &'static str,
         idempotency_key: Option<String>,
@@ -859,6 +860,7 @@ fn parse_reply(args: &[String]) -> Result<Command, String> {
     let final_ = tokens.take_bool("--final")?;
     let body = take_body(&mut tokens, "reply")?;
     let idempotency_key = tokens.take_value("--idempotency-key")?;
+    let requester = take_caller(&mut tokens)?;
     let reply_to = tokens
         .take_positional()
         .ok_or("usage: kelpie reply <ask-id> --progress|--final --stdin|--file|--body")?;
@@ -870,6 +872,7 @@ fn parse_reply(args: &[String]) -> Result<Command, String> {
     };
     Ok(Command::Reply {
         reply_to,
+        requester,
         body,
         disposition,
         idempotency_key,

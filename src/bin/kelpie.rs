@@ -186,18 +186,23 @@ fn build_typed(
         })),
         Command::Reply {
             reply_to,
+            requester,
             body,
             disposition,
             idempotency_key,
-        } => Ok((
-            "reply".into(),
-            json!({
-                "reply_to": reply_to,
-                "body": read_body(&body, &mut io::stdin())?,
-                "disposition": disposition,
-                "idempotency_key": idempotency_key.unwrap_or_else(generated_id),
-            }),
-        )),
+        } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            Ok((
+                "reply".into(),
+                json!({
+                    "reply_to": reply_to,
+                    "requester_agent_id": agent,
+                    "body": read_body(&body, &mut io::stdin())?,
+                    "disposition": disposition,
+                    "idempotency_key": idempotency_key.unwrap_or_else(generated_id),
+                }),
+            ))
+        }
         Command::Pending { target } => {
             let agent = resolve_caller(socket, target, request_id)?.0;
             Ok(("pending".into(), json!({"agent_id": agent})))

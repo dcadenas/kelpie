@@ -243,8 +243,10 @@ It MUST contain:
 
 A progress reply MUST refresh activity and set `in_progress`; it MUST NOT resolve
 the obligation. A final reply MUST resolve only the exact obligation named by
-`reply_to`. A reply from the wrong sender or to the wrong message MUST NOT clear
-another obligation.
+`reply_to`. A reply MUST be accepted only from the obligation's owing agent; a
+reply from the asker or any third party MUST be refused without mutating the
+obligation or delivering anything. A reply from the wrong sender or to the wrong
+message MUST NOT clear another obligation.
 
 Progress and final replies are durable messages with their own delivery attempts
 to the waiting logical agent. Kelpie MUST resolve the owing and waiting agents
@@ -918,6 +920,7 @@ application workflow policy, a general workflow engine, or a graphical UI.
 | A cancel never abandons an injection | Cancel a policy whose cycle is clearing and verify it is refused, the cycle still completes its resume prompt, and the refusal says to retry after the cycle. |
 | A cancellation reaches the asker | Cancel an ask whose asker is Ready and verify a Kelpie-authored `cancellation` message names the reason in the asker's pane, with the obligation `cancelled`, not `resolved`. |
 | A cancellation outlives the asker | Cancel an ask whose asker has no Ready incarnation, then re-adopt that asker and verify pending surfaces the cancellation with its reason and never attributes it to the responder; verify a cancellation whose response was already accepted into a pane does not re-surface. |
+| Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
 
 Tests SHOULD use deterministic fake Herdr protocol fixtures for state-machine
 coverage and real Herdr integration tests for transport, lifecycle, and failure

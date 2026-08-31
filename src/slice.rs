@@ -2133,14 +2133,18 @@ impl Kelpie {
     pub fn reply(
         &mut self,
         reply_to: MessageId,
+        requester_agent_id: LogicalAgentId,
         body: &str,
         disposition: ReplyDisposition,
         idempotency_key: &str,
     ) -> Result<CreatedReply, SliceError> {
-        let recipient_incarnation = self.store.reply_recipient_incarnation(reply_to)?;
+        let recipient_incarnation = self
+            .store
+            .reply_recipient_incarnation(reply_to, requester_agent_id)?;
         let (due_at_ms, defer) = self.prompt_schedule(recipient_incarnation, None)?;
         let created = self.store.create_reply_with_due(
             reply_to,
+            requester_agent_id,
             body,
             disposition,
             idempotency_key,
@@ -4563,6 +4567,7 @@ mod tests {
         let reply = kelpie
             .reply(
                 ask.message_id,
+                started.logical_agent_id,
                 "complete",
                 ReplyDisposition::Final,
                 "final-e2e",

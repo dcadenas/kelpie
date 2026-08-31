@@ -1238,6 +1238,7 @@ fn dispatch_reply(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceErro
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let created = kelpie.reply(
         params.reply_to,
+        params.requester_agent_id,
         &params.body,
         params.disposition,
         &params.idempotency_key,
@@ -1460,6 +1461,7 @@ struct RenewCancelParams {
 #[derive(Debug, Deserialize)]
 struct ReplyParams {
     reply_to: MessageId,
+    requester_agent_id: LogicalAgentId,
     body: String,
     disposition: ReplyDisposition,
     idempotency_key: String,
@@ -1906,6 +1908,7 @@ mod tests {
         let created = store
             .create_reply(
                 resolved.message_id,
+                owing.logical_agent_id,
                 "done",
                 ReplyDisposition::Final,
                 "socket-resolve",

@@ -1836,11 +1836,19 @@ impl Store {
     pub fn create_reply(
         &mut self,
         reply_to: MessageId,
+        requester_agent_id: LogicalAgentId,
         body: &str,
         disposition: ReplyDisposition,
         idempotency_key: &str,
     ) -> Result<CreatedReply, StoreError> {
-        self.create_reply_with_due(reply_to, body, disposition, idempotency_key, None)
+        self.create_reply_with_due(
+            reply_to,
+            requester_agent_id,
+            body,
+            disposition,
+            idempotency_key,
+            None,
+        )
     }
 
     /// Persist a reply for immediate or delayed delivery.
@@ -1852,6 +1860,7 @@ impl Store {
     pub fn create_reply_with_due(
         &mut self,
         reply_to: MessageId,
+        requester_agent_id: LogicalAgentId,
         body: &str,
         disposition: ReplyDisposition,
         idempotency_key: &str,
@@ -1881,6 +1890,11 @@ impl Store {
         let waiting_agent = LogicalAgentId::parse(&waiting).ok_or_else(|| {
             StoreError::InvalidRecord(format!("invalid waiting agent id {waiting}"))
         })?;
+        if requester_agent_id.to_string() != owing {
+            return Err(StoreError::Conflict(
+                "requester does not own the obligation".into(),
+            ));
+        }
         let recipient_incarnation = ready_incarnation_for_agent(&tx, waiting_agent)?;
         tx.execute(
             "INSERT INTO messages
@@ -1969,19 +1983,35 @@ impl Store {
     pub fn reply_recipient_incarnation(
         &self,
         reply_to: MessageId,
+        requester_agent_id: LogicalAgentId,
     ) -> Result<IncarnationId, StoreError> {
-        let waiting: Option<String> = self
+        let parties: Option<(String, String)> = self
             .connection
             .query_row(
-                "SELECT waiting_agent_id FROM obligations
+                "SELECT waiting_agent_id, owing_agent_id FROM obligations
                  WHERE ask_message_id = ?1 AND state IN ('open','in_progress')",
                 [reply_to.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let waiting = waiting.ok_or_else(|| {
-            StoreError::Conflict("reply_to does not name an open obligation".into())
-        })?;
+        let Some((waiting, owing)) = parties else {
+            return Err(StoreError::Conflict(
+                "reply_to does not name an open obligation".into(),
+            ));
+        };
+        // A reply is the owing agent's verb. The asker replying to its own ask
+        // would have its words delivered back to itself attributed to the
+        // owing agent — forged provenance — so it is refused outright.
+        if requester_agent_id.to_string() != owing {
+            let owing_name =
+                self.agent_address(LogicalAgentId::parse(&owing).ok_or_else(|| {
+                    StoreError::InvalidRecord(format!("invalid owing agent id {owing}"))
+                })?)?;
+            return Err(StoreError::Conflict(format!(
+                "only the owing agent can reply to this ask; it is owed by {owing_name} \
+                 (agent {owing}) — to send the asker information, use `kelpie tell`"
+            )));
+        }
         let waiting = parse_logical_agent_id(&waiting)?;
         ready_incarnation_for_agent(&self.connection, waiting)
     }
@@ -7196,13 +7226,14 @@ mod tests {
     fn deliver_reply(
         store: &mut Store,
         reply_to: MessageId,
+        requester: LogicalAgentId,
         body: &str,
         disposition: ReplyDisposition,
         key: &str,
         waiting_terminal: &str,
     ) -> CreatedReply {
         let created = store
-            .create_reply(reply_to, body, disposition, key)
+            .create_reply(reply_to, requester, body, disposition, key)
             .expect("create reply");
         store
             .begin_attempt(
@@ -7641,6 +7672,7 @@ mod tests {
         );
         let wrong_target = store.create_reply(
             MessageId::new(),
+            owing.logical_agent_id,
             "wrong target",
             ReplyDisposition::Final,
             "wrong-target",
@@ -7649,6 +7681,7 @@ mod tests {
         let progress = deliver_reply(
             &mut store,
             ask.message_id,
+            owing.logical_agent_id,
             "working",
             ReplyDisposition::Progress,
             "progress-1",
@@ -7675,6 +7708,7 @@ mod tests {
         let pending_final = store
             .create_reply(
                 ask.message_id,
+                owing.logical_agent_id,
                 "done",
                 ReplyDisposition::Final,
                 "final-pending",
@@ -8297,6 +8331,7 @@ mod tests {
         deliver_reply(
             &mut store,
             resolved.message_id,
+            owing.logical_agent_id,
             "done",
             ReplyDisposition::Final,
             "resolve-before-cancel",
@@ -8379,6 +8414,7 @@ mod tests {
         deliver_reply(
             &mut store,
             ask.message_id,
+            owing.logical_agent_id,
             "working",
             ReplyDisposition::Progress,
             "progress-cancel-progress",
@@ -9411,6 +9447,7 @@ mod tests {
         deliver_reply(
             &mut store,
             ask.message_id,
+            owing.logical_agent_id,
             "done",
             ReplyDisposition::Final,
             "stale-final",
@@ -9418,6 +9455,7 @@ mod tests {
         );
         let stale = store.create_reply(
             ask.message_id,
+            owing.logical_agent_id,
             "again",
             ReplyDisposition::Final,
             "stale-again",
@@ -9425,6 +9463,7 @@ mod tests {
         assert!(matches!(stale, Err(StoreError::Conflict(_))));
         let missing = store.create_reply(
             MessageId::new(),
+            owing.logical_agent_id,
             "nope",
             ReplyDisposition::Progress,
             "missing-ask",
@@ -9454,6 +9493,7 @@ mod tests {
         let rejected = store
             .create_reply(
                 ask.message_id,
+                owing.logical_agent_id,
                 "done",
                 ReplyDisposition::Final,
                 "final-reject",
@@ -9491,6 +9531,7 @@ mod tests {
         let unknown = store
             .create_reply(
                 ask.message_id,
+                owing.logical_agent_id,
                 "done again",
                 ReplyDisposition::Final,
                 "final-unknown",
@@ -9555,6 +9596,7 @@ mod tests {
             .expect("ask");
         let missing = store.create_reply(
             ask.message_id,
+            owing.logical_agent_id,
             "body",
             ReplyDisposition::Progress,
             "no-ready-progress",
@@ -10049,6 +10091,71 @@ mod tests {
         assert!(
             fresh.to_string().contains("a live Herdr agent may hold"),
             "{fresh}"
+        );
+    }
+
+    #[test]
+    fn reply_is_refused_from_anyone_but_the_owing_agent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-waiting", "reply-owner-waiting"))
+            .expect("declare waiting");
+        let owing = store
+            .declare_start(&intent("owing", "term-owing", "reply-owner-owing"))
+            .expect("declare owing");
+        mark_ready(&mut store, waiting, "waiting", "term-waiting");
+        mark_ready(&mut store, owing, "owing", "term-owing");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "reply-owner-ask",
+            )
+            .expect("ask");
+
+        // The asker replying to its own ask would have its words attributed to
+        // the owing agent and delivered back to itself — forged provenance.
+        let self_reply = store.create_reply_with_due(
+            ask.message_id,
+            waiting.logical_agent_id,
+            "my own words as if the responder sent them",
+            ReplyDisposition::Progress,
+            "self-reply",
+            None,
+        );
+        assert!(matches!(self_reply, Err(StoreError::Conflict(_))));
+
+        // A third party is refused identically.
+        let third_reply = store.create_reply_with_due(
+            ask.message_id,
+            LogicalAgentId::new(),
+            "unrelated commentary",
+            ReplyDisposition::Progress,
+            "third-reply",
+            None,
+        );
+        assert!(matches!(third_reply, Err(StoreError::Conflict(_))));
+
+        // The obligation is untouched by both refusals, and the owing agent
+        // can still reply.
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("state"),
+            ObligationState::Open
+        );
+        assert!(
+            store
+                .create_reply_with_due(
+                    ask.message_id,
+                    owing.logical_agent_id,
+                    "the actual answer",
+                    ReplyDisposition::Final,
+                    "owed-reply",
+                    None,
+                )
+                .is_ok()
         );
     }
 

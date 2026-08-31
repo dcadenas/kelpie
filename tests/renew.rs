@@ -160,6 +160,7 @@ fn settled_prepare(
     let reply = store
         .create_reply(
             ask.message_id,
+            worker.logical_agent_id,
             "checkpoint written",
             kelpie::domain::ReplyDisposition::Final,
             &format!("reply:{renew_id}"),
@@ -1672,6 +1673,7 @@ fn a_cycle_completes_when_the_agent_that_armed_it_is_gone() {
     let reply = kelpie
         .reply(
             ask,
+            coordinator.logical_agent_id,
             "checkpoint written",
             kelpie::domain::ReplyDisposition::Final,
             "prepare-reply",

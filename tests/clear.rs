@@ -400,6 +400,7 @@ fn on_clear_rotation_wait_does_not_block_an_unrelated_client() {
                 "method": "reply",
                 "params": {
                     "reply_to": ask.message_id,
+                    "requester_agent_id": worker.logical_agent_id,
                     "body": "final answer",
                     "disposition": "final",
                     "idempotency_key": "reply-during-clear",

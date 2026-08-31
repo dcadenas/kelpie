@@ -8,7 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 
 use kelpie::domain::{
-    InitialMessageIntent, InitialMessageKind, MessageId, ObligationState, Parent, StartIntent,
+    InitialMessageIntent, InitialMessageKind, LogicalAgentId, MessageId, ObligationState, Parent,
+    StartIntent,
 };
 use kelpie::herdr::AgentObservation;
 use kelpie::store::{DeclaredStart, Store};
@@ -279,7 +280,11 @@ fn accept_parsed(listener: &UnixListener, expected: &str) {
     assert_eq!(line.trim_end(), expected);
 }
 
-fn send_final_reply(socket: &Path, ask_message_id: MessageId) -> thread::JoinHandle<Vec<u8>> {
+fn send_final_reply(
+    socket: &Path,
+    owing: LogicalAgentId,
+    ask_message_id: MessageId,
+) -> thread::JoinHandle<Vec<u8>> {
     let socket = socket.to_path_buf();
     thread::spawn(move || {
         let mut stream = UnixStream::connect(socket).expect("connect Kelpie client");
@@ -290,6 +295,7 @@ fn send_final_reply(socket: &Path, ask_message_id: MessageId) -> thread::JoinHan
                 "method":"reply",
                 "params":{
                     "reply_to":ask_message_id,
+                    "requester_agent_id":owing,
                     "body":"final answer",
                     "disposition":"final",
                     "idempotency_key":"fault-final"
@@ -412,7 +418,7 @@ fn kill_after_reply_submitted_recovers_unknown_without_resend_and_keeps_obligati
     );
     let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
     bound.write_all(b"x").expect("release daemon startup");
-    let client = send_final_reply(&kelpie_socket, ask_message_id);
+    let client = send_final_reply(&kelpie_socket, owing.logical_agent_id, ask_message_id);
     let submitted = accept_point(&fault_listener, REPLY_SUBMITTED);
     first_daemon.kill().expect("kill first kelpied");
     first_daemon.wait().expect("reap first kelpied");
@@ -461,7 +467,7 @@ fn kill_after_reply_write_recovers_unknown_without_resend_and_keeps_obligation_o
     );
     let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
     bound.write_all(b"x").expect("release daemon startup");
-    let client = send_final_reply(&kelpie_socket, ask_message_id);
+    let client = send_final_reply(&kelpie_socket, owing.logical_agent_id, ask_message_id);
     accept_parsed(&parsed_listener, "reply parsed");
     let written = accept_point(&fault_listener, REPLY_WRITTEN);
     first_daemon.kill().expect("kill first kelpied");
@@ -499,7 +505,7 @@ fn kill_after_reply_acceptance_recovers_unknown_without_resend_and_keeps_obligat
     );
     let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
     bound.write_all(b"x").expect("release daemon startup");
-    let client = send_final_reply(&kelpie_socket, ask_message_id);
+    let client = send_final_reply(&kelpie_socket, owing.logical_agent_id, ask_message_id);
     let responded = accept_point(&fault_listener, REPLY_RESPONDED);
     first_daemon.kill().expect("kill first kelpied");
     first_daemon.wait().expect("reap first kelpied");

@@ -126,7 +126,10 @@ out, having held the answer the whole time.
   message. Answering only in the Grok or Codex pane does not notify the sender.
 - `<kelpie from=alice reply-to=ID>` is an ask. You owe
   `kelpie reply ID --progress` while working and `kelpie reply ID --final`
-  when done. That is the only reply the sender can correlate.
+  when done. That is the only reply the sender can correlate. Only the agent
+  that owes the ask can reply to it — replying to an ask you asked will be
+  refused. To push new information to another agent mid-task, `kelpie tell`
+  them.
 - `<kelpie-system cancellation waiting=… cancelled-ask=…>` is Kelpie's own
   notice that one of your asks was cancelled, with the reason. No reply is
   owed; re-ask whoever holds the name now if the question still matters.

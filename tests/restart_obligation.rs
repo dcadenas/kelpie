@@ -227,6 +227,7 @@ fn open_ask_survives_kelpie_and_herdr_restart_then_resolves() {
             "method":"reply",
             "params":{
                 "reply_to":ask.message_id,
+                "requester_agent_id":owing.logical_agent_id,
                 "body":"resolved after restart",
                 "disposition":ReplyDisposition::Final,
                 "idempotency_key":"restart-final"
