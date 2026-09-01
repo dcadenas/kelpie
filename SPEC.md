@@ -181,7 +181,9 @@ name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
 Start, adopt, and rename MUST refuse a name a socket waiter holds. Alias
 resolution MUST fail closed when more than one agent could match. Snapshot
 absence MUST NOT release a socket waiter's name. That name is released only by
-an explicit end of that LogicalAgent as a delivery target.
+an explicit end of that LogicalAgent as a delivery target. The operation that
+ends that targeting is part of pane-less identity, not of this transport
+contract.
 
 ### Incarnation
 
