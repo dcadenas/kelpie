@@ -181,9 +181,21 @@ name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
 Start, adopt, and rename MUST refuse a name a socket waiter holds. Alias
 resolution MUST fail closed when more than one agent could match. Snapshot
 absence MUST NOT release a socket waiter's name. That name is released only by
-an explicit end of that LogicalAgent as a delivery target. The operation that
-ends that targeting is part of pane-less identity, not of this transport
-contract.
+`waiter.retire`, which ends that LogicalAgent as a delivery target. `delivery_transport`
+MUST remain `socket_inbox` after that end. Start-continue and adopt MUST still
+refuse the agent.
+
+`waiter.register` MUST create that pane-less LogicalAgent. The request MUST
+contain a public name, explicit parent or parentless marker, and an idempotency
+key. It MUST NOT contain a pane, terminal, backend, or incarnation. Replay of
+the same idempotency key MUST return the same logical-agent id. The result is
+the logical-agent id. Creating it MUST NOT insert an incarnation.
+
+On `ask`, `from_operator` is message-sender attribution only. The obligation's
+`waiting_agent_id` MUST be the waiter LogicalAgent named as `sender`. Occupant
+envelopes MUST use `from=` equal to that waiter's public name, never `operator`
+and never a relay pubkey. `from_operator` MUST be refused unless that waiting
+agent's `delivery_transport` is `socket_inbox`.
 
 ### Incarnation
 
@@ -696,7 +708,8 @@ potentially ambiguous.
 
 ## Local client protocol
 
-Command RPCs (`tell`, `ask`, `reply`, and the other methods) MAY use one
+Command RPCs (`tell`, `ask`, `reply`, `waiter.register`, `waiter.retire`, and
+the other methods) MAY use one
 newline-delimited JSON request per connection.
 
 That one-shot RPC MUST NOT be the receive path for `socket_inbox` deliveries.

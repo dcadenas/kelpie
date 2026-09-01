@@ -157,6 +157,25 @@ pub enum ObligationState {
     Orphaned,
 }
 
+/// Local delivery client for one logical agent, fixed at creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryTransport {
+    /// Herdr prompt into a Ready pane incarnation.
+    HerdrPrompt,
+    /// Pane-less socket inbox addressed by logical-agent id.
+    SocketInbox,
+}
+
+impl DeliveryTransport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::HerdrPrompt => "herdr_prompt",
+            Self::SocketInbox => "socket_inbox",
+        }
+    }
+}
+
 /// Outcome of one terminal-input delivery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

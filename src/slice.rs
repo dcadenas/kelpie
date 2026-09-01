@@ -996,6 +996,7 @@ impl Kelpie {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
         remind_after_ms: Option<i64>,
+        operator_attributed: bool,
     ) -> Result<CreatedAsk, SliceError> {
         let _binding = self.store.ready_binding(recipient_incarnation)?;
         let (effective_due_at_ms, defer) =
@@ -1008,6 +1009,7 @@ impl Kelpie {
             idempotency_key,
             effective_due_at_ms,
             remind_after_ms,
+            operator_attributed,
         )?;
         if defer {
             return Ok(ask);
@@ -1516,6 +1518,7 @@ impl Kelpie {
             &format!("kelpie:renew:prepare:{}", item.renew_id),
             None,
             Some(item.prepare_timeout_ms),
+            false,
         )?;
         // Durable before the write: a crash here leaves a renew that recovery
         // can resume, not an agent holding an ask nobody is waiting on.
@@ -4600,6 +4603,7 @@ mod tests {
                 "ask-e2e",
                 None,
                 None,
+                false,
             )
             .expect("ask path");
         let reply = kelpie

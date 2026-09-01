@@ -87,6 +87,7 @@ fn accepted_reminder_ask(
             "reminder-ask",
             None,
             Some(interval_ms),
+            false,
         )
         .expect("ask");
     store

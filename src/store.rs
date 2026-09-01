@@ -8,14 +8,14 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
 use crate::domain::{
-    DeliveryOutcome, IncarnationId, IncarnationState, InitialMessageKind, LogicalAgentId,
-    MessageId, MessageKind, ObligationState, OperationId, OperationOutcome, OperatorNoticeId,
-    Parent, RenewId, RenewIntent, RenewPhase, RenewStep, RenewTimeout, ReplyDisposition,
-    StartIntent,
+    DeliveryOutcome, DeliveryTransport, IncarnationId, IncarnationState, InitialMessageKind,
+    LogicalAgentId, MessageId, MessageKind, ObligationState, OperationId, OperationOutcome,
+    OperatorNoticeId, Parent, RenewId, RenewIntent, RenewPhase, RenewStep, RenewTimeout,
+    ReplyDisposition, StartIntent,
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// Host wall clock used for due comparison, in Unix epoch milliseconds.
 ///
@@ -105,6 +105,12 @@ pub struct NameInfo {
 pub struct CreatedAsk {
     pub message_id: MessageId,
     pub operation_id: OperationId,
+}
+
+/// IDs atomically created for a pane-less socket waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedWaiter {
+    pub logical_agent_id: LogicalAgentId,
 }
 
 /// IDs atomically created for one tell and its delivery operation.
@@ -490,6 +496,7 @@ impl Store {
         let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
+        refuse_name_held_by_socket_waiter(&tx, &intent.public_name)?;
         let logical_agent_id = if let Some(existing) = intent.logical_agent_id {
             let found: Option<String> = tx
                 .query_row(
@@ -503,6 +510,7 @@ impl Store {
                     "logical agent to continue does not exist".into(),
                 ));
             }
+            refuse_pane_bind_of_socket_inbox(&tx, existing)?;
             // Public names are live aliases attached to the current occupant.
             tx.execute(
                 "UPDATE logical_agents SET public_name = ?1 WHERE id = ?2",
@@ -516,6 +524,7 @@ impl Store {
                 logical_agent_id,
                 &intent.public_name,
                 intent.parent,
+                DeliveryTransport::HerdrPrompt,
                 now,
             )?;
             logical_agent_id
@@ -688,6 +697,7 @@ impl Store {
                 "ready alias {public_name} is already bound to incarnation {existing}"
             )));
         }
+        refuse_name_held_by_socket_waiter(&tx, &public_name)?;
         if intent.logical_agent_id.is_none() {
             // A create-new adopt under a name a prior logical agent still holds
             // unresolved obligations under would strand them: the new identity
@@ -713,6 +723,7 @@ impl Store {
                     "logical agent to continue does not exist".into(),
                 ));
             }
+            refuse_pane_bind_of_socket_inbox(&tx, existing)?;
             tx.execute(
                 "UPDATE logical_agents SET public_name = ?1 WHERE id = ?2",
                 params![public_name, existing.to_string()],
@@ -720,7 +731,14 @@ impl Store {
             existing
         } else {
             let logical_agent_id = LogicalAgentId::new();
-            insert_logical_agent(&tx, logical_agent_id, &public_name, intent.parent, now)?;
+            insert_logical_agent(
+                &tx,
+                logical_agent_id,
+                &public_name,
+                intent.parent,
+                DeliveryTransport::HerdrPrompt,
+                now,
+            )?;
             logical_agent_id
         };
         let intent_json = serde_json::json!({
@@ -1589,6 +1607,201 @@ impl Store {
         })
     }
 
+    /// Register a pane-less `LogicalAgent` as a socket-inbox waiter.
+    ///
+    /// Creates no incarnation and no pane occupant. The public name is held until
+    /// [`Store::end_socket_waiter`] releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict for an illegal name, a name already held by a Ready
+    /// alias or another socket waiter, a missing parent, or a reused
+    /// idempotency key bound to a different waiter.
+    pub fn register_socket_waiter(
+        &mut self,
+        public_name: &str,
+        parent: Parent,
+        idempotency_key: &str,
+    ) -> Result<CreatedWaiter, StoreError> {
+        if !crate::name::valid_herdr_name(public_name) {
+            return Err(StoreError::InvalidRecord(format!(
+                "{public_name} is not a legal Herdr agent name"
+            )));
+        }
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        let replay: Option<String> = tx
+            .query_row(
+                "SELECT logical_agent_id FROM socket_waiter_keys WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = replay {
+            let logical_agent_id = LogicalAgentId::parse(&existing).ok_or_else(|| {
+                StoreError::InvalidRecord(format!("invalid waiter id {existing}"))
+            })?;
+            tx.commit()?;
+            return Ok(CreatedWaiter { logical_agent_id });
+        }
+        refuse_name_held_by_socket_waiter(&tx, public_name)?;
+        let ready: Option<String> = tx
+            .query_row(
+                "SELECT i.id FROM incarnations i
+                 JOIN logical_agents l ON l.id = i.logical_agent_id
+                 WHERE i.state = 'ready' AND l.public_name = ?1",
+                [public_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = ready {
+            return Err(StoreError::Conflict(format!(
+                "ready alias {public_name} is already bound to incarnation {existing}"
+            )));
+        }
+        if let Parent::Agent(parent_id) = parent {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM logical_agents WHERE id = ?1)",
+                [parent_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::Conflict(
+                    "parent logical agent does not exist".into(),
+                ));
+            }
+        }
+        let logical_agent_id = LogicalAgentId::new();
+        insert_logical_agent(
+            &tx,
+            logical_agent_id,
+            public_name,
+            parent,
+            DeliveryTransport::SocketInbox,
+            now,
+        )?;
+        tx.execute(
+            "INSERT INTO socket_waiter_keys (idempotency_key, logical_agent_id) VALUES (?1, ?2)",
+            params![idempotency_key, logical_agent_id.to_string()],
+        )
+        .map_err(map_constraint)?;
+        tx.commit()?;
+        Ok(CreatedWaiter { logical_agent_id })
+    }
+
+    /// End a socket waiter as a delivery target and release its public name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the agent is not an active socket waiter.
+    pub fn end_socket_waiter(
+        &mut self,
+        logical_agent_id: LogicalAgentId,
+    ) -> Result<(), StoreError> {
+        let now = now_millis()?;
+        let changed = self.connection.execute(
+            "UPDATE logical_agents
+             SET targeting_ended_at_ms = ?1
+             WHERE id = ?2
+               AND delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL",
+            params![now, logical_agent_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "logical agent {logical_agent_id} is not an active socket waiter"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record one socket-inbox delivery named by waiter agent, not incarnation.
+    ///
+    /// Persist is not acceptance. Callers pass the observed outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the waiter is absent, ended, or not socket-inbox,
+    /// or when the message is missing.
+    pub fn record_socket_inbox_delivery(
+        &mut self,
+        message_id: MessageId,
+        recipient_agent_id: LogicalAgentId,
+        outcome: DeliveryOutcome,
+    ) -> Result<(), StoreError> {
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        let transport: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT delivery_transport, targeting_ended_at_ms
+                 FROM logical_agents WHERE id = ?1",
+                [recipient_agent_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match transport {
+            Some((transport, ended)) if transport == "socket_inbox" && ended.is_none() => {}
+            Some(_) => {
+                return Err(StoreError::Conflict(format!(
+                    "logical agent {recipient_agent_id} is not an active socket waiter"
+                )));
+            }
+            None => {
+                return Err(StoreError::Conflict(format!(
+                    "socket waiter {recipient_agent_id} is absent"
+                )));
+            }
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+            [message_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Conflict("delivery message is absent".into()));
+        }
+        tx.execute(
+            "INSERT INTO deliveries
+             (message_id, delivery_transport, recipient_incarnation_id, recipient_agent_id,
+              attempt_number, scheduled_at_ms, outcome)
+             VALUES (?1, 'socket_inbox', NULL, ?2, 1, ?3, ?4)",
+            params![
+                message_id.to_string(),
+                recipient_agent_id.to_string(),
+                now,
+                match outcome {
+                    DeliveryOutcome::Pending => "pending",
+                    DeliveryOutcome::Submitted => "submitted",
+                    DeliveryOutcome::Accepted => "accepted",
+                    DeliveryOutcome::Queued => "queued",
+                    DeliveryOutcome::Unknown => "unknown",
+                    DeliveryOutcome::Rejected => "rejected",
+                    DeliveryOutcome::TargetUnavailable => "target_unavailable",
+                    DeliveryOutcome::Superseded => "superseded",
+                }
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read the delivery transport recorded at logical-agent creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent is missing or the stored value is unknown.
+    pub fn delivery_transport(
+        &self,
+        logical_agent_id: LogicalAgentId,
+    ) -> Result<DeliveryTransport, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT delivery_transport FROM logical_agents WHERE id = ?1",
+            [logical_agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        parse_delivery_transport(&value)
+    }
+
     /// Atomically persist an ask, delivery, operation, and reply obligation.
     ///
     /// # Errors
@@ -1634,6 +1847,7 @@ impl Store {
             idempotency_key,
             due_at_ms,
             None,
+            false,
         )
     }
 
@@ -1654,6 +1868,7 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
         remind_after_ms: Option<i64>,
+        operator_attributed: bool,
     ) -> Result<CreatedAsk, StoreError> {
         if remind_after_ms.is_some_and(|value| value <= 0) {
             return Err(StoreError::Conflict(
@@ -1677,11 +1892,27 @@ impl Store {
                 "recipient incarnation does not belong to the recipient logical agent".into(),
             ));
         }
+        let waiting = waiter_identity(&tx, sender)?;
+        if operator_attributed && waiting.transport != DeliveryTransport::SocketInbox {
+            return Err(StoreError::Conflict(
+                "operator attribution does not make operator the waiter".into(),
+            ));
+        }
+        if waiting.ended {
+            return Err(StoreError::Conflict(format!(
+                "socket waiter {sender} is no longer a delivery target"
+            )));
+        }
+        let message_sender = if operator_attributed {
+            None
+        } else {
+            Some(sender.to_string())
+        };
         tx.execute(
             "INSERT INTO messages
              (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
              VALUES (?1, ?2, ?3, 'ask', ?4, ?5, 1)",
-            params![message_id.to_string(), sender.to_string(), recipient.to_string(), body, now],
+            params![message_id.to_string(), message_sender, recipient.to_string(), body, now],
         )?;
         insert_obligation(&tx, message_id, recipient, sender, now)?;
         if let Some(interval_ms) = remind_after_ms {
@@ -3664,9 +3895,10 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT d.operation_id, m.id, m.kind, m.sender_agent_id, m.recipient_agent_id,
                     d.recipient_incarnation_id, m.body, d.scheduled_at_ms
-             FROM deliveries d
-             JOIN messages m ON m.id = d.message_id
-             WHERE d.outcome = 'queued' AND d.scheduled_at_ms <= ?1
+              FROM deliveries d
+              JOIN messages m ON m.id = d.message_id
+              WHERE d.outcome = 'queued' AND d.scheduled_at_ms <= ?1
+                AND d.delivery_transport = 'herdr_prompt'
                AND NOT EXISTS (SELECT 1 FROM renews r
                                WHERE r.incarnation_id = d.recipient_incarnation_id
                                   AND r.phase IN ('ready','clearing'))
@@ -5403,6 +5635,7 @@ impl Store {
                 "ready alias {new_name} is already bound to incarnation {existing}"
             )));
         }
+        refuse_name_held_by_socket_waiter(&tx, new_name)?;
         let changed = tx.execute(
             "UPDATE incarnations SET pending_rename_to = ?1
              WHERE id = ?2 AND state = 'ready' AND pending_rename_to IS NULL",
@@ -6402,6 +6635,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         ))?;
         version = 19;
     }
+    if version == 19 {
+        connection.execute_batch(include_str!("../migrations/020_socket_waiter.sql"))?;
+        version = 20;
+    }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
             "unsupported schema version {version}"
@@ -6595,6 +6832,7 @@ fn insert_logical_agent(
     id: LogicalAgentId,
     name: &str,
     parent: Parent,
+    delivery_transport: DeliveryTransport,
     now: i64,
 ) -> Result<(), StoreError> {
     let parent_id = match parent {
@@ -6602,11 +6840,96 @@ fn insert_logical_agent(
         Parent::Agent(id) => Some(id.to_string()),
     };
     tx.execute(
-        "INSERT INTO logical_agents (id, public_name, parent_agent_id, explicitly_parentless, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id.to_string(), name, parent_id, i64::from(matches!(parent, Parent::Parentless)), now],
+        "INSERT INTO logical_agents
+         (id, public_name, parent_agent_id, explicitly_parentless, created_at_ms, delivery_transport)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id.to_string(),
+            name,
+            parent_id,
+            i64::from(matches!(parent, Parent::Parentless)),
+            now,
+            delivery_transport.as_str()
+        ],
     )?;
     Ok(())
+}
+
+fn refuse_pane_bind_of_socket_inbox(
+    tx: &Transaction<'_>,
+    logical_agent_id: LogicalAgentId,
+) -> Result<(), StoreError> {
+    let transport: Option<String> = tx
+        .query_row(
+            "SELECT delivery_transport FROM logical_agents WHERE id = ?1",
+            [logical_agent_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if transport.as_deref() == Some("socket_inbox") {
+        return Err(StoreError::Conflict(format!(
+            "cannot bind a pane to socket-inbox logical agent {logical_agent_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn refuse_name_held_by_socket_waiter(tx: &Transaction<'_>, name: &str) -> Result<(), StoreError> {
+    let held: Option<String> = tx
+        .query_row(
+            "SELECT id FROM logical_agents
+             WHERE public_name = ?1
+               AND delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = held {
+        return Err(StoreError::Conflict(format!(
+            "socket waiter {existing} already holds public name {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_delivery_transport(value: &str) -> Result<DeliveryTransport, StoreError> {
+    match value {
+        "herdr_prompt" => Ok(DeliveryTransport::HerdrPrompt),
+        "socket_inbox" => Ok(DeliveryTransport::SocketInbox),
+        other => Err(StoreError::InvalidRecord(format!(
+            "unknown delivery_transport {other}"
+        ))),
+    }
+}
+
+struct WaiterIdentity {
+    transport: DeliveryTransport,
+    ended: bool,
+}
+
+fn waiter_identity(
+    tx: &Transaction<'_>,
+    logical_agent_id: LogicalAgentId,
+) -> Result<WaiterIdentity, StoreError> {
+    let row: Option<(String, Option<i64>)> = tx
+        .query_row(
+            "SELECT delivery_transport, targeting_ended_at_ms
+             FROM logical_agents WHERE id = ?1",
+            [logical_agent_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((transport, ended_at)) = row else {
+        return Err(StoreError::Conflict(format!(
+            "waiting agent {logical_agent_id} is absent"
+        )));
+    };
+    let transport = parse_delivery_transport(&transport)?;
+    Ok(WaiterIdentity {
+        ended: matches!(transport, DeliveryTransport::SocketInbox) && ended_at.is_some(),
+        transport,
+    })
 }
 
 struct DeliverySchedule {
@@ -10992,5 +11315,153 @@ mod tests {
             store.obligation_state(live_ask).expect("state"),
             ObligationState::Open
         );
+    }
+
+    #[test]
+    fn socket_waiter_is_pane_less_and_can_wait_on_an_ask() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "waiter-1")
+            .expect("register");
+        assert_eq!(
+            store
+                .delivery_transport(waiter.logical_agent_id)
+                .expect("transport"),
+            DeliveryTransport::SocketInbox
+        );
+        let incarnations: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM incarnations WHERE logical_agent_id = ?1",
+                [waiter.logical_agent_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(incarnations, 0);
+
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "owing-start"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "waiter-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let waiting: String = store
+            .connection
+            .query_row(
+                "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("waiting");
+        assert_eq!(waiting, waiter.logical_agent_id.to_string());
+        let sender: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT sender_agent_id FROM messages WHERE id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("sender");
+        assert_eq!(sender, None);
+        assert_eq!(
+            store.agent_address(waiter.logical_agent_id).expect("from="),
+            "inbox"
+        );
+
+        store
+            .record_socket_inbox_delivery(
+                ask.message_id,
+                waiter.logical_agent_id,
+                DeliveryOutcome::Queued,
+            )
+            .expect("socket delivery");
+        let (transport, incarnation, agent): (String, Option<String>, String) = store
+            .connection
+            .query_row(
+                "SELECT delivery_transport, recipient_incarnation_id, recipient_agent_id
+                 FROM deliveries
+                 WHERE message_id = ?1 AND delivery_transport = 'socket_inbox'",
+                [ask.message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("delivery");
+        assert_eq!(transport, "socket_inbox");
+        assert_eq!(incarnation, None);
+        assert_eq!(agent, waiter.logical_agent_id.to_string());
+    }
+
+    #[test]
+    fn operator_cannot_be_the_waiting_agent_and_absent_ids_cannot_wait() {
+        let mut store = Store::in_memory().expect("store");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "owing-op"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let error = store
+            .create_ask_with_schedule(
+                owing.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "q",
+                "operator-as-waiter",
+                None,
+                None,
+                true,
+            )
+            .expect_err("pane agent is not a waiter");
+        assert!(
+            error
+                .to_string()
+                .contains("operator attribution does not make operator the waiter"),
+            "{error}"
+        );
+        let missing = LogicalAgentId::new();
+        let absent = store
+            .create_ask(
+                missing,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "q",
+                "connection-id",
+            )
+            .expect_err("unknown id");
+        assert!(absent.to_string().contains("waiting agent"), "{absent}");
+    }
+
+    #[test]
+    fn start_and_rename_refuse_a_socket_waiter_name_and_identity() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("held", Parent::Parentless, "held-waiter")
+            .expect("register");
+        let start = store
+            .declare_start(&intent("held", "term-1", "taken-name"))
+            .expect_err("name");
+        assert!(start.to_string().contains("socket waiter"), "{start}");
+        let continue_err = {
+            let mut continued = intent("other", "term-2", "continue-socket");
+            continued.logical_agent_id = Some(waiter.logical_agent_id);
+            store.declare_start(&continued).expect_err("continue")
+        };
+        assert!(
+            continue_err.to_string().contains("socket-inbox"),
+            "{continue_err}"
+        );
+        store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("end");
+        store
+            .declare_start(&intent("held", "term-3", "name-free"))
+            .expect("name released");
     }
 }

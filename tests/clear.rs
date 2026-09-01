@@ -540,6 +540,7 @@ fn prompt_spacing_includes_submitted_reminders() {
             "reminded-ask",
             None,
             Some(60_000),
+            false,
         )
         .expect("ask");
     let attempt = store
@@ -590,6 +591,7 @@ fn a_due_reminder_waits_out_the_post_clear_gap() {
             "due-reminder-before-clear",
             None,
             Some(1),
+            false,
         )
         .expect("ask");
     let attempt = store

@@ -117,6 +117,7 @@ fn armed_prepare(
             &format!("prepare:{renew_id}"),
             None,
             None,
+            false,
         )
         .expect("prepare ask");
     store
@@ -148,6 +149,7 @@ fn settled_prepare(
             &format!("prepare:{renew_id}"),
             None,
             None,
+            false,
         )
         .expect("prepare ask");
     store

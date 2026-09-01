@@ -249,7 +249,14 @@ fn spawn_withholding_initial_tell_herdr(
         let envelope = request["params"]["text"]
             .as_str()
             .expect("initial tell prompt text");
-        assert_eq!(envelope, "<kelpie from=operator>\ninitial work\n</kelpie>");
+        assert!(
+            envelope.starts_with("<kelpie from=operator msg="),
+            "{envelope}"
+        );
+        assert!(
+            envelope.ends_with(">\ninitial work\n</kelpie>"),
+            "{envelope}"
+        );
         assert!(!envelope.contains("reply-to"));
         UnixStream::connect(parsed_socket)
             .expect("connect parsed signal")

@@ -166,6 +166,7 @@ fn build_typed(
             due,
             remind_after_ms,
             no_remind,
+            from_operator,
         } => Ok(("ask".into(), {
             let mut params = message_command(
                 socket,
@@ -181,6 +182,9 @@ fn build_typed(
             }
             if no_remind {
                 params["no_remind"] = json!(true);
+            }
+            if from_operator {
+                params["from_operator"] = json!(true);
             }
             params
         })),
@@ -423,6 +427,25 @@ fn build_typed(
                 "idempotency_key": idempotency_key.unwrap_or_else(generated_id),
                 "close_pane": close_pane,
             }),
+        )),
+        Command::WaiterRegister {
+            public_name,
+            parent,
+            idempotency_key,
+        } => Ok((
+            "waiter.register".into(),
+            json!({
+                "public_name": public_name,
+                "parent": match parent {
+                    StartParent::Parentless => json!({"kind": "parentless"}),
+                    StartParent::Agent(id) => json!({"kind": "agent", "agent_id": id}),
+                },
+                "idempotency_key": idempotency_key.unwrap_or_else(generated_id),
+            }),
+        )),
+        Command::WaiterRetire { logical_agent_id } => Ok((
+            "waiter.retire".into(),
+            json!({ "logical_agent_id": logical_agent_id }),
         )),
     }
 }

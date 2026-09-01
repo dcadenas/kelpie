@@ -64,6 +64,7 @@ pub enum Command {
         due: Option<Due>,
         remind_after_ms: Option<i64>,
         no_remind: bool,
+        from_operator: bool,
     },
     Reply {
         reply_to: String,
@@ -136,6 +137,14 @@ pub enum Command {
     },
     /// Launch one incarnation using the existing start contract.
     Start(Box<StartCommand>),
+    WaiterRegister {
+        public_name: String,
+        parent: StartParent,
+        idempotency_key: Option<String>,
+    },
+    WaiterRetire {
+        logical_agent_id: String,
+    },
 }
 
 /// `StartIntent` parent: parentless or an exact parent agent ID.
@@ -342,6 +351,7 @@ pub fn default_socket() -> String {
 
 /// Format a typed receipt. Unknown and rejected outcomes stay visible.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn format_receipt(method: &str, response: &Value) -> String {
     if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
         return format!(
@@ -422,6 +432,16 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
         "report" => render_report(&result),
         "name.info" => render_name_info(&result),
         "ask.info" => render_ask_info(&result),
+        "waiter.register" => format!(
+            "waiter-register agent={} name={} transport=socket_inbox\n",
+            field(&result, "logical_agent_id"),
+            field(&result, "public_name")
+        ),
+        "waiter.retire" => format!(
+            "waiter-retire agent={} targeting-ended={}\n",
+            field(&result, "logical_agent_id"),
+            field(&result, "targeting_ended")
+        ),
         "rename" => format!(
             "rename name={} agent={} incarnation={}\n",
             field(&result, "public_name"),
@@ -518,6 +538,8 @@ Commands:
   reminder-snooze <ask-id> --until-ms MS
   reminder-disable <ask-id>
   retire --incarnation ID [--close-pane]
+  waiter-register --name NAME (--parentless | --parent-id ID)
+  waiter-retire --logical-id ID
 
 Unknown, duplicate, conflicting, or extra arguments fail closed. Ordinary
 bodies should use --stdin or --file. --body is only for short trusted text.
@@ -563,6 +585,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "start" => parse_start(&args[1..], false),
         "handoff" => parse_start(&args[1..], true),
         "adopt" => parse_adopt(&args[1..]),
+        "waiter-register" => parse_waiter_register(&args[1..]),
+        "waiter-retire" => parse_waiter_retire(&args[1..]),
         "notice" => {
             let mut tokens = Tokens::new(&args[1..]);
             let body = take_body(&mut tokens, "notice")?;
@@ -580,6 +604,29 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "retire" => parse_retire(&args[1..]),
         other => Err(format!("unknown command {other}")),
     }
+}
+
+fn parse_waiter_register(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(args);
+    let mut problems = Problems::default();
+    let public_name = problems.required(&mut tokens, "--name");
+    let parent = take_parent(&mut problems, &mut tokens, "waiter-register");
+    let idempotency_key = problems.value(&mut tokens, "--idempotency-key");
+    problems.resolve(&tokens, "waiter-register")?;
+    Ok(Command::WaiterRegister {
+        public_name: public_name.ok_or("missing --name")?,
+        parent: parent.ok_or("missing --parentless or --parent-id")?,
+        idempotency_key,
+    })
+}
+
+fn parse_waiter_retire(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(args);
+    let logical_agent_id = tokens
+        .take_value("--logical-id")?
+        .ok_or("waiter-retire requires --logical-id")?;
+    tokens.finish("waiter-retire")?;
+    Ok(Command::WaiterRetire { logical_agent_id })
 }
 
 fn parse_clear(args: &[String]) -> Result<Command, String> {
@@ -640,6 +687,13 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
     if remind_after_ms.is_some() && no_remind {
         return Err("ask accepts only one of --remind-after-ms or --no-remind".into());
     }
+    let from = tokens.take_value("--from")?;
+    let from_operator = match from.as_deref() {
+        None => false,
+        Some("operator") if verb == "ask" => true,
+        Some("operator") => return Err("tell does not accept --from".into()),
+        Some(_) => return Err("--from only accepts operator".into()),
+    };
     let positional = tokens.take_positional();
     tokens.finish(verb)?;
     let recipient = match (positional, recipient_id, recipient_incarnation) {
@@ -671,6 +725,7 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
             due,
             remind_after_ms,
             no_remind,
+            from_operator,
         })
     }
 }
@@ -3184,5 +3239,49 @@ mod tests {
         assert!(text.contains("runtime=succeeded"), "{text}");
         assert!(text.contains("delivery=unknown"), "{text}");
         assert!(text.contains("message=m"), "{text}");
+    }
+
+    #[test]
+    fn waiter_register_and_from_operator_parse() {
+        let invocation = parse_invocation(&args(&[
+            "waiter-register",
+            "--name",
+            "inbox",
+            "--parentless",
+        ]))
+        .expect("register");
+        match invocation {
+            Invocation::Typed {
+                command:
+                    Command::WaiterRegister {
+                        public_name,
+                        parent: StartParent::Parentless,
+                        ..
+                    },
+                ..
+            } => assert_eq!(public_name, "inbox"),
+            other => panic!("{other:?}"),
+        }
+        let ask = parse_invocation(&args(&[
+            "ask",
+            "owing",
+            "--sender-id",
+            "aaaaaaaa-bbbb-7ccc-dddd-eeeeeeeeeeee",
+            "--from",
+            "operator",
+            "--body",
+            "q",
+        ]))
+        .expect("ask");
+        match ask {
+            Invocation::Typed {
+                command: Command::Ask { from_operator, .. },
+                ..
+            } => assert!(from_operator),
+            other => panic!("{other:?}"),
+        }
+        let bad = parse_invocation(&args(&["ask", "owing", "--from", "relay", "--body", "q"]))
+            .expect_err("from");
+        assert!(bad.contains("operator"), "{bad}");
     }
 }

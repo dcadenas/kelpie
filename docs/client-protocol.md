@@ -27,6 +27,7 @@ request contains `id`, `method`, and `params`; each response echoes `id` and
 contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
 `reply`, `clear`, `renew`, `renew.cancel`, `pending`, `cancel`, `retire`,
+`waiter.register`, `waiter.retire`,
 `notice.create`, `notice.list`, `name.info`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
 
@@ -64,6 +65,11 @@ authentication boundary.
   `recipient_alias` resolved once at send time to the unique Ready agent for
   that public name. The resolved IDs are what durable records store; later
   alias reuse does not retarget them. Results echo the resolved recipient IDs.
+- `waiter.register` creates a pane-less LogicalAgent with
+  `delivery_transport=socket_inbox`. It mints no incarnation. `waiter.retire`
+  ends that targeting and releases the name. `ask` `from_operator` attributes
+  the stored sender as the operator; `waiting_agent_id` stays the waiter, and
+  occupant envelopes still use `from=` equal to the waiter's public name.
 
 ## Messaging methods
 

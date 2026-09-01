@@ -200,6 +200,7 @@ fn seed_renew(database: &Path, clearing: bool) -> RenewId {
             "renew-prepare",
             None,
             None,
+            false,
         )
         .expect("prepare ask");
     store

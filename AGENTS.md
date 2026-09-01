@@ -58,7 +58,8 @@ not just the code.
 - `src/bin/kelpied.rs` → `daemon.rs` — foreground daemon. Opens and recovers the
   store *before* binding the Unix socket. Dispatches one NDJSON request per
   connection (`recover`, `start`, `adopt`, `tell`, `ask`, `reply`, `clear`, `renew`,
-  `renew.cancel`, `pending`, `cancel`, `retire`, `reminder.snooze`, `reminder.disable`,
+  `renew.cancel`, `pending`, `cancel`, `retire`, `waiter.register`, `waiter.retire`,
+  `reminder.snooze`, `reminder.disable`,
   `notice.create`, `notice.list`, `whoami`). Uses a non-blocking accept timeout
   so scheduled deliveries, reminders, and renew phases run with no client
   connected.
