@@ -1647,17 +1647,26 @@ impl Store {
             let logical_agent_id = LogicalAgentId::parse(&existing).ok_or_else(|| {
                 StoreError::InvalidRecord(format!("invalid waiter id {existing}"))
             })?;
-            let (stored_name, stored_parent, stored_parentless): (String, Option<String>, i64) = tx
-                .query_row(
-                    "SELECT public_name, parent_agent_id, explicitly_parentless
-                     FROM logical_agents WHERE id = ?1",
-                    [logical_agent_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
+            let (stored_name, stored_parent, stored_parentless, ended): (
+                String,
+                Option<String>,
+                i64,
+                Option<i64>,
+            ) = tx.query_row(
+                "SELECT public_name, parent_agent_id, explicitly_parentless, targeting_ended_at_ms
+                 FROM logical_agents WHERE id = ?1",
+                [logical_agent_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
             let parent_matches = match parent {
                 Parent::Parentless => stored_parentless == 1 && stored_parent.is_none(),
                 Parent::Agent(id) => stored_parent.as_deref() == Some(&id.to_string()),
             };
+            if ended.is_some() {
+                return Err(StoreError::Conflict(
+                    "waiter.register idempotency key is bound to an ended waiter".into(),
+                ));
+            }
             if stored_name != public_name || !parent_matches {
                 return Err(StoreError::Conflict(
                     "waiter.register idempotency key already bound to a different waiter".into(),
@@ -6896,7 +6905,7 @@ fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), 
             "SELECT i.id FROM incarnations i
              JOIN logical_agents l ON l.id = i.logical_agent_id
              WHERE l.public_name = ?1
-               AND i.state IN ('declared','starting','ready')",
+               AND i.state IN ('starting','ready')",
             [name],
             |row| row.get(0),
         )
@@ -11549,21 +11558,38 @@ mod tests {
     }
 
     #[test]
-    fn register_refuses_a_declared_alias_and_mismatched_replay() {
+    fn register_refuses_a_ready_alias_and_mismatched_or_retired_replay() {
         let mut store = Store::in_memory().expect("store");
         store
             .declare_start(&intent("pending", "term-1", "pending-start"))
             .expect("declared");
-        let taken = store
-            .register_socket_waiter("pending", Parent::Parentless, "against-declared")
-            .expect_err("declared");
-        assert!(taken.to_string().contains("pending"), "{taken}");
         store
+            .register_socket_waiter("pending", Parent::Parentless, "against-declared")
+            .expect("declared is not a live alias");
+        let ready = store
+            .declare_start(&intent("live", "term-2", "live-start"))
+            .expect("live");
+        mark_ready(&mut store, ready, "live", "term-2");
+        let taken = store
+            .register_socket_waiter("live", Parent::Parentless, "against-ready")
+            .expect_err("ready");
+        assert!(taken.to_string().contains("live"), "{taken}");
+        let first = store
             .register_socket_waiter("inbox", Parent::Parentless, "same-key")
             .expect("first");
         let mismatch = store
             .register_socket_waiter("other", Parent::Parentless, "same-key")
             .expect_err("mismatch");
         assert!(mismatch.to_string().contains("idempotency"), "{mismatch}");
+        store
+            .end_socket_waiter(first.logical_agent_id)
+            .expect("end");
+        store
+            .register_socket_waiter("inbox", Parent::Parentless, "new-key")
+            .expect("name released");
+        let retired = store
+            .register_socket_waiter("inbox", Parent::Parentless, "same-key")
+            .expect_err("retired replay");
+        assert!(retired.to_string().contains("ended waiter"), "{retired}");
     }
 }
