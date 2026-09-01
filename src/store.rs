@@ -865,6 +865,9 @@ impl Store {
                 "Herdr observation does not prove the claimed adopt name is live".into(),
             ));
         }
+        if let Some((_, _, name, _)) = expected.as_ref() {
+            refuse_name_held_by_socket_waiter(&tx, name)?;
+        }
         let changed = tx.execute(
             "UPDATE operations SET outcome = 'succeeded', resolved_at_ms = ?1
              WHERE id = ?2 AND target_incarnation_id = ?3 AND outcome IN ('pending', 'accepted')",
@@ -1073,6 +1076,9 @@ impl Store {
             return Err(StoreError::Conflict(
                 "Herdr observation does not prove the exact intended incarnation is ready".into(),
             ));
+        }
+        if let Some((_, _, name, _)) = expected.as_ref() {
+            refuse_name_held_by_socket_waiter(&tx, name)?;
         }
         let changed = tx.execute(
             "UPDATE operations SET outcome = 'succeeded', resolved_at_ms = ?1
@@ -1641,24 +1647,27 @@ impl Store {
             let logical_agent_id = LogicalAgentId::parse(&existing).ok_or_else(|| {
                 StoreError::InvalidRecord(format!("invalid waiter id {existing}"))
             })?;
+            let (stored_name, stored_parent, stored_parentless): (String, Option<String>, i64) = tx
+                .query_row(
+                    "SELECT public_name, parent_agent_id, explicitly_parentless
+                     FROM logical_agents WHERE id = ?1",
+                    [logical_agent_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let parent_matches = match parent {
+                Parent::Parentless => stored_parentless == 1 && stored_parent.is_none(),
+                Parent::Agent(id) => stored_parent.as_deref() == Some(&id.to_string()),
+            };
+            if stored_name != public_name || !parent_matches {
+                return Err(StoreError::Conflict(
+                    "waiter.register idempotency key already bound to a different waiter".into(),
+                ));
+            }
             tx.commit()?;
             return Ok(CreatedWaiter { logical_agent_id });
         }
         refuse_name_held_by_socket_waiter(&tx, public_name)?;
-        let ready: Option<String> = tx
-            .query_row(
-                "SELECT i.id FROM incarnations i
-                 JOIN logical_agents l ON l.id = i.logical_agent_id
-                 WHERE i.state = 'ready' AND l.public_name = ?1",
-                [public_name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = ready {
-            return Err(StoreError::Conflict(format!(
-                "ready alias {public_name} is already bound to incarnation {existing}"
-            )));
-        }
+        refuse_live_or_pending_alias(&tx, public_name)?;
         if let Parent::Agent(parent_id) = parent {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM logical_agents WHERE id = ?1)",
@@ -3769,7 +3778,7 @@ impl Store {
         }
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
-        let row: Option<(String, String, String, String)> = tx
+        let row: Option<(String, Option<String>, String, String)> = tx
             .query_row(
                 "SELECT m.kind, m.sender_agent_id, d.outcome, d.operation_id
                  FROM messages m
@@ -3785,7 +3794,7 @@ impl Store {
         if outcome != "queued" {
             return Ok(false);
         }
-        if kind == "tell" && sender != requester_agent_id.to_string() {
+        if kind == "tell" && sender.as_deref() != Some(&requester_agent_id.to_string()) {
             return Err(StoreError::Conflict(
                 "requester does not own the scheduled tell".into(),
             ));
@@ -3893,10 +3902,16 @@ impl Store {
     /// Returns an error if durable IDs or kinds are malformed.
     pub fn due_deliveries(&self, now_ms: i64) -> Result<Vec<DueDelivery>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT d.operation_id, m.id, m.kind, m.sender_agent_id, m.recipient_agent_id,
+            "SELECT d.operation_id, m.id, m.kind,
+                    CASE
+                      WHEN m.kind = 'ask' THEN COALESCE(m.sender_agent_id, o.waiting_agent_id)
+                      ELSE m.sender_agent_id
+                    END,
+                    m.recipient_agent_id,
                     d.recipient_incarnation_id, m.body, d.scheduled_at_ms
               FROM deliveries d
               JOIN messages m ON m.id = d.message_id
+              LEFT JOIN obligations o ON o.ask_message_id = m.id
               WHERE d.outcome = 'queued' AND d.scheduled_at_ms <= ?1
                 AND d.delivery_transport = 'herdr_prompt'
                AND NOT EXISTS (SELECT 1 FROM renews r
@@ -5678,6 +5693,7 @@ impl Store {
                 "no matching pending rename for this ready incarnation".into(),
             ));
         };
+        refuse_name_held_by_socket_waiter(&tx, new_name)?;
         tx.execute(
             "UPDATE logical_agents SET public_name = ?1 WHERE id = ?2",
             params![new_name, agent_id],
@@ -6869,6 +6885,37 @@ fn refuse_pane_bind_of_socket_inbox(
     if transport.as_deref() == Some("socket_inbox") {
         return Err(StoreError::Conflict(format!(
             "cannot bind a pane to socket-inbox logical agent {logical_agent_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), StoreError> {
+    let held: Option<String> = tx
+        .query_row(
+            "SELECT i.id FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE l.public_name = ?1
+               AND i.state IN ('declared','starting','ready')",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = held {
+        return Err(StoreError::Conflict(format!(
+            "alias {name} is already bound to incarnation {existing}"
+        )));
+    }
+    let pending: Option<String> = tx
+        .query_row(
+            "SELECT id FROM incarnations WHERE pending_rename_to = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = pending {
+        return Err(StoreError::Conflict(format!(
+            "alias {name} is already a pending rename target for incarnation {existing}"
         )));
     }
     Ok(())
@@ -11463,5 +11510,60 @@ mod tests {
         store
             .declare_start(&intent("held", "term-3", "name-free"))
             .expect("name released");
+    }
+
+    #[test]
+    fn queued_operator_ask_keeps_waiter_as_envelope_sender_and_cancels() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "queued-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "queued-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let due_at = store_clock_ms().expect("clock") + 1_000;
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "later?",
+                "queued-from-operator",
+                Some(due_at),
+                None,
+                true,
+            )
+            .expect("queued ask");
+        let due = store.due_deliveries(due_at).expect("due");
+        let item = due
+            .iter()
+            .find(|item| item.message_id == ask.message_id)
+            .expect("queued ask is due");
+        assert_eq!(item.sender, Some(waiter.logical_agent_id));
+        assert!(
+            store
+                .cancel_queued_delivery(waiter.logical_agent_id, ask.message_id, "host down")
+                .expect("cancel")
+        );
+    }
+
+    #[test]
+    fn register_refuses_a_declared_alias_and_mismatched_replay() {
+        let mut store = Store::in_memory().expect("store");
+        store
+            .declare_start(&intent("pending", "term-1", "pending-start"))
+            .expect("declared");
+        let taken = store
+            .register_socket_waiter("pending", Parent::Parentless, "against-declared")
+            .expect_err("declared");
+        assert!(taken.to_string().contains("pending"), "{taken}");
+        store
+            .register_socket_waiter("inbox", Parent::Parentless, "same-key")
+            .expect("first");
+        let mismatch = store
+            .register_socket_waiter("other", Parent::Parentless, "same-key")
+            .expect_err("mismatch");
+        assert!(mismatch.to_string().contains("idempotency"), "{mismatch}");
     }
 }
