@@ -1,7 +1,8 @@
 //! Foreground local daemon for Kelpie's newline-delimited JSON protocol.
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -104,6 +105,15 @@ struct AwaitingClearRequest {
     stream: UnixStream,
 }
 
+/// Long-lived socket-inbox client. One-shot RPCs are not this receive path.
+#[derive(Debug)]
+struct InboxSession {
+    waiter_id: LogicalAgentId,
+    stream: UnixStream,
+    read_buf: Vec<u8>,
+    offered: HashSet<MessageId>,
+}
+
 /// A bound foreground daemon. Dropping it removes only the socket it created.
 #[derive(Debug)]
 pub struct Daemon {
@@ -112,6 +122,7 @@ pub struct Daemon {
     kelpie: Kelpie,
     awaiting_starts: Vec<AwaitingStart>,
     awaiting_clears: Vec<AwaitingClearRequest>,
+    inboxes: Vec<InboxSession>,
 }
 
 impl Daemon {
@@ -130,6 +141,7 @@ impl Daemon {
             kelpie,
             awaiting_starts: Vec::new(),
             awaiting_clears: Vec::new(),
+            inboxes: Vec::new(),
         })
     }
 
@@ -180,7 +192,8 @@ impl Daemon {
         };
         let start_advanced = self.advance_awaiting_starts();
         let clear_advanced = self.advance_awaiting_clears();
-        let advanced = start_advanced || clear_advanced || renewed;
+        let inbox_advanced = self.advance_inboxes();
+        let advanced = start_advanced || clear_advanced || inbox_advanced || renewed;
         self.listener.set_nonblocking(true)?;
         match self.listener.accept() {
             Ok((stream, _)) => {
@@ -196,6 +209,7 @@ impl Daemon {
                     Ok(Served::Answered) => {}
                     Ok(Served::AwaitingStart(awaiting)) => self.awaiting_starts.push(*awaiting),
                     Ok(Served::AwaitingClear(awaiting)) => self.awaiting_clears.push(*awaiting),
+                    Ok(Served::Inbox(session)) => self.park_inbox(*session),
                     Err(error) => {
                         eprintln!("kelpied: client connection failed: {error}");
                     }
@@ -287,6 +301,26 @@ impl Daemon {
         settled
     }
 
+    fn park_inbox(&mut self, session: InboxSession) {
+        let waiter_id = session.waiter_id;
+        self.inboxes.retain(|open| open.waiter_id != waiter_id);
+        self.inboxes.push(session);
+        let _ = self.advance_inboxes();
+    }
+
+    fn advance_inboxes(&mut self) -> bool {
+        let mut progressed = false;
+        let mut still_open = Vec::with_capacity(self.inboxes.len());
+        for mut session in std::mem::take(&mut self.inboxes) {
+            if let Ok(changed) = pump_inbox(&mut session, &mut self.kelpie) {
+                progressed |= changed;
+                still_open.push(session);
+            }
+        }
+        self.inboxes = still_open;
+        progressed
+    }
+
     /// Accept and serve one request, primarily for deterministic integration tests.
     ///
     /// # Errors
@@ -306,6 +340,10 @@ impl Daemon {
                     .and_then(|started| self.kelpie.finish_launch(&awaiting.intent, started));
                 let response = respond(&awaiting.request_id, settled.map(launch_result));
                 write_response(&mut awaiting.stream, &response)
+            }
+            Served::Inbox(session) => {
+                self.park_inbox(*session);
+                Ok(())
             }
             Served::AwaitingClear(mut awaiting) => loop {
                 match advance_clear_state(awaiting.state, &mut self.kelpie) {
@@ -342,6 +380,8 @@ enum Served {
     AwaitingStart(Box<AwaitingStart>),
     /// A clear is waiting for prompt spacing or backend session rotation.
     AwaitingClear(Box<AwaitingClearRequest>),
+    /// A socket waiter claimed this connection as its inbox.
+    Inbox(Box<InboxSession>),
 }
 
 fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, DaemonError> {
@@ -362,6 +402,34 @@ fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, Daemo
                         declared,
                         deadline,
                         stream,
+                    })));
+                }
+                Err(error) => {
+                    let response = respond(&request.id, Err(error));
+                    write_response(&mut stream, &response)?;
+                    return Ok(Served::Answered);
+                }
+            }
+        }
+        Ok(request) if request.method == "inbox.claim" => {
+            let mut stream = reader.into_inner();
+            match claim_inbox(&request, kelpie) {
+                Ok(waiter_id) => {
+                    let response = respond(
+                        &request.id,
+                        Ok(serde_json::json!({
+                            "logical_agent_id": waiter_id,
+                            "claimed": true,
+                            "delivery_transport": "socket_inbox",
+                        })),
+                    );
+                    write_json_line(&mut stream, &response)?;
+                    stream.set_nonblocking(true)?;
+                    return Ok(Served::Inbox(Box::new(InboxSession {
+                        waiter_id,
+                        stream,
+                        read_buf: Vec::new(),
+                        offered: HashSet::new(),
                     })));
                 }
                 Err(error) => {
@@ -410,13 +478,143 @@ fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, Daemo
 }
 
 fn write_response(stream: &mut UnixStream, response: &ClientResponse) -> Result<(), DaemonError> {
-    serde_json::to_writer(&mut *stream, response)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    write_json_line(stream, response)?;
     // Half-close write so line-oriented clients receive a finished response
     // even if they still wait for EOF after the NDJSON line.
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
+}
+
+fn write_json_line(
+    stream: &mut UnixStream,
+    value: &impl serde::Serialize,
+) -> Result<(), DaemonError> {
+    serde_json::to_writer(&mut *stream, value)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn claim_inbox(request: &ClientRequest, kelpie: &Kelpie) -> Result<LogicalAgentId, SliceError> {
+    let params = serde_json::from_value::<InboxClaimParams>(request.params.clone())
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    kelpie
+        .store()
+        .claim_socket_waiter(params.logical_agent_id)
+        .map_err(SliceError::Store)?;
+    Ok(params.logical_agent_id)
+}
+
+fn pump_inbox(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, DaemonError> {
+    let mut progressed = offer_queued_inbox(session, kelpie)?;
+    progressed |= read_inbox_acks(session, kelpie)?;
+    Ok(progressed)
+}
+
+fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<bool, DaemonError> {
+    let queued = kelpie
+        .store()
+        .queued_socket_inbox_deliveries(session.waiter_id)
+        .map_err(|error| std::io::Error::other(format!("queued socket inbox failed: {error}")))?;
+    let mut progressed = false;
+    for delivery in queued {
+        if !session.offered.insert(delivery.message_id) {
+            continue;
+        }
+        let event = serde_json::json!({
+            "id": uuid::Uuid::now_v7().to_string(),
+            "method": "inbox.delivery",
+            "params": {
+                "message_id": delivery.message_id,
+                "kind": delivery.kind,
+                "body": delivery.body,
+                "reply_to": delivery.reply_to,
+                "disposition": delivery.disposition,
+                "attempt_number": delivery.attempt_number,
+            }
+        });
+        write_json_line(&mut session.stream, &event)?;
+        progressed = true;
+    }
+    Ok(progressed)
+}
+
+fn read_inbox_acks(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, DaemonError> {
+    let mut chunk = [0_u8; 4096];
+    match session.stream.read(&mut chunk) {
+        Ok(0) => {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        Ok(n) => session.read_buf.extend_from_slice(&chunk[..n]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let mut progressed = false;
+    while let Some(index) = session.read_buf.iter().position(|byte| *byte == b'\n') {
+        let line = session.read_buf.drain(..=index).collect::<Vec<_>>();
+        let line = String::from_utf8_lossy(&line);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ClientRequest>(line) {
+            Ok(request) if request.method == "inbox.ack" => {
+                match ack_inbox(&request, session.waiter_id, kelpie) {
+                    Ok(result) => {
+                        write_json_line(&mut session.stream, &respond(&request.id, Ok(result)))?;
+                        progressed = true;
+                    }
+                    Err(error) => {
+                        write_json_line(&mut session.stream, &respond(&request.id, Err(error)))?;
+                    }
+                }
+            }
+            Ok(request) => {
+                write_json_line(
+                    &mut session.stream,
+                    &respond(
+                        &request.id,
+                        Err(SliceError::Store(StoreError::InvalidRecord(
+                            "inbox connection accepts only inbox.ack".into(),
+                        ))),
+                    ),
+                )?;
+            }
+            Err(error) => {
+                write_json_line(
+                    &mut session.stream,
+                    &ClientResponse {
+                        id: String::new(),
+                        result: None,
+                        error: Some(ClientError {
+                            class: "invalid_request",
+                            message: error.to_string(),
+                            code: None,
+                        }),
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(progressed)
+}
+
+fn ack_inbox(
+    request: &ClientRequest,
+    waiter_id: LogicalAgentId,
+    kelpie: &mut Kelpie,
+) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<InboxAckParams>(request.params.clone())
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let outcome = kelpie
+        .store_mut()
+        .ack_socket_inbox_delivery(waiter_id, params.message_id)
+        .map_err(SliceError::Store)?;
+    Ok(serde_json::json!({
+        "message_id": params.message_id,
+        "outcome": outcome,
+    }))
 }
 
 /// Declare and submit a start, leaving its readiness to the poll loop.
@@ -1436,6 +1634,16 @@ struct WaiterRetireParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct InboxClaimParams {
+    logical_agent_id: LogicalAgentId,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxAckParams {
+    message_id: MessageId,
+}
+
+#[derive(Debug, Deserialize)]
 struct AskParams {
     sender: LogicalAgentId,
     #[serde(default)]
@@ -2377,5 +2585,197 @@ mod tests {
             crate::domain::DeliveryOutcome::Accepted
         );
         server.join().expect("herdr");
+    }
+
+    fn queue_reply_for_waiter(store: &mut Store) -> (LogicalAgentId, MessageId, MessageId) {
+        use crate::domain::{DeliveryOutcome, MessageKind, ReplyDisposition};
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "inbox-waiter")
+            .expect("register");
+        let ask = store
+            .insert_inbox_message(
+                waiter.logical_agent_id,
+                MessageKind::Ask,
+                "question",
+                None,
+                None,
+            )
+            .expect("ask");
+        let reply = store
+            .insert_inbox_message(
+                waiter.logical_agent_id,
+                MessageKind::Reply,
+                "later reply body",
+                Some(ask),
+                Some(ReplyDisposition::Final),
+            )
+            .expect("reply");
+        store
+            .record_socket_inbox_delivery(reply, waiter.logical_agent_id, DeliveryOutcome::Queued)
+            .expect("queue");
+        (waiter.logical_agent_id, ask, reply)
+    }
+
+    fn rpc(daemon: &mut Daemon, socket: &Path, request: Value) -> Value {
+        let socket = socket.to_path_buf();
+        let client = thread::spawn(move || send_request(&socket, &request));
+        while !daemon.poll().expect("rpc poll") {}
+        client.join().expect("rpc client")
+    }
+
+    fn claim_waiter(socket: &Path, waiter: LogicalAgentId, id: &str) -> UnixStream {
+        let mut stream = UnixStream::connect(socket).expect("connect inbox");
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "id": id,
+                "method": "inbox.claim",
+                "params": {"logical_agent_id": waiter},
+            }),
+        )
+        .expect("write claim");
+        stream.write_all(b"\n").expect("nl");
+        stream
+    }
+
+    fn read_json(reader: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        serde_json::from_str(&line).expect("json")
+    }
+
+    fn bind_inbox_daemon(directory: &Path, store: Store) -> (Daemon, PathBuf) {
+        let socket = directory.join("kelpie.sock");
+        let daemon = Daemon::bind(
+            &socket,
+            Kelpie::new(
+                store,
+                HerdrClient::new(directory.join("unused-herdr.sock"), Duration::from_secs(1)),
+            ),
+        )
+        .expect("bind");
+        (daemon, socket)
+    }
+
+    fn drain_reply(daemon: &mut Daemon, socket: &Path, waiter: LogicalAgentId, id: &str) -> Value {
+        let stream = claim_waiter(socket, waiter, id);
+        while daemon.inboxes.is_empty() {
+            daemon.poll().expect("claim");
+        }
+        let mut reader = BufReader::new(stream);
+        let claim = read_json(&mut reader);
+        assert_eq!(claim["result"]["claimed"], true);
+        read_json(&mut reader)
+    }
+
+    #[test]
+    fn pending_and_ask_info_are_not_the_socket_inbox() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, ask, _) = queue_reply_for_waiter(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let pending = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "pending-1",
+                "method": "pending",
+                "params": {"agent_id": waiter},
+            }),
+        );
+        assert_eq!(pending["result"], serde_json::json!([]));
+        assert!(
+            !pending.to_string().contains("later reply body"),
+            "{pending}"
+        );
+        let ask_info = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "ask-info-1",
+                "method": "ask.info",
+                "params": {"ask_message_id": ask},
+            }),
+        );
+        assert!(
+            !ask_info.to_string().contains("later reply body"),
+            "{ask_info}"
+        );
+    }
+
+    #[test]
+    fn inbox_claim_refuses_a_foreign_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let _ = queue_reply_for_waiter(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let refused = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "claim-foreign",
+                "method": "inbox.claim",
+                "params": {"logical_agent_id": LogicalAgentId::new()},
+            }),
+        );
+        assert_eq!(refused["error"]["class"], "conflict");
+        let message = refused["error"]["message"].as_str().expect("msg");
+        assert!(
+            message.contains("absent") || message.contains("not an active socket waiter"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn inbox_reconnect_drains_the_same_waiter_until_ack() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, _, reply) = queue_reply_for_waiter(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+
+        let delivery = drain_reply(&mut daemon, &socket, waiter, "claim-1");
+        assert_eq!(delivery["method"], "inbox.delivery");
+        assert_eq!(delivery["params"]["body"], "later reply body");
+        assert_eq!(delivery["params"]["message_id"], reply.to_string());
+        assert_eq!(delivery["params"]["kind"], "reply");
+        while !daemon.inboxes.is_empty() {
+            let _ = daemon.poll().expect("drop");
+        }
+
+        let mut again = claim_waiter(&socket, waiter, "claim-2");
+        while daemon.inboxes.is_empty() {
+            daemon.poll().expect("reclaim");
+        }
+        let mut reader = BufReader::new(again.try_clone().expect("clone"));
+        let _claim = read_json(&mut reader);
+        let delivery = read_json(&mut reader);
+        assert_eq!(delivery["params"]["body"], "later reply body");
+        serde_json::to_writer(
+            &mut again,
+            &serde_json::json!({
+                "id": "ack-1",
+                "method": "inbox.ack",
+                "params": {"message_id": reply},
+            }),
+        )
+        .expect("ack");
+        again.write_all(b"\n").expect("nl");
+        let mut acked = false;
+        for _ in 0..20 {
+            daemon.poll().expect("ack poll");
+            if daemon
+                .kelpie
+                .store()
+                .queued_socket_inbox_deliveries(waiter)
+                .expect("queued")
+                .is_empty()
+            {
+                acked = true;
+                break;
+            }
+        }
+        assert!(acked, "ack should complete the same queued attempt");
+        let ack = read_json(&mut reader);
+        assert_eq!(ack["result"]["outcome"], "accepted");
     }
 }

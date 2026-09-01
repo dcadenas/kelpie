@@ -442,7 +442,9 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   No incarnation, no pane occupant. `waiter.retire` ends that targeting and
   releases the public name. `--from operator` on `ask` is sender attribution
   only; `waiting_agent_id` is the waiter, and occupant `from=` is the waiter's
-  public name.
+  public name. The host receives deliveries on a long-lived `inbox.claim`
+  connection for that waiter id, then `inbox.ack`. `pending` and `ask.info`
+  are not the socket-waiter receive path.
 - `ask`: same recipient shape as `tell`, delivered immediately; a due time is
   refused. Every ask
   creates a five-minute pending-reply reminder by default. Use

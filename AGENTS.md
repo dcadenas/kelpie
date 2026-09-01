@@ -59,6 +59,7 @@ not just the code.
   store *before* binding the Unix socket. Dispatches one NDJSON request per
   connection (`recover`, `start`, `adopt`, `tell`, `ask`, `reply`, `clear`, `renew`,
   `renew.cancel`, `pending`, `cancel`, `retire`, `waiter.register`, `waiter.retire`,
+  `inbox.claim`, `inbox.ack`,
   `reminder.snooze`, `reminder.disable`,
   `notice.create`, `notice.list`, `whoami`). Uses a non-blocking accept timeout
   so scheduled deliveries, reminders, and renew phases run with no client
