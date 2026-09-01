@@ -6205,14 +6205,19 @@ impl Store {
                         && agent.interactive_ready
                         && !agent.launch_pending
                 }) {
-                    self.accept_start_ready(
+                    match self.accept_start_ready(
                         candidate.operation_id,
                         candidate.incarnation_id,
                         agent,
                         None,
-                    )?;
-                    report.starts_recovered += 1;
-                    continue;
+                    ) {
+                        Ok(()) => {
+                            report.starts_recovered += 1;
+                            continue;
+                        }
+                        Err(StoreError::Conflict(_)) => continue,
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             if candidate.kind == "adopt" {
@@ -6917,7 +6922,8 @@ fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), 
     }
     let pending: Option<String> = tx
         .query_row(
-            "SELECT id FROM incarnations WHERE pending_rename_to = ?1",
+            "SELECT id FROM incarnations
+             WHERE pending_rename_to = ?1 AND state = 'ready'",
             [name],
             |row| row.get(0),
         )
@@ -11591,5 +11597,22 @@ mod tests {
             .register_socket_waiter("inbox", Parent::Parentless, "same-key")
             .expect_err("retired replay");
         assert!(retired.to_string().contains("ended waiter"), "{retired}");
+        let named = store
+            .declare_start(&intent("old", "term-3", "rename-then-lost"))
+            .expect("named");
+        mark_ready(&mut store, named, "old", "term-3");
+        store
+            .declare_rename(named.incarnation_id, "target")
+            .expect("pending rename");
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lost");
+        store
+            .register_socket_waiter("target", Parent::Parentless, "after-lost-rename")
+            .expect("lost pending rename does not hold the name");
     }
 }
