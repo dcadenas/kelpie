@@ -134,11 +134,11 @@ The verbs are `tell`, `ask`, and `reply`. An occupant answers an ask with
 `reply` and a final disposition. Kelpie MUST NOT add a new message verb or a
 new obligation kind for socket waiters.
 
-Occupant envelopes are `<kelpie from=… reply-to=…>`: `from` is the waiter's
-public name, `reply-to` is the ask message ID. Pane callers MUST default sender
-attribution to the Ready binding of the calling pane. A pane-less host MAY
-attribute a send as the operator; that attribution MUST NOT make the operator
-the waiting agent.
+Occupant envelopes are `<kelpie from=… msg=… reply-to=…>`: `from` is the
+waiter's public name, `msg` and `reply-to` are the ask message ID. Pane callers
+MUST default sender attribution to the Ready binding of the calling pane. A
+pane-less host MAY attribute a send as the operator; that attribution MUST NOT
+make the operator the waiting agent.
 
 The operator-notice inbox in Goal 10 is a human-facing durable record. It is
 not the socket-waiter receive path.
@@ -146,7 +146,8 @@ not the socket-waiter receive path.
 A LogicalAgent that receives through the socket inbox MUST record
 `delivery_transport` as `socket_inbox`. A LogicalAgent bound to a Herdr pane
 MUST record `delivery_transport` as `herdr_prompt`. Those are the only two
-values.
+values. `delivery_transport` is fixed at creation. It MUST NOT change when the
+agent later gains or loses a Herdr binding.
 
 ## Domain model
 
@@ -173,6 +174,10 @@ delivery target. Creating it MUST NOT mint a fake pane occupant or a fake
 incarnation. The operator identity MUST NOT be a LogicalAgent id and MUST NOT
 be an obligation's waiting agent. A TCP or Unix connection MUST NOT be a
 LogicalAgent id.
+
+Public names are one namespace across both transports. A socket waiter's public
+name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
+Alias resolution MUST fail closed when more than one agent could match.
 
 ### Incarnation
 
@@ -269,12 +274,15 @@ Delivery outcome MUST distinguish at least:
 
 The exact mapping from transport observations to these outcomes MUST be
 documented and tested. For `socket_inbox`, a client acknowledgement is
-`accepted`, an absent host is `target_unavailable`, and an ambiguous write is
-`unknown`. Persist of the delivery record is not acceptance. Success of any
-publish outside Kelpie is not acceptance.
+`accepted`, a disconnected host leaves the delivery `queued`, an absent waiter
+identity is `target_unavailable`, and an ambiguous write is `unknown`. Persist
+of the delivery record is not acceptance. Success of any publish outside Kelpie
+is not acceptance.
 
 `submitted`, `accepted`, `queued`, and `unknown` MUST NOT be blindly
-resent because the recipient may already have received the message.
+resent because the recipient may already have received the message. Draining a
+still-queued `socket_inbox` delivery on reconnect is that same attempt
+completing. It is not a resend.
 
 ### Obligation
 
@@ -334,9 +342,11 @@ A due time is one-shot, except a renew policy, which re-arms after each
 completed injection and MUST terminate when its incarnation is no longer Ready.
 Every ask creates a reply-reminder policy by default.
 The caller MAY explicitly disable reminders for one ask. The policy is armed
-only after the ask delivery is accepted. It MUST be injected only when a
-fresh Herdr snapshot proves the owing logical agent's exact Ready incarnation is
-`idle` or `done`. A first observed working-to-idle/done boundary MAY trigger the
+only after the ask delivery is accepted. Reminder injection is `herdr_prompt`
+only. It MUST be injected only when a fresh Herdr snapshot proves the owing
+logical agent's exact Ready incarnation is `idle` or `done`. A `socket_inbox`
+owing agent has no Herdr pane; Kelpie MUST NOT require reminder injection for
+that owing agent. A first observed working-to-idle/done boundary MAY trigger the
 initial reminder before the interval when no reply activity has occurred.
 Progress and final-reply activity reset its interval. An
 unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
@@ -689,8 +699,10 @@ methods MUST NOT be the receive path for `socket_inbox` deliveries.
 
 A socket waiter MUST reconnect, claim its LogicalAgent id as same-user
 attribution (not authentication), and drain queued deliveries for that waiter
-id. A dropped connection MUST NOT resolve an obligation. Deliveries remain
-queued or `target_unavailable` until a client acknowledges them.
+id. A dropped connection MUST NOT resolve an obligation. A disconnected host
+leaves those deliveries `queued` until the same waiter acknowledges them.
+`target_unavailable` means the waiter identity is gone, not that the connection
+dropped.
 
 ## Herdr adapter contract
 
