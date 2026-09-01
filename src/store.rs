@@ -6215,7 +6215,7 @@ impl Store {
                             report.starts_recovered += 1;
                             continue;
                         }
-                        Err(StoreError::Conflict(_)) => continue,
+                        Err(StoreError::Conflict(_)) => {}
                         Err(error) => return Err(error),
                     }
                 }
