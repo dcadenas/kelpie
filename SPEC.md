@@ -143,11 +143,12 @@ make the operator the waiting agent.
 The operator-notice inbox in Goal 10 is a human-facing durable record. It is
 not the socket-waiter receive path.
 
-A LogicalAgent that receives through the socket inbox MUST record
-`delivery_transport` as `socket_inbox`. A LogicalAgent bound to a Herdr pane
-MUST record `delivery_transport` as `herdr_prompt`. Those are the only two
-values. `delivery_transport` is fixed at creation. It MUST NOT change when the
-agent later gains or loses a Herdr binding.
+A LogicalAgent created as a socket-inbox recipient MUST record
+`delivery_transport` as `socket_inbox`. A LogicalAgent created as a Herdr pane
+recipient MUST record `delivery_transport` as `herdr_prompt`. Those are the
+only two values. `delivery_transport` is fixed at creation. It MUST NOT change
+when the agent later gains or loses a Herdr binding. Start-continue and adopt
+MUST refuse a logical agent whose `delivery_transport` is `socket_inbox`.
 
 ## Domain model
 
@@ -177,7 +178,10 @@ LogicalAgent id.
 
 Public names are one namespace across both transports. A socket waiter's public
 name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
-Alias resolution MUST fail closed when more than one agent could match.
+Start, adopt, and rename MUST refuse a name a socket waiter holds. Alias
+resolution MUST fail closed when more than one agent could match. Snapshot
+absence MUST NOT release a socket waiter's name. That name is released only by
+an explicit end of that LogicalAgent as a delivery target.
 
 ### Incarnation
 
@@ -780,12 +784,13 @@ Adoption MUST:
 4. NOT issue `agent.start` or otherwise mutate Herdr topology;
 5. treat public names as aliases: create-new never inherits history of a prior
    logical agent that used the same name; continue reuses only an explicit
-   logical-agent ID. Because create-new inherits nothing, it MUST fail closed
-   when a logical agent already holding that public name has an obligation in
-   `open` or `in_progress`, owing or waiting, and the refusal MUST name that
-   logical agent. Continuing that agent, or first terminating the obligation,
-   are the two paths forward; Kelpie MUST NOT choose either on the caller's
-   behalf;
+   logical-agent ID. Continue MUST refuse a logical agent whose
+   `delivery_transport` is `socket_inbox`. Because create-new inherits nothing,
+   it MUST fail closed when a logical agent already holding that public name has
+   an obligation in `open` or `in_progress`, owing or waiting, and the refusal
+   MUST name that logical agent. Continuing that agent, or first terminating the
+   obligation, are the two paths forward; Kelpie MUST NOT choose either on the
+   caller's behalf;
 6. reject a second Ready adoption of the same exact live binding unless the
    caller is continuing through an approved supersession path.
 
@@ -836,8 +841,9 @@ committed name in place. A rename whose outcome cannot be proven MUST remain
 pending rather than be retried blindly.
 
 The alias belongs to the logical agent, so a rename renames that agent across its
-whole history. Kelpie MUST refuse a name another Ready agent holds, and MUST
-refuse a name outside Herdr's grammar, before any external effect.
+whole history. Kelpie MUST refuse a name another Ready agent holds, MUST refuse
+a name a socket waiter holds, and MUST refuse a name outside Herdr's grammar,
+before any external effect.
 
 ## Launch contract
 
