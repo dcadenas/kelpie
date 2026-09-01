@@ -523,9 +523,9 @@ fn pump_inbox(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, D
     if !session.write_buf.is_empty() {
         return Ok(true);
     }
-    progressed |= read_inbox_acks(session, kelpie)?;
-    progressed |= flush_inbox_write(session)?;
-    Ok(progressed)
+    let read = read_inbox_acks(session, kelpie);
+    let flushed = flush_inbox_write(session)?;
+    Ok(read? || flushed || progressed)
 }
 
 fn enqueue_json_line(buf: &mut Vec<u8>, value: &impl serde::Serialize) -> Result<(), DaemonError> {
@@ -2842,5 +2842,94 @@ mod tests {
         assert!(acked, "ack should complete the same queued attempt");
         let ack = read_json(&mut reader);
         assert_eq!(ack["result"]["outcome"], "accepted");
+    }
+
+    #[test]
+    fn inbox_drains_a_large_body_as_one_json_line() {
+        use crate::domain::{DeliveryOutcome, MessageKind, ReplyDisposition};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "large-waiter")
+            .expect("register");
+        let ask = store
+            .insert_inbox_message(waiter.logical_agent_id, MessageKind::Ask, "q", None, None)
+            .expect("ask");
+        let body = "x".repeat(2_000_000);
+        let reply = store
+            .insert_inbox_message(
+                waiter.logical_agent_id,
+                MessageKind::Reply,
+                &body,
+                Some(ask),
+                Some(ReplyDisposition::Final),
+            )
+            .expect("reply");
+        store
+            .record_socket_inbox_delivery(reply, waiter.logical_agent_id, DeliveryOutcome::Queued)
+            .expect("queue");
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let stream = claim_waiter(&socket, waiter.logical_agent_id, "claim-large");
+        let client = thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            let claim = read_json(&mut reader);
+            assert_eq!(claim["result"]["claimed"], true);
+            read_json(&mut reader)
+        });
+        while !client.is_finished() {
+            daemon.poll().expect("poll large");
+        }
+        let delivery = client.join().expect("client");
+        assert_eq!(delivery["method"], "inbox.delivery");
+        assert_eq!(
+            delivery["params"]["body"].as_str().expect("body").len(),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn inbox_claim_keeps_a_pipelined_ack() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, _, reply) = queue_reply_for_waiter(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        let claim = serde_json::json!({
+            "id": "claim-pipe",
+            "method": "inbox.claim",
+            "params": {"logical_agent_id": waiter},
+        });
+        let ack = serde_json::json!({
+            "id": "ack-pipe",
+            "method": "inbox.ack",
+            "params": {"message_id": reply},
+        });
+        serde_json::to_writer(&mut stream, &claim).expect("claim");
+        stream.write_all(b"\n").expect("nl");
+        serde_json::to_writer(&mut stream, &ack).expect("ack");
+        stream.write_all(b"\n").expect("nl");
+        while daemon.inboxes.is_empty() {
+            daemon.poll().expect("claim");
+        }
+        for _ in 0..20 {
+            daemon.poll().expect("pipeline");
+            if daemon
+                .kelpie
+                .store()
+                .queued_socket_inbox_deliveries(waiter)
+                .expect("queued")
+                .is_empty()
+            {
+                break;
+            }
+        }
+        assert!(
+            daemon
+                .kelpie
+                .store()
+                .queued_socket_inbox_deliveries(waiter)
+                .expect("queued")
+                .is_empty()
+        );
     }
 }
