@@ -2932,4 +2932,45 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn inbox_half_close_still_receives_the_ack() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, _, reply) = queue_reply_for_waiter(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "id": "claim-half",
+                "method": "inbox.claim",
+                "params": {"logical_agent_id": waiter},
+            }),
+        )
+        .expect("claim");
+        stream.write_all(b"\n").expect("nl");
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "id": "ack-half",
+                "method": "inbox.ack",
+                "params": {"message_id": reply},
+            }),
+        )
+        .expect("ack");
+        stream.write_all(b"\n").expect("nl");
+        stream.shutdown(Shutdown::Write).expect("half-close");
+        for _ in 0..20 {
+            let _ = daemon.poll().expect("half-close poll");
+        }
+        let mut reader = BufReader::new(stream);
+        let claim = read_json(&mut reader);
+        assert_eq!(claim["result"]["claimed"], true);
+        let delivery = read_json(&mut reader);
+        assert_eq!(delivery["method"], "inbox.delivery");
+        let ack = read_json(&mut reader);
+        assert_eq!(ack["id"], "ack-half");
+        assert_eq!(ack["result"]["outcome"], "accepted");
+    }
 }
