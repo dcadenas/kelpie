@@ -111,6 +111,7 @@ struct InboxSession {
     waiter_id: LogicalAgentId,
     stream: UnixStream,
     read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
     offered: HashSet<MessageId>,
 }
 
@@ -312,9 +313,14 @@ impl Daemon {
         let mut progressed = false;
         let mut still_open = Vec::with_capacity(self.inboxes.len());
         for mut session in std::mem::take(&mut self.inboxes) {
-            if let Ok(changed) = pump_inbox(&mut session, &mut self.kelpie) {
-                progressed |= changed;
-                still_open.push(session);
+            match pump_inbox(&mut session, &mut self.kelpie) {
+                Ok(changed) => {
+                    progressed |= changed;
+                    still_open.push(session);
+                }
+                Err(error) => {
+                    eprintln!("kelpied: inbox connection failed: {error}");
+                }
             }
         }
         self.inboxes = still_open;
@@ -412,6 +418,7 @@ fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, Daemo
             }
         }
         Ok(request) if request.method == "inbox.claim" => {
+            let leftover = reader.buffer().to_vec();
             let mut stream = reader.into_inner();
             match claim_inbox(&request, kelpie) {
                 Ok(waiter_id) => {
@@ -428,7 +435,8 @@ fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, Daemo
                     return Ok(Served::Inbox(Box::new(InboxSession {
                         waiter_id,
                         stream,
-                        read_buf: Vec::new(),
+                        read_buf: leftover,
+                        write_buf: Vec::new(),
                         offered: HashSet::new(),
                     })));
                 }
@@ -506,9 +514,56 @@ fn claim_inbox(request: &ClientRequest, kelpie: &Kelpie) -> Result<LogicalAgentI
 }
 
 fn pump_inbox(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, DaemonError> {
-    let mut progressed = offer_queued_inbox(session, kelpie)?;
+    let mut progressed = flush_inbox_write(session)?;
+    if !session.write_buf.is_empty() {
+        return Ok(progressed);
+    }
+    progressed |= offer_queued_inbox(session, kelpie)?;
+    progressed |= flush_inbox_write(session)?;
+    if !session.write_buf.is_empty() {
+        return Ok(true);
+    }
     progressed |= read_inbox_acks(session, kelpie)?;
+    progressed |= flush_inbox_write(session)?;
     Ok(progressed)
+}
+
+fn enqueue_json_line(buf: &mut Vec<u8>, value: &impl serde::Serialize) -> Result<(), DaemonError> {
+    serde_json::to_writer(&mut *buf, value)?;
+    buf.push(b'\n');
+    Ok(())
+}
+
+fn flush_inbox_write(session: &mut InboxSession) -> Result<bool, DaemonError> {
+    let mut progressed = false;
+    while !session.write_buf.is_empty() {
+        match session.stream.write(&session.write_buf) {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            Ok(n) => {
+                session.write_buf.drain(..n);
+                progressed = true;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                return Ok(progressed);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match session.stream.flush() {
+        Ok(()) => Ok(progressed),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            Ok(progressed)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<bool, DaemonError> {
@@ -518,7 +573,7 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
         .map_err(|error| std::io::Error::other(format!("queued socket inbox failed: {error}")))?;
     let mut progressed = false;
     for delivery in queued {
-        if !session.offered.insert(delivery.message_id) {
+        if session.offered.contains(&delivery.message_id) {
             continue;
         }
         let event = serde_json::json!({
@@ -533,21 +588,22 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
                 "attempt_number": delivery.attempt_number,
             }
         });
-        write_json_line(&mut session.stream, &event)?;
+        enqueue_json_line(&mut session.write_buf, &event)?;
+        session.offered.insert(delivery.message_id);
         progressed = true;
     }
     Ok(progressed)
 }
 
 fn read_inbox_acks(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, DaemonError> {
+    let mut eof = false;
     let mut chunk = [0_u8; 4096];
     match session.stream.read(&mut chunk) {
-        Ok(0) => {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-        }
+        Ok(0) => eof = true,
         Ok(n) => session.read_buf.extend_from_slice(&chunk[..n]),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(false),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted => {}
         Err(error) => return Err(error.into()),
     }
     let mut progressed = false;
@@ -562,17 +618,23 @@ fn read_inbox_acks(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bo
             Ok(request) if request.method == "inbox.ack" => {
                 match ack_inbox(&request, session.waiter_id, kelpie) {
                     Ok(result) => {
-                        write_json_line(&mut session.stream, &respond(&request.id, Ok(result)))?;
+                        enqueue_json_line(
+                            &mut session.write_buf,
+                            &respond(&request.id, Ok(result)),
+                        )?;
                         progressed = true;
                     }
                     Err(error) => {
-                        write_json_line(&mut session.stream, &respond(&request.id, Err(error)))?;
+                        enqueue_json_line(
+                            &mut session.write_buf,
+                            &respond(&request.id, Err(error)),
+                        )?;
                     }
                 }
             }
             Ok(request) => {
-                write_json_line(
-                    &mut session.stream,
+                enqueue_json_line(
+                    &mut session.write_buf,
                     &respond(
                         &request.id,
                         Err(SliceError::Store(StoreError::InvalidRecord(
@@ -582,8 +644,8 @@ fn read_inbox_acks(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bo
                 )?;
             }
             Err(error) => {
-                write_json_line(
-                    &mut session.stream,
+                enqueue_json_line(
+                    &mut session.write_buf,
                     &ClientResponse {
                         id: String::new(),
                         result: None,
@@ -596,6 +658,9 @@ fn read_inbox_acks(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bo
                 )?;
             }
         }
+    }
+    if eof {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
     Ok(progressed)
 }
