@@ -45,8 +45,8 @@ Kelpie MUST provide:
 6. Honest delivery and lifecycle outcomes, including ambiguity.
 7. Crash recovery through persisted intent and reconciliation with Herdr.
 8. Direct integration with Herdr's socket protocol without invoking its CLI.
-9. A transport-neutral domain model whose local delivery transport is Herdr prompt
-   delivery.
+9. A transport-neutral domain model with two local delivery transports: Herdr
+   prompt delivery, and a local socket inbox.
 10. Optional operator notification backed by a durable local inbox.
 11. A small API and command surface usable by agents and other automation.
 12. Fault-injection tests that prove the invariants across process failure,
@@ -118,6 +118,38 @@ reduce latency, but after reconnect, Herdr restart, suspected event loss, or
 live handoff, Kelpie MUST discard cached present-state assumptions and obtain a
 new authoritative snapshot.
 
+## Local delivery transports
+
+Kelpie's domain is transport-neutral. Locally it MUST support exactly two
+delivery clients of one seam:
+
+1. A Herdr pane, addressed by a Ready incarnation, delivered by Herdr prompt.
+2. A long-lived local socket client, addressed by a pane-less LogicalAgent,
+   delivered by draining that waiter's inbox.
+
+The host process of a socket waiter is a delivery client. It is not a Herdr
+pane.
+
+The verbs are `tell`, `ask`, and `reply`. An occupant answers an ask with
+`reply` and a final disposition. Kelpie MUST NOT add a new message verb or a
+new obligation kind for socket waiters.
+
+Occupant envelopes are `<kelpie from=… msg=… reply-to=…>`: `from` is the
+waiter's public name, `msg` and `reply-to` are the ask message ID. Pane callers
+MUST default sender attribution to the Ready binding of the calling pane. A
+pane-less host MAY attribute a send as the operator; that attribution MUST NOT
+make the operator the waiting agent.
+
+The operator-notice inbox in Goal 10 is a human-facing durable record. It is
+not the socket-waiter receive path.
+
+A LogicalAgent created as a socket-inbox recipient MUST record
+`delivery_transport` as `socket_inbox`. A LogicalAgent created as a Herdr pane
+recipient MUST record `delivery_transport` as `herdr_prompt`. Those are the
+only two values. `delivery_transport` is fixed at creation. It MUST NOT change
+when the agent later gains or loses a Herdr binding. Start-continue and adopt
+MUST refuse a logical agent whose `delivery_transport` is `socket_inbox`.
+
 ## Domain model
 
 The names below describe semantic records, not a required database schema.
@@ -131,11 +163,27 @@ It MUST contain:
 - an immutable opaque ID;
 - a human-readable address or name;
 - either a parent logical-agent ID or an explicit parentless marker;
+- `delivery_transport`: `herdr_prompt` or `socket_inbox`;
 - creation time;
 - application-owned optional metadata that does not become Kelpie policy.
 
 A public name MUST NOT be the primary key. Reuse of a name MUST NOT cause old
 messages, operations, or obligations to refer to the new owner.
+
+A LogicalAgent MAY exist with no Herdr pane. That pane-less agent is a legal
+delivery target. Creating it MUST NOT mint a fake pane occupant or a fake
+incarnation. The operator identity MUST NOT be a LogicalAgent id and MUST NOT
+be an obligation's waiting agent. A TCP or Unix connection MUST NOT be a
+LogicalAgent id.
+
+Public names are one namespace across both transports. A socket waiter's public
+name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
+Start, adopt, and rename MUST refuse a name a socket waiter holds. Alias
+resolution MUST fail closed when more than one agent could match. Snapshot
+absence MUST NOT release a socket waiter's name. That name is released only by
+an explicit end of that LogicalAgent as a delivery target. The operation that
+ends that targeting is part of pane-less identity, not of this transport
+contract.
 
 ### Incarnation
 
@@ -202,15 +250,22 @@ plain-text rendering injected into an agent is a transport representation.
 
 ### Delivery
 
-A `Delivery` represents one attempt to convey a message to one incarnation.
+A `Delivery` represents one attempt to convey a message to one recipient.
 
 It MUST contain:
 
-- message ID and exact recipient incarnation ID;
+- message ID;
+- `delivery_transport`: `herdr_prompt` or `socket_inbox`;
+- for `herdr_prompt`, the exact recipient incarnation ID;
+- for `socket_inbox`, the recipient logical-agent ID, and MUST NOT require an
+  incarnation ID;
 - attempt number;
 - scheduled, attempted, and resolved times where applicable;
-- Herdr request correlation where available;
+- Herdr request correlation when the transport is `herdr_prompt` and the
+  correlation is available;
 - an outcome.
+
+Herdr request correlation MUST NOT be required for `socket_inbox`.
 
 Delivery outcome MUST distinguish at least:
 
@@ -223,9 +278,17 @@ Delivery outcome MUST distinguish at least:
 - `target_unavailable`;
 - `superseded`.
 
-The exact mapping from Herdr observations to these outcomes MUST be documented
-and tested. `submitted`, `accepted`, `queued`, and `unknown` MUST NOT be blindly
-resent because the recipient may already have received the message.
+The exact mapping from transport observations to these outcomes MUST be
+documented and tested. For `socket_inbox`, a client acknowledgement is
+`accepted`, a disconnected host leaves the delivery `queued`, an absent waiter
+identity is `target_unavailable`, and an ambiguous write is `unknown`. Persist
+of the delivery record is not acceptance. Success of any publish outside Kelpie
+is not acceptance.
+
+`submitted`, `accepted`, `queued`, and `unknown` MUST NOT be blindly
+resent because the recipient may already have received the message. Draining a
+still-queued `socket_inbox` delivery on reconnect is that same attempt
+completing. It is not a resend.
 
 ### Obligation
 
@@ -250,17 +313,23 @@ message MUST NOT clear another obligation.
 
 Progress and final replies are durable messages with their own delivery attempts
 to the waiting logical agent. Kelpie MUST resolve the owing and waiting agents
-from the obligation named by `reply_to`, bind the unique Ready incarnation of
-the waiting agent when send intent is recorded, and attempt Herdr prompt
-delivery with the same accepted / rejected / target-unavailable / unknown
-outcomes as `tell` and `ask`. Submitted and unknown reply deliveries MUST NOT be
-blindly resent.
+from the obligation named by `reply_to`. When send intent is recorded, Kelpie
+MUST bind the waiter's receive path:
+
+- `herdr_prompt`: the unique Ready incarnation of the waiting agent, then Herdr
+  prompt delivery;
+- `socket_inbox`: the waiting agent's socket inbox, with no Herdr prompt.
+
+Outcomes are the same accepted / rejected / target-unavailable / unknown set as
+`tell` and `ask`. Submitted and unknown reply deliveries MUST NOT be blindly
+resent.
 
 A final reply MUST resolve the obligation only when its delivery is accepted.
-Rejected, target-unavailable, or unknown final deliveries leave the obligation
-open or in progress so the waiter is not treated as answered without an
-accepted delivery. Progress MAY set `in_progress` when the progress message is
-durably recorded, independent of that progress delivery's terminal outcome.
+For `socket_inbox`, accepted means the socket client acknowledged that
+delivery. Rejected, target-unavailable, or unknown final deliveries leave the
+obligation open or in progress so the waiter is not treated as answered without
+an accepted delivery. Progress MAY set `in_progress` when the progress message
+is durably recorded, independent of that progress delivery's terminal outcome.
 
 ### OperatorNotice
 
@@ -279,9 +348,11 @@ A due time is one-shot, except a renew policy, which re-arms after each
 completed injection and MUST terminate when its incarnation is no longer Ready.
 Every ask creates a reply-reminder policy by default.
 The caller MAY explicitly disable reminders for one ask. The policy is armed
-only after the ask delivery is accepted. It MUST be injected only when a
-fresh Herdr snapshot proves the owing logical agent's exact Ready incarnation is
-`idle` or `done`. A first observed working-to-idle/done boundary MAY trigger the
+only after the ask delivery is accepted. Reminder injection is `herdr_prompt`
+only. It MUST be injected only when a fresh Herdr snapshot proves the owing
+logical agent's exact Ready incarnation is `idle` or `done`. A `socket_inbox`
+owing agent has no Herdr pane; Kelpie MUST NOT require reminder injection for
+that owing agent. A first observed working-to-idle/done boundary MAY trigger the
 initial reminder before the interval when no reply activity has occurred.
 Progress and final-reply activity reset its interval. An
 unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
@@ -595,14 +666,16 @@ Kelpie MUST expose semantic operations equivalent to:
 - `cancel(message_id, reason)` where authorization permits it.
 
 Cancelling an ask settles its obligation `cancelled` with the stated reason,
-and MUST deliver a response naming the reason into the asker's Ready pane when
-one exists, authored by Kelpie as a `cancellation` message with no sender. It
-MUST NOT be attributed to the responder, and cancellation MUST NOT set the
-obligation `resolved`. With no Ready asker the response MUST stay recorded
-against the obligation, and MUST be surfaced to the asker's first obligation
-check after it is again addressable. A cancellation whose Herdr outcome is
-unknown MUST NOT be retried; the settled obligation and the recorded response
-are the durable truth.
+and MUST deliver a response naming the reason to the asker when that asker is
+addressable: into the asker's Ready pane for `herdr_prompt`, or into the
+asker's socket inbox for `socket_inbox`. The response is authored by Kelpie as
+a `cancellation` message with no sender. It MUST NOT be attributed to the
+responder, and cancellation MUST NOT set the obligation `resolved`. With no
+addressable asker the response MUST stay recorded against the obligation, and
+MUST be surfaced to the asker's first obligation check after it is again
+addressable. A cancellation whose transport outcome is unknown MUST NOT be
+retried; the settled obligation and the recorded response are the durable
+truth.
 
 Every agent-facing message rendering MUST include enough information for the
 recipient to reply through Kelpie without guessing:
@@ -620,6 +693,22 @@ security boundary.
 Kelpie SHOULD support receiver acknowledgement and message-ID deduplication.
 Delivery through terminal input MUST be modeled as at-least-once-capable and
 potentially ambiguous.
+
+## Local client protocol
+
+Command RPCs (`tell`, `ask`, `reply`, and the other methods) MAY use one
+newline-delimited JSON request per connection.
+
+That one-shot RPC MUST NOT be the receive path for `socket_inbox` deliveries.
+`pending` lists what an agent owes. `ask-info` re-reads one ask by id. Those
+methods MUST NOT be the receive path for `socket_inbox` deliveries.
+
+A socket waiter MUST reconnect, claim its LogicalAgent id as same-user
+attribution (not authentication), and drain queued deliveries for that waiter
+id. A dropped connection MUST NOT resolve an obligation. A disconnected host
+leaves those deliveries `queued` until the same waiter acknowledges them.
+`target_unavailable` means the waiter identity is gone, not that the connection
+dropped.
 
 ## Herdr adapter contract
 
@@ -697,12 +786,13 @@ Adoption MUST:
 4. NOT issue `agent.start` or otherwise mutate Herdr topology;
 5. treat public names as aliases: create-new never inherits history of a prior
    logical agent that used the same name; continue reuses only an explicit
-   logical-agent ID. Because create-new inherits nothing, it MUST fail closed
-   when a logical agent already holding that public name has an obligation in
-   `open` or `in_progress`, owing or waiting, and the refusal MUST name that
-   logical agent. Continuing that agent, or first terminating the obligation,
-   are the two paths forward; Kelpie MUST NOT choose either on the caller's
-   behalf;
+   logical-agent ID. Continue MUST refuse a logical agent whose
+   `delivery_transport` is `socket_inbox`. Because create-new inherits nothing,
+   it MUST fail closed when a logical agent already holding that public name has
+   an obligation in `open` or `in_progress`, owing or waiting, and the refusal
+   MUST name that logical agent. Continuing that agent, or first terminating the
+   obligation, are the two paths forward; Kelpie MUST NOT choose either on the
+   caller's behalf;
 6. reject a second Ready adoption of the same exact live binding unless the
    caller is continuing through an approved supersession path.
 
@@ -753,8 +843,9 @@ committed name in place. A rename whose outcome cannot be proven MUST remain
 pending rather than be retried blindly.
 
 The alias belongs to the logical agent, so a rename renames that agent across its
-whole history. Kelpie MUST refuse a name another Ready agent holds, and MUST
-refuse a name outside Herdr's grammar, before any external effect.
+whole history. Kelpie MUST refuse a name another Ready agent holds, MUST refuse
+a name a socket waiter holds, and MUST refuse a name outside Herdr's grammar,
+before any external effect.
 
 ## Launch contract
 
@@ -893,6 +984,12 @@ Every conforming implementation MUST prove this end-to-end path:
 The scenario does not require recurring schedules, remote transport,
 application workflow policy, a general workflow engine, or a graphical UI.
 
+A conforming implementation MUST also prove the same ask, accepted final, and
+resolve path for a `socket_inbox` waiter, using a reconnectable inbox client
+rather than a pane. A final on that path MUST NOT resolve on persist. It MUST
+resolve only on accepted socket acknowledgement. Pane waiters MUST keep the
+Herdr prompt proofs above.
+
 ## Conformance matrix
 
 | Invariant | Required proof |
@@ -927,6 +1024,9 @@ application workflow policy, a general workflow engine, or a graphical UI.
 | A cancellation reaches the asker | Cancel an ask whose asker is Ready and verify a Kelpie-authored `cancellation` message names the reason in the asker's pane, with the obligation `cancelled`, not `resolved`. |
 | A cancellation outlives the asker | Cancel an ask whose asker has no Ready incarnation, then re-adopt that asker and verify pending surfaces the cancellation with its reason and never attributes it to the responder; verify a cancellation whose response was already accepted into a pane does not re-surface. |
 | Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
+| Socket-inbox final resolves only on ACK | Occupant `reply` final to a `socket_inbox` waiter: no Herdr prompt to the waiter, persist does not resolve, ACK resolves once, a dropped host leaves the obligation open. |
+| Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |
+| Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming another waiter id is refused. |
 
 Tests SHOULD use deterministic fake Herdr protocol fixtures for state-machine
 coverage and real Herdr integration tests for transport, lifecycle, and failure
