@@ -79,7 +79,10 @@ authentication boundary.
   `delivery_transport=socket_inbox`. It mints no incarnation. `waiter.retire`
   ends that targeting and releases the name. Open or in-progress asks waiting
   on that waiter are cancelled in the same transaction, reason `waiter retired`,
-  and the owing agent is notified when addressable. Queued inbox deliveries for
+  and the owing agent is notified when addressable, except when that ask's own
+  delivery is still an unsubmitted queued row. The result lists
+  `cancelled_ask_ids` and `owing_notices` with `owing_response`
+  `delivered` or `recorded`. Queued inbox deliveries for
   the waiter do not remain queued. `ask` `from_operator` attributes
   the stored sender as the operator; `waiting_agent_id` stays the waiter, and
   occupant envelopes still use `from=` equal to the waiter's public name.

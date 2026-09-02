@@ -559,7 +559,7 @@ fn spawn_unwritten_owing_prompt_herdr(socket: &Path) -> thread::JoinHandle<()> {
 }
 
 #[test]
-fn kill_after_waiter_retire_owing_submitted_settles_without_resend() {
+fn kill_after_waiter_retire_owing_submitted_settles_before_write() {
     let directory = tempfile::tempdir().expect("tempdir");
     let database = directory.path().join("kelpie.sqlite3");
     let kelpie_socket = directory.path().join("kelpie.sock");

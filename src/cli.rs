@@ -2674,6 +2674,36 @@ mod tests {
     }
 
     #[test]
+    fn waiter_retire_receipt_joins_ids_and_counts_owing_notices() {
+        let text = format_receipt(
+            "waiter.retire",
+            &json!({"result":{
+                "logical_agent_id":"waiter-1",
+                "targeting_ended":true,
+                "cancelled_ask_ids":["ask-a","ask-b"],
+                "owing_notices":[
+                    {"ask_message_id":"ask-a","message_id":"n1","owing_response":"delivered"},
+                    {"ask_message_id":"ask-b","message_id":"n2","owing_response":"recorded"}
+                ]
+            }}),
+        );
+        assert!(text.contains("cancelled-asks=ask-a,ask-b"), "{text}");
+        assert!(text.contains("owing-delivered=1"), "{text}");
+        assert!(text.contains("owing-recorded=1"), "{text}");
+        let empty = format_receipt(
+            "waiter.retire",
+            &json!({"result":{
+                "logical_agent_id":"waiter-1",
+                "targeting_ended":true,
+                "cancelled_ask_ids":[],
+                "owing_notices":[]
+            }}),
+        );
+        assert!(empty.contains("cancelled-asks=none"), "{empty}");
+        assert!(empty.contains("owing-delivered=0"), "{empty}");
+    }
+
+    #[test]
     fn tell_accepts_exact_ids_without_alias() {
         let invocation = parse_invocation(&args(&[
             "tell",
