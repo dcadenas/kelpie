@@ -48,6 +48,14 @@ The compiled points are test infrastructure, not a public operational API:
 - `cancellation_after_response_before_commit`: a structured `agent.prompt`
   acceptance response has been decoded, while the cancellation's prompt
   operation remains `pending` and its attempt and delivery remain `submitted`.
+- `inbox_after_queued_before_write`: a socket-inbox delivery is durably
+  `queued` and selected to offer, and no `inbox.delivery` byte has been written.
+- `inbox_after_write_before_ack`: the complete `inbox.delivery` line has been
+  written and flushed, while the delivery remains `queued` and no `inbox.ack`
+  has been committed.
+- `inbox_after_ack_before_resolve`: a parsed `inbox.ack` names that queued
+  delivery, while the delivery remains `queued` and the obligation has not been
+  resolved.
 - `initial_message_after_submitted_before_write`: runtime start is independently
   `succeeded` and its incarnation is `ready`; the initial tell's separate
   message, prompt operation, delivery, and request attempt are durable; the
@@ -182,13 +190,25 @@ is the one place Kelpie retries a submitted prompt: a duplicate resume prompt
 tells an agent its own instructions twice, while a missing one leaves an agent
 cleared, idle, and instructionless, with nothing inside it that could notice.
 
+The socket-inbox process-kill tests cover the same three boundaries on the
+inbox write rather than a Herdr prompt. Persist queues the delivery and does
+not resolve. Kill before write proves zero `inbox.delivery` bytes. Kill after
+write proves the client parsed that line while the delivery stayed `queued`.
+Kill after ACK proves the acknowledgement was read and the obligation stayed
+open because resolve was not committed. Restart leaves the same queued row;
+reconnecting as that waiter id drains it. That drain is the original attempt
+completing, not a resend, and a second delivery row is never inserted.
+Socket-inbox never records `unknown` for those kills: persist precedes every
+inbox byte, a torn line has no newline, and the same queued row is what
+reconnect offers.
+
 The deterministic process-kill matrix covers all three explicit external-
 effect boundaries for runtime start, ask prompt, tell prompt, initial-tell
-prompt, and standalone clear: after durable submission but before request write,
-after complete write
-and flush but before response read, and after structured response decode but
-before local outcome commit. Renew is covered at its two distinct external
-effects rather than at three boundaries each, because its response boundary is
-the ordinary prompt boundary and its recovery obligation is asymmetric: the
-clear must never be repeated and the injection must never be abandoned. See
-`real-herdr-test.md` for the isolated integration procedure.
+prompt, standalone clear, and socket-inbox delivery: after durable submission
+but before request write, after complete write and flush but before response
+read, and after structured response decode but before local outcome commit.
+Renew is covered at its two distinct external effects rather than at three
+boundaries each, because its response boundary is the ordinary prompt boundary
+and its recovery obligation is asymmetric: the clear must never be repeated and
+the injection must never be abandoned. See `real-herdr-test.md` for the isolated
+integration procedure.
