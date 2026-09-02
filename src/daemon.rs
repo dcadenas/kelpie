@@ -113,6 +113,7 @@ struct InboxSession {
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     offered: HashSet<MessageId>,
+    awaiting_write_pause: bool,
 }
 
 /// A bound foreground daemon. Dropping it removes only the socket it created.
@@ -438,6 +439,7 @@ fn serve_stream(stream: UnixStream, kelpie: &mut Kelpie) -> Result<Served, Daemo
                         read_buf: leftover,
                         write_buf: Vec::new(),
                         offered: HashSet::new(),
+                        awaiting_write_pause: false,
                     })));
                 }
                 Err(error) => {
@@ -518,14 +520,23 @@ fn pump_inbox(session: &mut InboxSession, kelpie: &mut Kelpie) -> Result<bool, D
     if !session.write_buf.is_empty() {
         return Ok(progressed);
     }
+    pause_after_inbox_write(session);
     progressed |= offer_queued_inbox(session, kelpie)?;
     progressed |= flush_inbox_write(session)?;
     if !session.write_buf.is_empty() {
         return Ok(true);
     }
+    pause_after_inbox_write(session);
     let read = read_inbox_acks(session, kelpie);
     let flushed = flush_inbox_write(session)?;
     Ok(read? || flushed || progressed)
+}
+
+fn pause_after_inbox_write(session: &mut InboxSession) {
+    if session.awaiting_write_pause && session.write_buf.is_empty() {
+        crate::test_fault::pause("inbox_after_write_before_ack");
+        session.awaiting_write_pause = false;
+    }
 }
 
 fn enqueue_json_line(buf: &mut Vec<u8>, value: &impl serde::Serialize) -> Result<(), DaemonError> {
@@ -576,6 +587,7 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
         if session.offered.contains(&delivery.message_id) {
             continue;
         }
+        crate::test_fault::pause("inbox_after_queued_before_write");
         let event = serde_json::json!({
             "id": uuid::Uuid::now_v7().to_string(),
             "method": "inbox.delivery",
@@ -590,6 +602,7 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
         });
         enqueue_json_line(&mut session.write_buf, &event)?;
         session.offered.insert(delivery.message_id);
+        session.awaiting_write_pause = true;
         progressed = true;
     }
     Ok(progressed)
@@ -672,6 +685,7 @@ fn ack_inbox(
 ) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<InboxAckParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    crate::test_fault::pause("inbox_after_ack_before_resolve");
     let outcome = kelpie
         .store_mut()
         .ack_socket_inbox_delivery(waiter_id, params.message_id)
