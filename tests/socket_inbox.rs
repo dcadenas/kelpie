@@ -642,3 +642,94 @@ fn reconnect_drains_one_waiter_and_refuses_another() {
     daemon.kill().expect("stop");
     daemon.wait().expect("reap");
 }
+
+#[test]
+fn waiter_retire_cancels_open_ask_and_refuses_later_final_as_not_open() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (waiter, owing, ask) = seed_waiter_and_ask(&database);
+    let (prompt_tx, prompt_rx) = mpsc::channel();
+    let _herdr = spawn_prompt_herdr(&herdr_socket, prompt_tx);
+    let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
+    let retired = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "retire-1",
+            "method": "waiter.retire",
+            "params": {"logical_agent_id": waiter.logical_agent_id}
+        }),
+    );
+    assert!(retired["error"].is_null(), "{retired}");
+    assert_eq!(retired["result"]["targeting_ended"], true);
+    assert_eq!(
+        retired["result"]["cancelled_ask_ids"],
+        serde_json::json!([ask.to_string()])
+    );
+    let prompt = prompt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("owing notice");
+    let text = prompt["params"]["text"]
+        .as_str()
+        .expect("owing cancellation text");
+    assert!(text.contains("waiter retired"), "{text}");
+    assert!(text.contains(&ask.to_string()), "{text}");
+    assert!(!text.contains("reply-to"), "{text}");
+    let pending = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "pending-1",
+            "method": "pending",
+            "params": {"agent_id": owing.logical_agent_id}
+        }),
+    );
+    let obligations = pending["result"].as_array().expect("obligations");
+    assert!(
+        obligations
+            .iter()
+            .all(|row| row["state"] != "open" && row["state"] != "in_progress"),
+        "{pending}"
+    );
+    let later = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "reply-late",
+            "method": "reply",
+            "params": {
+                "reply_to": ask,
+                "requester_agent_id": owing.logical_agent_id,
+                "body": "too late",
+                "disposition": "final",
+                "idempotency_key": "after-retire"
+            }
+        }),
+    );
+    assert_eq!(later["error"]["class"], "conflict");
+    assert!(
+        later["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("does not name an open obligation"),
+        "{later}"
+    );
+    assert!(
+        !later["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("no longer a delivery target"),
+        "{later}"
+    );
+    let claim = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "claim-ended",
+            "method": "inbox.claim",
+            "params": {"logical_agent_id": waiter.logical_agent_id}
+        }),
+    );
+    assert_eq!(claim["error"]["class"], "conflict");
+    daemon.kill().expect("stop");
+    daemon.wait().expect("reap");
+}

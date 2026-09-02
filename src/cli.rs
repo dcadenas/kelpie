@@ -438,9 +438,10 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "public_name")
         ),
         "waiter.retire" => format!(
-            "waiter-retire agent={} targeting-ended={}\n",
+            "waiter-retire agent={} targeting-ended={} cancelled-asks={}\n",
             field(&result, "logical_agent_id"),
-            field(&result, "targeting_ended")
+            field(&result, "targeting_ended"),
+            field(&result, "cancelled_ask_ids")
         ),
         "rename" => format!(
             "rename name={} agent={} incarnation={}\n",

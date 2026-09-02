@@ -1,5 +1,6 @@
 //! The first composed start, ask, reply, and recovery path.
 
+use std::collections::{HashMap, HashSet};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -13,8 +14,8 @@ use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply, CreatedTell,
-    DeclaredStart, DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport,
-    ReplyReceivePath, Store, StoreError, store_clock_ms,
+    DeclaredStart, DueDelivery, DueReminder, DueRenew, EndedWaiter, PendingObligation,
+    RecoveryReport, ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -2553,6 +2554,67 @@ impl Kelpie {
             owing_delivered,
             owing_message_id: Some(created.owing_message_id),
         })
+    }
+
+    /// End a socket waiter, cancelling asks it is waiting on.
+    ///
+    /// Durable cancel and targeting end commit before any owing stop-notice is
+    /// written to Herdr. The waiter inbox is not a receive path: that agent is
+    /// no longer a delivery target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the agent is not an active socket waiter.
+    pub fn retire_waiter(
+        &mut self,
+        logical_agent_id: LogicalAgentId,
+    ) -> Result<EndedWaiter, SliceError> {
+        let asks = self
+            .store
+            .unresolved_asks_waiting_on(logical_agent_id)
+            .map_err(SliceError::Store)?;
+        let mut owing_due = HashMap::new();
+        let mut defer = HashSet::new();
+        for ask in asks {
+            let owing_incarnation = self
+                .store
+                .cancel_owing_incarnation(ask)
+                .map_err(SliceError::Store)?;
+            let (due_at_ms, should_defer) = match owing_incarnation {
+                Some(incarnation) => self.prompt_schedule(incarnation, None)?,
+                None => (None, false),
+            };
+            owing_due.insert(ask, due_at_ms);
+            if should_defer {
+                defer.insert(ask);
+            }
+        }
+        let ended = self
+            .store
+            .end_socket_waiter_with_owing_due(logical_agent_id, &owing_due)
+            .map_err(SliceError::Store)?;
+        for notice in &ended.owing_notices {
+            if defer.contains(&notice.ask_message_id) {
+                continue;
+            }
+            let Some((operation_id, incarnation)) = notice.delivery else {
+                continue;
+            };
+            let owing_name = self.store.ask_info(notice.ask_message_id)?.responder_name;
+            self.deliver_cancellation_notice(
+                operation_id,
+                incarnation,
+                &envelope::render_owing_cancellation(
+                    &owing_name,
+                    &notice.ask_message_id.to_string(),
+                    "waiter retired",
+                )?,
+                "kelpie:owing-cancellation",
+                "owing_cancellation_after_submitted_before_write",
+                "owing_cancellation_after_response_before_commit",
+            )?;
+        }
+        Ok(ended)
     }
 
     fn deliver_cancellation_notice(
