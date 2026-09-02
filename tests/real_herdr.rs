@@ -68,6 +68,7 @@ fn real_herdr_start_ask_and_correlated_reply() {
             &format!("real-ask-{}", uuid::Uuid::now_v7()),
             None,
             None,
+            false,
         )
         .expect("real Herdr prompt accepts delivery");
     kelpie

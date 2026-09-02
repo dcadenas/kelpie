@@ -291,6 +291,9 @@ kelpie handoff --replace <incarnation-id> --logical-id <agent-id> \
   --cwd /new/checkout --timeout-ms 90000 --keep-open --parentless --tell --stdin
 kelpie start --name worker --pane w1:p1 --terminal term-1 --backend grok \
   --cwd /tmp/work --timeout-ms 5000 --keep-open --parentless --tell --stdin
+kelpie waiter-register --name inbox --parentless
+kelpie ask worker --sender-id <waiter-id> --from operator --stdin
+kelpie waiter-retire --logical-id <waiter-id>
 ```
 
 Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Use exactly
@@ -435,6 +438,11 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   with an in-flight renew cycle.
   Unknown kinds fail closed; no command is guessed. An ambiguous submitted
   clear is never resent automatically.
+- `waiter.register`: create a pane-less LogicalAgent with socket-inbox delivery.
+  No incarnation, no pane occupant. `waiter.retire` ends that targeting and
+  releases the public name. `--from operator` on `ask` is sender attribution
+  only; `waiting_agent_id` is the waiter, and occupant `from=` is the waiter's
+  public name.
 - `ask`: same recipient shape as `tell`, delivered immediately; a due time is
   refused. Every ask
   creates a five-minute pending-reply reminder by default. Use

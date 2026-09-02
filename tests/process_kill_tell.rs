@@ -199,9 +199,13 @@ fn spawn_withholding_tell_herdr(socket: &Path, parsed_socket: &Path) -> thread::
         let envelope = request["params"]["text"]
             .as_str()
             .expect("tell prompt text");
-        assert_eq!(
-            envelope,
-            "<kelpie from=sender>\none-way delivery\n</kelpie>"
+        assert!(
+            envelope.starts_with("<kelpie from=sender msg="),
+            "{envelope}"
+        );
+        assert!(
+            envelope.ends_with(">\none-way delivery\n</kelpie>"),
+            "{envelope}"
         );
         assert!(!envelope.contains("reply-to"));
         UnixStream::connect(parsed_socket)

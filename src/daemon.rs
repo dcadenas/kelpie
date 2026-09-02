@@ -13,8 +13,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::domain::{
-    AdoptIntent, IncarnationId, LogicalAgentId, MessageId, RenewId, RenewTimeout, ReplyDisposition,
-    StartIntent,
+    AdoptIntent, IncarnationId, LogicalAgentId, MessageId, Parent, RenewId, RenewTimeout,
+    ReplyDisposition, StartIntent,
 };
 use crate::herdr::HerdrError;
 use crate::slice::{AwaitingClear, ClearResult, ClearSubmission, Kelpie, SliceError};
@@ -456,6 +456,8 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
         "start" | "handoff" => dispatch_start(request.params, kelpie),
         "adopt" => dispatch_adopt(request.params, kelpie),
         "ask" => dispatch_ask(request.params, kelpie),
+        "waiter.register" => dispatch_waiter_register(request.params, kelpie),
+        "waiter.retire" => dispatch_waiter_retire(request.params, kelpie),
         "tell" => dispatch_tell(request.params, kelpie),
         "renew" => dispatch_renew(request.params, kelpie),
         "renew.cancel" => serde_json::from_value::<RenewCancelParams>(request.params)
@@ -1010,6 +1012,33 @@ fn dispatch_recover(kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     })
 }
 
+fn dispatch_waiter_register(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<WaiterRegisterParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let created = kelpie
+        .store_mut()
+        .register_socket_waiter(&params.public_name, params.parent, &params.idempotency_key)
+        .map_err(SliceError::Store)?;
+    Ok(serde_json::json!({
+        "logical_agent_id": created.logical_agent_id,
+        "public_name": params.public_name,
+        "delivery_transport": "socket_inbox",
+    }))
+}
+
+fn dispatch_waiter_retire(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<WaiterRetireParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    kelpie
+        .store_mut()
+        .end_socket_waiter(params.logical_agent_id)
+        .map_err(SliceError::Store)?;
+    Ok(serde_json::json!({
+        "logical_agent_id": params.logical_agent_id,
+        "targeting_ended": true,
+    }))
+}
+
 fn dispatch_ask(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<AskParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
@@ -1040,6 +1069,7 @@ fn dispatch_ask(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError>
         &params.idempotency_key,
         None,
         reminder_interval,
+        params.from_operator,
     )?;
     let delivery_outcome = kelpie
         .store_mut()
@@ -1050,6 +1080,7 @@ fn dispatch_ask(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError>
         "operation_id": created.operation_id,
         "recipient": recipient,
         "recipient_incarnation": recipient_incarnation,
+        "waiting_agent_id": params.sender,
         "delivery_outcome": delivery_outcome
     });
     if let Some(due_at_ms) = params.due_at_ms {
@@ -1393,6 +1424,18 @@ fn classify_error(error: &SliceError) -> ClientError {
 }
 
 #[derive(Debug, Deserialize)]
+struct WaiterRegisterParams {
+    public_name: String,
+    parent: Parent,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaiterRetireParams {
+    logical_agent_id: LogicalAgentId,
+}
+
+#[derive(Debug, Deserialize)]
 struct AskParams {
     sender: LogicalAgentId,
     #[serde(default)]
@@ -1412,6 +1455,9 @@ struct AskParams {
     remind_after_ms: Option<i64>,
     #[serde(default)]
     no_remind: bool,
+    /// Message-sender attribution only. The waiting agent is still `sender`.
+    #[serde(default)]
+    from_operator: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1592,6 +1638,7 @@ mod tests {
             due_at_ms: None,
             remind_after_ms,
             no_remind,
+            from_operator: false,
         }
     }
 
