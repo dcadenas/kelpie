@@ -4119,6 +4119,7 @@ impl Store {
                     o.cancellation_requester_agent_id, o.last_activity_at_ms
              FROM obligations o
              WHERE o.owing_agent_id = ?1 AND o.state = 'cancelled'
+               AND o.cancellation_owing_message_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM deliveries d
                                WHERE d.message_id = o.cancellation_owing_message_id
                                  AND d.outcome = 'accepted')
@@ -11696,6 +11697,106 @@ mod tests {
             .expect("owing while away after revival");
         assert_eq!(revived.len(), 1);
         assert_eq!(revived[0].ask_message_id, ask.message_id.to_string());
+    }
+
+    #[test]
+    fn accepted_or_absent_owing_notice_does_not_resurface() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-waiting", "owing-excl-waiting"))
+            .expect("declare waiting");
+        let owing = store
+            .declare_start(&intent("owing", "term-owing", "owing-excl-owing"))
+            .expect("declare owing");
+        mark_ready(&mut store, waiting, "waiting", "term-waiting");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "status?",
+                "owing-excl-ask",
+            )
+            .expect("ask");
+        let created = store
+            .cancel_with_response(
+                waiting.logical_agent_id,
+                ask.message_id,
+                "stand down",
+                "Your ask was cancelled. Reason: stand down.",
+                "Stop. Ask was cancelled. Reason: stand down.",
+                None,
+                None,
+            )
+            .expect("cancel");
+        let cancelled_at: i64 = store
+            .connection
+            .query_row(
+                "SELECT last_activity_at_ms FROM obligations WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("cancelled obligation");
+        store
+            .connection
+            .execute(
+                "INSERT INTO incarnations (
+                    id, logical_agent_id, herdr_session, intended_pane_id,
+                    expected_terminal_id, backend_kind, backend_args_json,
+                    working_directory, created_at_ms, state
+                 ) VALUES (?1, ?2, 's', 'w1:p2', 'term-owing', 'codex', '[]', '/tmp', ?3, 'ready')",
+                params![
+                    IncarnationId::new().to_string(),
+                    owing.logical_agent_id.to_string(),
+                    cancelled_at + 1
+                ],
+            )
+            .expect("owing revival incarnation");
+        store
+            .connection
+            .execute(
+                "INSERT INTO deliveries
+                 (message_id, delivery_transport, recipient_incarnation_id,
+                  recipient_agent_id, attempt_number, scheduled_at_ms, outcome)
+                 VALUES (?1, 'socket_inbox', NULL, ?2, 1, ?3, 'accepted')",
+                params![
+                    created.owing_message_id.to_string(),
+                    owing.logical_agent_id.to_string(),
+                    cancelled_at
+                ],
+            )
+            .expect("accepted owing notice");
+        let after_accept = store
+            .cancelled_owing_while_away(owing.logical_agent_id)
+            .expect("owing after accepted notice");
+        assert!(
+            after_accept.is_empty(),
+            "an accepted owing notice must not re-surface"
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE obligations SET cancellation_owing_message_id = NULL
+                 WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+            )
+            .expect("pre-upgrade null owing notice");
+        store
+            .connection
+            .execute(
+                "DELETE FROM deliveries WHERE message_id = ?1",
+                [created.owing_message_id.to_string()],
+            )
+            .expect("drop synthetic delivery");
+        let pre_upgrade = store
+            .cancelled_owing_while_away(owing.logical_agent_id)
+            .expect("owing with null notice id");
+        assert!(
+            pre_upgrade.is_empty(),
+            "a cancel from before owing notices existed must not surface as a stop-notice"
+        );
     }
 
     fn unnamed_intent(key: &str) -> crate::domain::AdoptIntent {

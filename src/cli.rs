@@ -450,13 +450,18 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
         ),
         "notice.create" => format!("notice {}\n", field(&result, "notice_id")),
         "cancel" => format!(
-            "cancel state={} response={}{}\n",
+            "cancel state={} response={}{} owing-response={}{}\n",
             field(&result, "state"),
             field(&result, "response"),
             result
                 .get("message_id")
                 .and_then(Value::as_str)
-                .map_or(String::new(), |id| format!(" message={id}"))
+                .map_or(String::new(), |id| format!(" message={id}")),
+            field(&result, "owing_response"),
+            result
+                .get("owing_message_id")
+                .and_then(Value::as_str)
+                .map_or(String::new(), |id| format!(" owing-message={id}"))
         ),
         "retire" => format!(
             "retire operation={} pane-released={}\n",
@@ -2622,6 +2627,23 @@ mod tests {
         );
         assert!(text.contains("unknown_outcome"));
         assert!(text.contains("ambiguous"));
+    }
+
+    #[test]
+    fn cancel_receipt_names_both_audiences() {
+        let text = format_receipt(
+            "cancel",
+            &json!({"result":{
+                "state":"cancelled",
+                "response":"delivered",
+                "message_id":"ask-notice",
+                "owing_response":"recorded",
+                "owing_message_id":"owing-notice"
+            }}),
+        );
+        assert!(text.contains("response=delivered"), "{text}");
+        assert!(text.contains("owing-response=recorded"), "{text}");
+        assert!(text.contains("owing-message=owing-notice"), "{text}");
     }
 
     #[test]
