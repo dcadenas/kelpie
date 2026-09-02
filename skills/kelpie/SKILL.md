@@ -454,9 +454,11 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   ID; it identifies the durable reply obligation.
 - `reply`: provide `reply_to` (the ask message ID), `body`, `progress` or
   `final` disposition, and `idempotency_key`. Kelpie resolves the exact owing
-  and waiting logical agents from the durable obligation, delivers the
-  progress/final envelope to the waiter's Ready incarnation, and reports
-  delivery outcome. Only an accepted final reply resolves the obligation.
+  and waiting logical agents from the durable obligation and binds the waiter's
+  receive path: a pane waiter's Ready incarnation through Herdr, or a socket
+  waiter's inbox with no Herdr prompt. Persist is not acceptance. Only an
+  accepted final reply resolves the obligation — Herdr prompt acceptance, or
+  socket `inbox.ack`.
 - `renew`: bound one agent's context by clearing it and re-seeding it. With no
   recipient it arms on the caller; it accepts no alias, only `--recipient-id`
   with `--recipient-incarnation` for a deliberate cross-target. Two phases: the
@@ -547,6 +549,8 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   and a non-empty reason. A queued tell or ask can be cancelled only before
   the first Herdr write. After submit, existing no-resend and unknown rules
   apply; open/in-progress ask obligations remain cancellable by the waiter.
+  A socket waiter receives the Kelpie-authored cancellation on its inbox;
+  state is `cancelled`, not `resolved`.
 - `retire`: record desired retirement for an incarnation. On its own it sends
   nothing to Herdr and leaves the pane occupied. Add `--close-pane` to release
   the pane in the same step; it ends that process but keeps the worktree,
