@@ -2317,7 +2317,10 @@ impl Kelpie {
                 Some(live) if !live.is_empty() && live != recorded => {
                     return Err(SliceError::LiveConflict(format!(
                         "pane {pane_id} live name {live} does not match continuable agent \
-                         {logical_agent_id} alias {recorded}; adopt --logical-id to continue it"
+                         {logical_agent_id} alias {recorded}; adopt --logical-id \
+                         {logical_agent_id} to continue that agent, or adopt --pane {pane_id} \
+                         --terminal {} --name {live} to bind the live occupant as a new agent",
+                        agent.terminal_id
                     )));
                 }
                 _ => Some(recorded),
@@ -4323,6 +4326,7 @@ mod tests {
         assert!(message.contains("stranger"), "{message}");
         assert!(message.contains("foobar"), "{message}");
         assert!(message.contains("adopt --logical-id"), "{message}");
+        assert!(message.contains("new agent"), "{message}");
         server.join().expect("server");
     }
 

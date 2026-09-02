@@ -757,13 +757,15 @@ auto-adoption is out of scope.
 Kelpie MAY perform targeted lazy adoption when a command needs an unbound
 calling pane or addresses a missing alias. Caller adoption MUST select the
 exact pane and observed terminal. When that exact pane, terminal, and backend
-kind already record a unique `lost` or `unknown` incarnation, lazy caller
-adoption MUST continue that logical agent and MUST keep its recorded public
-name: an unnamed live occupant is claimed under that name, and a live name that
-does not equal it MUST fail closed. `declared`, `starting`, or `failed`
-incarnations on the same pane and terminal, a backend mismatch, or more than
-one such logical agent MUST fail closed and name the id so the caller can pass
-an explicit `logical_agent_id`. When none exist, it MAY create a new logical
+kind already record a unique `lost`, `unknown`, or `declared` incarnation, lazy
+caller adoption MUST continue that logical agent and MUST keep its recorded
+public name: an unnamed live occupant is claimed under that name, and a live
+name that does not equal it MUST fail closed. `declared` is included so a
+failed name claim on first use can be retried against the same agent rather
+than wedging the pane. `starting` or `failed` incarnations on the same pane and
+terminal, a backend mismatch, or more than one such logical agent MUST fail
+closed and name the id so the caller can pass an explicit `logical_agent_id` or
+adopt the live occupant as a new agent. When none exist, it MAY create a new logical
 agent. Lazy caller adoption MUST NOT mint a new logical agent while a
 continuable prior incarnation occupies that exact pane and terminal, MUST NOT
 replace the continued agent's alias with a working-directory basename, and

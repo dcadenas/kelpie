@@ -3465,19 +3465,20 @@ impl Store {
         )
     }
 
-    /// Find the unique lost or unknown logical agent for one live binding.
+    /// Find the unique continuable logical agent for one live binding.
     ///
     /// `ready` is already bound. `retiring`, `retired`, and `superseded` left
     /// the runtime on purpose. `lost` and `unknown` on this exact pane,
     /// terminal, and backend are the prior occupant that lazy create-new would
-    /// fork. `declared`, `starting`, and `failed` on the same pane and terminal
-    /// fail closed: they are in-flight identity work, not a first-use vacancy.
+    /// fork. `declared` of that same backend is retried so a failed name claim
+    /// does not wedge the pane. `starting` and `failed` on the same pane and
+    /// terminal fail closed.
     ///
     /// # Errors
     ///
     /// Returns a conflict when more than one logical agent still occupies the
-    /// pane and terminal, or when the unique occupant is not a lost or unknown
-    /// incarnation of the live backend.
+    /// pane and terminal, or when the unique occupant is not a lost, unknown,
+    /// or declared incarnation of the live backend.
     pub fn continuable_logical_agent_for_binding(
         &self,
         pane_id: &str,
@@ -3524,14 +3525,15 @@ impl Store {
             StoreError::InvalidRecord(format!("invalid logical agent id {}", ids[0]))
         })?;
         let matches_live = occupants.iter().any(|(_, state, backend)| {
-            matches!(state.as_str(), "lost" | "unknown") && backend == backend_kind
+            matches!(state.as_str(), "lost" | "unknown" | "declared") && backend == backend_kind
         });
         if matches_live {
             Ok(Some(id))
         } else {
             Err(StoreError::Conflict(format!(
-                "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost or unknown \
-                 {backend_kind} incarnation; adopt --logical-id to continue it"
+                "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost, unknown, or \
+                 declared {backend_kind} incarnation; adopt --logical-id to continue it, or \
+                 adopt the live occupant as a new agent"
             )))
         }
     }
@@ -10840,15 +10842,17 @@ mod tests {
     }
 
     #[test]
-    fn continuable_binding_refuses_a_declared_only_occupant() {
+    fn continuable_binding_retries_a_declared_occupant() {
         let mut store = Store::in_memory().expect("store");
-        store
+        let pending = store
             .declare_adopt_pending(&adopt_intent("pend-only"), &ready_evidence())
             .expect("pending");
-        let error = store
-            .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
-            .expect_err("declared is not auto-continued");
-        assert!(error.to_string().contains("adopt --logical-id"), "{error}");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("declared retries"),
+            Some(pending.logical_agent_id)
+        );
     }
 
     #[test]
