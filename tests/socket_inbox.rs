@@ -226,15 +226,18 @@ fn send_request(socket: &Path, request: &Value) -> Value {
     serde_json::from_str(&line).expect("response JSON")
 }
 
-fn read_json(stream: &mut UnixStream) -> Value {
+fn read_json(reader: &mut BufReader<UnixStream>) -> Value {
     let mut line = String::new();
-    BufReader::new(stream.try_clone().expect("clone"))
-        .read_line(&mut line)
-        .expect("read json line");
+    reader.read_line(&mut line).expect("read json line");
     serde_json::from_str(&line).expect("json")
 }
 
-fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> UnixStream {
+struct InboxConn {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> InboxConn {
     let mut stream = UnixStream::connect(socket).expect("connect inbox");
     serde_json::to_writer(
         &mut stream,
@@ -246,9 +249,10 @@ fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> UnixStream {
     )
     .expect("write claim");
     stream.write_all(b"\n").expect("finish claim");
-    let claimed = read_json(&mut stream);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone inbox"));
+    let claimed = read_json(&mut reader);
     assert_eq!(claimed["result"]["claimed"], true);
-    stream
+    InboxConn { stream, reader }
 }
 
 fn boot(
@@ -304,7 +308,7 @@ fn occupant_final_resolves_only_on_socket_ack() {
         )
         .expect("herdr count");
     assert_eq!(herdr_prompts, 0);
-    let delivery = read_json(&mut inbox);
+    let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
     assert_eq!(delivery["params"]["kind"], "reply");
     assert_eq!(
@@ -315,7 +319,7 @@ fn occupant_final_resolves_only_on_socket_ack() {
         ObligationState::Open
     );
     serde_json::to_writer(
-        &mut inbox,
+        &mut inbox.stream,
         &serde_json::json!({
             "id": "ack-1",
             "method": "inbox.ack",
@@ -323,8 +327,8 @@ fn occupant_final_resolves_only_on_socket_ack() {
         }),
     )
     .expect("ack");
-    inbox.write_all(b"\n").expect("nl");
-    let ack = read_json(&mut inbox);
+    inbox.stream.write_all(b"\n").expect("nl");
+    let ack = read_json(&mut inbox.reader);
     assert_eq!(ack["result"]["outcome"], "accepted");
     assert_eq!(
         Store::open(&database)
@@ -536,7 +540,7 @@ fn cancel_reaches_socket_inbox_and_is_not_resolved() {
     );
     assert_eq!(cancelled["result"]["state"], "cancelled");
     let mut inbox = claim_inbox(&kelpie_socket, waiter.logical_agent_id, "claim-cancel");
-    let delivery = read_json(&mut inbox);
+    let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
     assert_eq!(delivery["params"]["kind"], "cancellation");
     assert!(
@@ -599,7 +603,7 @@ fn reconnect_drains_one_waiter_and_refuses_another() {
         waiter.logical_agent_id,
         "claim-1",
     ));
-    let stolen = send_request(
+    let other_claim = send_request(
         &kelpie_socket,
         &serde_json::json!({
             "id": "claim-other",
@@ -607,12 +611,12 @@ fn reconnect_drains_one_waiter_and_refuses_another() {
             "params": {"logical_agent_id": other.logical_agent_id}
         }),
     );
-    assert!(stolen["error"].is_null(), "{stolen}");
+    assert!(other_claim["error"].is_null(), "{other_claim}");
     let mut again = claim_inbox(&kelpie_socket, waiter.logical_agent_id, "claim-2");
-    let delivery = read_json(&mut again);
+    let delivery = read_json(&mut again.reader);
     assert_eq!(delivery["params"]["body"], "later reply body");
     serde_json::to_writer(
-        &mut again,
+        &mut again.stream,
         &serde_json::json!({
             "id": "ack-1",
             "method": "inbox.ack",
@@ -620,8 +624,8 @@ fn reconnect_drains_one_waiter_and_refuses_another() {
         }),
     )
     .expect("ack");
-    again.write_all(b"\n").expect("nl");
-    let ack = read_json(&mut again);
+    again.stream.write_all(b"\n").expect("nl");
+    let ack = read_json(&mut again.reader);
     assert_eq!(ack["result"]["outcome"], "accepted");
     let foreign = send_request(
         &kelpie_socket,

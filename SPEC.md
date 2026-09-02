@@ -292,10 +292,13 @@ Delivery outcome MUST distinguish at least:
 
 The exact mapping from transport observations to these outcomes MUST be
 documented and tested. For `socket_inbox`, a client acknowledgement is
-`accepted`, a disconnected host leaves the delivery `queued`, an absent waiter
-identity is `target_unavailable`, and an ambiguous write is `unknown`. Persist
-of the delivery record is not acceptance. Success of any publish outside Kelpie
-is not acceptance.
+`accepted`, a disconnected host leaves the delivery `queued`, and an absent
+waiter identity is `target_unavailable`. A write that may have reached the
+client in part stays `queued`: persist precedes every inbox byte, a torn line
+has no newline so the client discards it, and reconnect drains that same row.
+That drain is not a resend. This transport MUST NOT record `unknown` for an
+inbox write. Persist of the delivery record is not acceptance. Success of any
+publish outside Kelpie is not acceptance.
 
 `submitted`, `accepted`, `queued`, and `unknown` MUST NOT be blindly
 resent because the recipient may already have received the message. Draining a
@@ -1041,7 +1044,7 @@ Herdr prompt proofs above.
 | Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
 | Socket-inbox final resolves only on ACK | Occupant `reply` final to a `socket_inbox` waiter: no Herdr prompt to the waiter, persist does not resolve, ACK resolves once, a dropped host leaves the obligation open. |
 | Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |
-| Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming another waiter id is refused. |
+| Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming an id that is not an active socket waiter is refused. |
 
 Tests SHOULD use deterministic fake Herdr protocol fixtures for state-machine
 coverage and real Herdr integration tests for transport, lifecycle, and failure

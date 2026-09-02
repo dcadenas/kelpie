@@ -198,6 +198,9 @@ Kill after ACK proves the acknowledgement was read and the obligation stayed
 open because resolve was not committed. Restart leaves the same queued row;
 reconnecting as that waiter id drains it. That drain is the original attempt
 completing, not a resend, and a second delivery row is never inserted.
+Socket-inbox never records `unknown` for those kills: persist precedes every
+inbox byte, a torn line has no newline, and the same queued row is what
+reconnect offers.
 
 The deterministic process-kill matrix covers all three explicit external-
 effect boundaries for runtime start, ask prompt, tell prompt, initial-tell

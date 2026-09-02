@@ -192,15 +192,18 @@ fn send_final_reply(socket: &Path, owing: LogicalAgentId, ask_message_id: Messag
     )
 }
 
-fn read_json(stream: &mut UnixStream) -> Value {
+fn read_json(reader: &mut BufReader<UnixStream>) -> Value {
     let mut line = String::new();
-    BufReader::new(stream.try_clone().expect("clone"))
-        .read_line(&mut line)
-        .expect("read json line");
+    reader.read_line(&mut line).expect("read json line");
     serde_json::from_str(&line).expect("json")
 }
 
-fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> UnixStream {
+struct InboxConn {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> InboxConn {
     let mut stream = UnixStream::connect(socket).expect("connect inbox");
     serde_json::to_writer(
         &mut stream,
@@ -212,9 +215,10 @@ fn claim_inbox(socket: &Path, waiter: LogicalAgentId, id: &str) -> UnixStream {
     )
     .expect("write claim");
     stream.write_all(b"\n").expect("finish claim");
-    let claimed = read_json(&mut stream);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone inbox"));
+    let claimed = read_json(&mut reader);
     assert_eq!(claimed["result"]["claimed"], true);
-    stream
+    InboxConn { stream, reader }
 }
 
 fn ack_delivery(stream: &mut UnixStream, message_id: &Value, id: &str) {
@@ -292,11 +296,15 @@ fn recover_daemon(
 
 fn ack_until_resolved(kelpie_socket: &Path, waiter: LogicalAgentId, expected_reply: &str) {
     let mut inbox = claim_inbox(kelpie_socket, waiter, "recover-claim");
-    let delivery = read_json(&mut inbox);
+    let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
     assert_eq!(delivery["params"]["message_id"], expected_reply);
-    ack_delivery(&mut inbox, &delivery["params"]["message_id"], "recover-ack");
-    let ack = read_json(&mut inbox);
+    ack_delivery(
+        &mut inbox.stream,
+        &delivery["params"]["message_id"],
+        "recover-ack",
+    );
+    let ack = read_json(&mut inbox.reader);
     assert_eq!(ack["result"]["outcome"], "accepted");
 }
 
@@ -324,7 +332,8 @@ fn kill_before_inbox_write_keeps_queued_without_bytes_or_resend() {
     let inbox = claim_inbox(&kelpie_socket, waiter.logical_agent_id, "claim-1");
     let remainder = thread::spawn(move || {
         let mut bytes = Vec::new();
-        BufReader::new(inbox)
+        let mut reader = inbox.reader;
+        reader
             .read_to_end(&mut bytes)
             .expect("read until daemon death");
         bytes
@@ -399,7 +408,7 @@ fn kill_after_inbox_write_drains_the_same_queued_attempt() {
     let replied = send_final_reply(&kelpie_socket, owing.logical_agent_id, ask_message_id);
     assert_eq!(replied["result"]["delivery_outcome"], "queued");
     let written = accept_point(&fault_listener, INBOX_AFTER_WRITE);
-    let delivery = read_json(&mut inbox);
+    let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
     assert_eq!(delivery["params"]["kind"], "reply");
     assert_eq!(delivery["params"]["disposition"], "final");
@@ -459,10 +468,10 @@ fn kill_after_inbox_ack_before_resolve_leaves_obligation_open() {
     let mut inbox = claim_inbox(&kelpie_socket, waiter.logical_agent_id, "claim-1");
     let replied = send_final_reply(&kelpie_socket, owing.logical_agent_id, ask_message_id);
     assert_eq!(replied["result"]["obligation_state"], "open");
-    let delivery = read_json(&mut inbox);
+    let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
     let reply_id = delivery["params"]["message_id"].clone();
-    ack_delivery(&mut inbox, &reply_id, "ack-1");
+    ack_delivery(&mut inbox.stream, &reply_id, "ack-1");
     let acked = accept_point(&fault_listener, INBOX_AFTER_ACK);
     kill_daemon(first_daemon);
     drop(acked);
