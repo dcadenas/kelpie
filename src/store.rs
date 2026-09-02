@@ -3665,6 +3665,7 @@ impl Store {
                 "obligation in {state} state is not cancellable"
             )));
         }
+        refuse_renew_prepare_ask_cancel(&tx, ask_message_id)?;
         let changed = tx.execute(
             "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
              cancellation_requester_agent_id = ?2, cancellation_reason = ?3
@@ -3844,6 +3845,7 @@ impl Store {
                 "obligation in {state} state is not cancellable"
             )));
         }
+        refuse_renew_prepare_ask_cancel(&tx, ask_message_id)?;
         let waiting_agent = parse_logical_agent_id(&waiting)?;
         let owing_agent = parse_logical_agent_id(&owing)?;
         let (message_id, delivery) = record_cancellation_side(
@@ -4207,6 +4209,7 @@ impl Store {
             if !exists {
                 return Err(StoreError::Conflict("obligation is absent".into()));
             }
+            refuse_renew_prepare_ask_cancel(&tx, message_id)?;
         }
         let submitted: i64 = tx.query_row(
             "SELECT COUNT(*) FROM operation_attempts
@@ -6688,10 +6691,30 @@ impl Store {
     }
 }
 
-/// Arm the successor cycle of a renew policy, if the resolved renew was one.
-///
-/// The successor is a new row so the resolved cycle keeps its own evidence and
-/// the one-active-renew index stays satisfied. A one-shot renew arms nothing.
+/// A renew prepare ask is not a same-user `cancel`. Ending it through `cancel`
+/// would skip `renew.cancel`'s requester-or-target check, its operator notice,
+/// and leave the cycle to time out or clear without a checkpoint.
+fn refuse_renew_prepare_ask_cancel(
+    tx: &Transaction<'_>,
+    ask_message_id: MessageId,
+) -> Result<(), StoreError> {
+    let renew: Option<String> = tx
+        .query_row(
+            "SELECT id FROM renews WHERE ask_message_id = ?1
+             AND phase NOT IN ('done', 'aborted', 'terminated')",
+            [ask_message_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(renew_id) = renew else {
+        return Ok(());
+    };
+    Err(StoreError::Conflict(format!(
+        "ask {ask_message_id} is the prepare obligation of renew {renew_id}; \
+         cancel the policy with renew.cancel, not cancel"
+    )))
+}
+
 /// Say which rule refused a cancel, so the caller knows what to do next.
 ///
 /// The `UPDATE` folds three refusals into one row count. "Not permitted" and
@@ -11852,6 +11875,55 @@ mod tests {
             )
             .expect("response");
         assert_eq!(sender, None);
+    }
+
+    #[test]
+    fn cancel_refuses_a_renew_prepare_ask() {
+        let mut store = Store::in_memory().expect("store");
+        let target = store
+            .declare_start(&intent("worker", "term-a", "renew-target"))
+            .expect("target");
+        mark_ready(&mut store, target, "worker", "term-a");
+        let bystander = store
+            .declare_start(&intent("other", "term-b", "renew-bystander"))
+            .expect("bystander");
+        let policy = store
+            .create_renew(&RenewIntent {
+                logical_agent_id: target.logical_agent_id,
+                incarnation_id: target.incarnation_id,
+                requester_agent_id: target.logical_agent_id,
+                prepare_prompt: "save".into(),
+                resume_prompt: "continue".into(),
+                on_timeout: RenewTimeout::Abort,
+                prepare_timeout_ms: 60_000,
+                every_ms: None,
+                scheduled_at_ms: store_clock_ms().expect("clock"),
+            })
+            .expect("policy");
+        let ask = store
+            .create_ask(
+                target.logical_agent_id,
+                target.logical_agent_id,
+                target.incarnation_id,
+                "save",
+                "renew-prepare-ask",
+            )
+            .expect("prepare ask");
+        store
+            .mark_renew_preparing(policy, ask.message_id, store_clock_ms().expect("clock") + 1)
+            .expect("preparing");
+        let refused = store.cancel_obligation(bystander.logical_agent_id, ask.message_id, "disarm");
+        let Err(StoreError::Conflict(message)) = refused else {
+            panic!("expected conflict, got {refused:?}");
+        };
+        assert!(
+            message.contains("renew.cancel"),
+            "refusal names the policy door: {message}"
+        );
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("open"),
+            ObligationState::Open
+        );
     }
 
     fn unnamed_intent(key: &str) -> crate::domain::AdoptIntent {

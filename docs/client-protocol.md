@@ -521,7 +521,8 @@ is read from the newest assistant row because a session can change model mid-run
 The requester is an unauthenticated same-user identity claim, not a waiter-only
 check. Kelpie records the claim and reason and permits only `open` or
 `in_progress` to become `cancelled`. The calling pane need not be the waiter;
-`--sender-id` of the waiter remains a valid override. A pane waiter receives Kelpie's
+`--sender-id` of the waiter remains a valid override. A renew prepare ask is
+refused here; end that policy with `renew.cancel`. A pane waiter receives Kelpie's
 cancellation through Herdr when Ready. A socket waiter receives it on the inbox.
 The owing agent receives a Kelpie-authored stop-notice when addressable, recorded
 for a later `pending` when not. The obligation is `cancelled`, not `resolved`,
