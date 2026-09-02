@@ -27,9 +27,17 @@ request contains `id`, `method`, and `params`; each response echoes `id` and
 contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
 `reply`, `clear`, `renew`, `renew.cancel`, `pending`, `cancel`, `retire`,
-`waiter.register`, `waiter.retire`,
+`waiter.register`, `waiter.retire`, `inbox.claim`, `inbox.ack`,
 `notice.create`, `notice.list`, `name.info`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
+
+`inbox.claim` is the exception to one-request-per-connection. The host process
+reconnects, names its waiter LogicalAgent id (same-user attribution, not
+authentication), and keeps the connection. Kelpie writes `inbox.delivery`
+events for queued deliveries of that waiter only. The client acknowledges with
+`inbox.ack`. Dropping the connection leaves those deliveries `queued`. Claiming
+an id that is not an active socket waiter is `conflict`. `pending` and
+`ask.info` are not this receive path.
 
 `kelpie adopt --pane ID --terminal ID [--logical-id ID]` is the client form.
 `--logical-id` continues that exact logical agent in a new incarnation, keeping
@@ -70,6 +78,9 @@ authentication boundary.
   ends that targeting and releases the name. `ask` `from_operator` attributes
   the stored sender as the operator; `waiting_agent_id` stays the waiter, and
   occupant envelopes still use `from=` equal to the waiter's public name.
+- `inbox.claim` holds a reconnectable inbox for that waiter id. Deliveries
+  arrive as `inbox.delivery` on that socket. `inbox.ack` marks the named
+  delivery `accepted`. Persist is not acceptance.
 
 ## Messaging methods
 

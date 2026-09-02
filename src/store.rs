@@ -113,6 +113,17 @@ pub struct CreatedWaiter {
     pub logical_agent_id: LogicalAgentId,
 }
 
+/// One queued socket-inbox delivery named by waiter agent, not incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketInboxDelivery {
+    pub message_id: MessageId,
+    pub kind: MessageKind,
+    pub body: String,
+    pub reply_to: Option<MessageId>,
+    pub disposition: Option<ReplyDisposition>,
+    pub attempt_number: i64,
+}
+
 /// IDs atomically created for one tell and its delivery operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedTell {
@@ -1801,6 +1812,163 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Confirm `logical_agent_id` is an active socket waiter.
+    ///
+    /// Same-user attribution, not authentication. A pane agent, ended waiter, or
+    /// absent id is not owned as an inbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the agent is absent, ended, or not socket-inbox.
+    pub fn claim_socket_waiter(&self, logical_agent_id: LogicalAgentId) -> Result<(), StoreError> {
+        require_active_socket_waiter(&self.connection, logical_agent_id)
+    }
+
+    /// Queued socket-inbox deliveries for one waiter, oldest first.
+    ///
+    /// Draining is the same attempt completing. It is not a resend.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the agent is not an active socket waiter.
+    pub fn queued_socket_inbox_deliveries(
+        &self,
+        recipient_agent_id: LogicalAgentId,
+    ) -> Result<Vec<SocketInboxDelivery>, StoreError> {
+        require_active_socket_waiter(&self.connection, recipient_agent_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.kind, m.body, m.reply_to_message_id, m.disposition, d.attempt_number
+               FROM deliveries d
+               JOIN messages m ON m.id = d.message_id
+              WHERE d.recipient_agent_id = ?1
+                AND d.delivery_transport = 'socket_inbox'
+                AND d.outcome = 'queued'
+              ORDER BY d.scheduled_at_ms, m.created_at_ms",
+        )?;
+        let rows = statement.query_map([recipient_agent_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut deliveries = Vec::new();
+        for row in rows {
+            let (message_id, kind, body, reply_to, disposition, attempt_number) = row?;
+            deliveries.push(SocketInboxDelivery {
+                message_id: parse_message_id(&message_id)?,
+                kind: parse_message_kind(&kind)?,
+                body,
+                reply_to: reply_to.as_deref().map(parse_message_id).transpose()?,
+                disposition: disposition
+                    .as_deref()
+                    .map(parse_reply_disposition)
+                    .transpose()?,
+                attempt_number,
+            });
+        }
+        Ok(deliveries)
+    }
+
+    /// Acknowledge one queued socket-inbox delivery for this waiter.
+    ///
+    /// Persist is not acceptance. ACK is. Already-accepted ACK is idempotent.
+    /// Dropping the host leaves the delivery queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the waiter is not active or the delivery is not a
+    /// queued or already-accepted socket-inbox row for that waiter.
+    pub fn ack_socket_inbox_delivery(
+        &mut self,
+        recipient_agent_id: LogicalAgentId,
+        message_id: MessageId,
+    ) -> Result<DeliveryOutcome, StoreError> {
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        require_active_socket_waiter(&tx, recipient_agent_id)?;
+        let outcome: Option<String> = tx
+            .query_row(
+                "SELECT outcome FROM deliveries
+                  WHERE message_id = ?1
+                    AND recipient_agent_id = ?2
+                    AND delivery_transport = 'socket_inbox'",
+                params![message_id.to_string(), recipient_agent_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match outcome.as_deref() {
+            Some("accepted") => {
+                tx.commit()?;
+                Ok(DeliveryOutcome::Accepted)
+            }
+            Some("queued") => {
+                tx.execute(
+                    "UPDATE deliveries
+                        SET outcome = 'accepted', resolved_at_ms = ?1
+                      WHERE message_id = ?2
+                        AND recipient_agent_id = ?3
+                        AND delivery_transport = 'socket_inbox'
+                        AND outcome = 'queued'",
+                    params![now, message_id.to_string(), recipient_agent_id.to_string()],
+                )?;
+                tx.commit()?;
+                Ok(DeliveryOutcome::Accepted)
+            }
+            Some(other) => Err(StoreError::Conflict(format!(
+                "socket-inbox delivery {message_id} for {recipient_agent_id} is {other}"
+            ))),
+            None => Err(StoreError::Conflict(format!(
+                "no socket-inbox delivery {message_id} for waiter {recipient_agent_id}"
+            ))),
+        }
+    }
+
+    /// Insert a message so tests can queue a socket-inbox delivery without reply bind.
+    #[cfg(test)]
+    pub(crate) fn insert_inbox_message(
+        &mut self,
+        recipient: LogicalAgentId,
+        kind: MessageKind,
+        body: &str,
+        reply_to: Option<MessageId>,
+        disposition: Option<ReplyDisposition>,
+    ) -> Result<MessageId, StoreError> {
+        let now = now_millis()?;
+        let message_id = MessageId::new();
+        let kind_name = match kind {
+            MessageKind::Tell => "tell",
+            MessageKind::Ask => "ask",
+            MessageKind::Reply => "reply",
+            MessageKind::Cancellation => "cancellation",
+        };
+        let sender = match kind {
+            MessageKind::Cancellation => None,
+            _ => Some(recipient.to_string()),
+        };
+        self.connection.execute(
+            "INSERT INTO messages
+             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
+              reply_to_message_id, disposition, creates_obligation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                message_id.to_string(),
+                sender,
+                recipient.to_string(),
+                kind_name,
+                body,
+                now,
+                reply_to.map(|id| id.to_string()),
+                disposition.map(disposition_name),
+                i64::from(kind == MessageKind::Ask),
+            ],
+        )?;
+        Ok(message_id)
     }
 
     /// Read the delivery transport recorded at logical-agent creation.
@@ -6936,6 +7104,29 @@ fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), 
     Ok(())
 }
 
+fn require_active_socket_waiter(
+    conn: &Connection,
+    logical_agent_id: LogicalAgentId,
+) -> Result<(), StoreError> {
+    let row: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT delivery_transport, targeting_ended_at_ms
+             FROM logical_agents WHERE id = ?1",
+            [logical_agent_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((transport, ended)) if transport == "socket_inbox" && ended.is_none() => Ok(()),
+        Some(_) => Err(StoreError::Conflict(format!(
+            "logical agent {logical_agent_id} is not an active socket waiter"
+        ))),
+        None => Err(StoreError::Conflict(format!(
+            "socket waiter {logical_agent_id} is absent"
+        ))),
+    }
+}
+
 fn refuse_name_held_by_socket_waiter(tx: &Transaction<'_>, name: &str) -> Result<(), StoreError> {
     let held: Option<String> = tx
         .query_row(
@@ -7054,6 +7245,16 @@ fn disposition_name(value: ReplyDisposition) -> &'static str {
     match value {
         ReplyDisposition::Progress => "progress",
         ReplyDisposition::Final => "final",
+    }
+}
+
+fn parse_reply_disposition(value: &str) -> Result<ReplyDisposition, StoreError> {
+    match value {
+        "progress" => Ok(ReplyDisposition::Progress),
+        "final" => Ok(ReplyDisposition::Final),
+        other => Err(StoreError::InvalidRecord(format!(
+            "unknown reply disposition {other}"
+        ))),
     }
 }
 
@@ -11614,5 +11815,103 @@ mod tests {
         store
             .register_socket_waiter("target", Parent::Parentless, "after-lost-rename")
             .expect("lost pending rename does not hold the name");
+    }
+
+    #[test]
+    fn socket_inbox_queues_drain_and_ack_by_waiter_id() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "drain-waiter")
+            .expect("register");
+        let other = store
+            .register_socket_waiter("other", Parent::Parentless, "other-waiter")
+            .expect("other");
+        let ask = store
+            .insert_inbox_message(
+                waiter.logical_agent_id,
+                MessageKind::Ask,
+                "question",
+                None,
+                None,
+            )
+            .expect("ask");
+        let reply = store
+            .insert_inbox_message(
+                waiter.logical_agent_id,
+                MessageKind::Reply,
+                "later reply body",
+                Some(ask),
+                Some(ReplyDisposition::Final),
+            )
+            .expect("reply");
+        store
+            .record_socket_inbox_delivery(reply, waiter.logical_agent_id, DeliveryOutcome::Queued)
+            .expect("queue");
+        store
+            .claim_socket_waiter(waiter.logical_agent_id)
+            .expect("claim");
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("drain");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, reply);
+        assert_eq!(queued[0].body, "later reply body");
+        assert_eq!(queued[0].kind, MessageKind::Reply);
+        assert_eq!(queued[0].reply_to, Some(ask));
+        assert_eq!(queued[0].disposition, Some(ReplyDisposition::Final));
+        assert_eq!(
+            store
+                .ack_socket_inbox_delivery(waiter.logical_agent_id, reply)
+                .expect("ack"),
+            DeliveryOutcome::Accepted
+        );
+        assert!(
+            store
+                .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+                .expect("empty")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .ack_socket_inbox_delivery(waiter.logical_agent_id, reply)
+                .expect("idempotent"),
+            DeliveryOutcome::Accepted
+        );
+        let missing = LogicalAgentId::new();
+        assert!(
+            store
+                .claim_socket_waiter(missing)
+                .expect_err("absent")
+                .to_string()
+                .contains("absent")
+        );
+        let pane = store
+            .declare_start(&intent("owing", "term-b", "pane-not-waiter"))
+            .expect("pane");
+        mark_ready(&mut store, pane, "owing", "term-b");
+        assert!(
+            store
+                .claim_socket_waiter(pane.logical_agent_id)
+                .expect_err("pane")
+                .to_string()
+                .contains("not an active socket waiter")
+        );
+        let stolen = store
+            .ack_socket_inbox_delivery(other.logical_agent_id, reply)
+            .expect_err("other waiter");
+        assert!(
+            stolen.to_string().contains("no socket-inbox delivery"),
+            "{stolen}"
+        );
+        store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("end");
+        assert!(
+            store
+                .claim_socket_waiter(waiter.logical_agent_id)
+                .expect_err("ended")
+                .to_string()
+                .contains("not an active socket waiter")
+        );
     }
 }

@@ -60,7 +60,9 @@ not just the code.
   connection (`recover`, `start`, `adopt`, `tell`, `ask`, `reply`, `clear`, `renew`,
   `renew.cancel`, `pending`, `cancel`, `retire`, `waiter.register`, `waiter.retire`,
   `reminder.snooze`, `reminder.disable`,
-  `notice.create`, `notice.list`, `whoami`). Uses a non-blocking accept timeout
+  `notice.create`, `notice.list`, `whoami`). `inbox.claim` is the exception: it
+  keeps the connection and drains `inbox.delivery` events for that waiter;
+  `inbox.ack` is valid only on that claimed connection. Uses a non-blocking accept timeout
   so scheduled deliveries, reminders, and renew phases run with no client
   connected.
 - `src/bin/kelpie.rs` → `cli.rs` — the client. Typed commands build the NDJSON

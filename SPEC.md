@@ -716,10 +716,12 @@ That one-shot RPC MUST NOT be the receive path for `socket_inbox` deliveries.
 `pending` lists what an agent owes. `ask-info` re-reads one ask by id. Those
 methods MUST NOT be the receive path for `socket_inbox` deliveries.
 
-A socket waiter MUST reconnect, claim its LogicalAgent id as same-user
-attribution (not authentication), and drain queued deliveries for that waiter
-id. A dropped connection MUST NOT resolve an obligation. A disconnected host
-leaves those deliveries `queued` until the same waiter acknowledges them.
+A socket waiter MUST reconnect with `inbox.claim`, naming its LogicalAgent id as
+same-user attribution (not authentication), and drain queued deliveries for that
+waiter id as `inbox.delivery` events on that connection. `inbox.ack` is the
+client acknowledgement. Claiming an id that is not an active socket waiter MUST
+be refused. A dropped connection MUST NOT resolve an obligation. A disconnected
+host leaves those deliveries `queued` until the same waiter acknowledges them.
 `target_unavailable` means the waiter identity is gone, not that the connection
 dropped.
 
