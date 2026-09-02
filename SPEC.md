@@ -756,14 +756,19 @@ auto-adoption is out of scope.
 
 Kelpie MAY perform targeted lazy adoption when a command needs an unbound
 calling pane or addresses a missing alias. Caller adoption MUST select the
-exact pane and observed terminal. When that exact pane and terminal already
-record a unique continuable incarnation (any state other than `ready`,
-`retiring`, `retired`, or `superseded`), lazy caller adoption MUST continue
-that logical agent. When more than one such logical agent exists, it MUST fail
-closed and name those ids so the caller can pass an explicit `logical_agent_id`.
-When none exist, it MAY create a new logical agent. Lazy caller adoption MUST
-NOT mint a new logical agent while a continuable prior incarnation occupies
-that exact pane and terminal. Recipient adoption MUST require exactly one
+exact pane and observed terminal. When that exact pane, terminal, and backend
+kind already record a unique `lost` or `unknown` incarnation, lazy caller
+adoption MUST continue that logical agent and MUST keep its recorded public
+name: an unnamed live occupant is claimed under that name, and a live name that
+does not equal it MUST fail closed. `declared`, `starting`, or `failed`
+incarnations on the same pane and terminal, a backend mismatch, or more than
+one such logical agent MUST fail closed and name the id so the caller can pass
+an explicit `logical_agent_id`. When none exist, it MAY create a new logical
+agent. Lazy caller adoption MUST NOT mint a new logical agent while a
+continuable prior incarnation occupies that exact pane and terminal, MUST NOT
+replace the continued agent's alias with a working-directory basename, and
+MUST NOT continue under a public name another logical agent still holds
+unresolved obligations on. Recipient adoption MUST require exactly one
 unnamed, non-launch-pending live agent whose working-directory basename derives
 to the requested alias. Ambiguous or absent matches MUST fail closed. Targeted
 lazy adoption MUST use the normal durable adoption contract below and MUST NOT
