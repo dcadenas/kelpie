@@ -48,6 +48,17 @@ The compiled points are test infrastructure, not a public operational API:
 - `cancellation_after_response_before_commit`: a structured `agent.prompt`
   acceptance response has been decoded, while the cancellation's prompt
   operation remains `pending` and its attempt and delivery remain `submitted`.
+- `owing_cancellation_after_submitted_before_write`: the settled obligation, the
+  Kelpie-authored owing stop-notice, its prompt operation, delivery, and request
+  attempt are durable; the attempt and delivery are `submitted`; and no owing
+  `agent.prompt` byte has been written.
+- `owing_cancellation_after_write_before_response`: the complete owing
+  cancellation `agent.prompt` request has been written and flushed, while no
+  response has been read or decoded.
+- `owing_cancellation_after_response_before_commit`: a structured `agent.prompt`
+  acceptance response for the owing stop-notice has been decoded, while its
+  prompt operation remains `pending` and its attempt and delivery remain
+  `submitted`.
 - `inbox_after_queued_before_write`: a socket-inbox delivery is durably
   `queued` and selected to offer, and no `inbox.delivery` byte has been written.
 - `inbox_after_write_before_ack`: the complete `inbox.delivery` line has been

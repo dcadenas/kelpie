@@ -1604,6 +1604,7 @@ fn dispatch_pending(params: Value, kelpie: &Kelpie) -> Result<Value, SliceError>
     let params = serde_json::from_value::<PendingParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let cancelled = kelpie.cancelled_while_away(params.agent_id)?;
+    let cancelled_owing = kelpie.cancelled_owing_while_away(params.agent_id)?;
     let pending = kelpie.pending(params.agent_id)?;
     let mut obligations: Vec<Value> = pending
         .into_iter()
@@ -1621,6 +1622,19 @@ fn dispatch_pending(params: Value, kelpie: &Kelpie) -> Result<Value, SliceError>
         serde_json::json!({
             "ask_message_id": entry.ask_message_id,
             "state": "cancelled",
+            "audience": "waiting",
+            "cancellation_reason": entry.reason,
+            "cancellation_requester_agent_id": entry.cancelled_by,
+            "cancelled_at_ms": entry.cancelled_at_ms,
+        })
+    }));
+    // Asks this agent was answering, cancelled while it had no Ready
+    // binding: the stop-notice it never received.
+    obligations.extend(cancelled_owing.into_iter().map(|entry| {
+        serde_json::json!({
+            "ask_message_id": entry.ask_message_id,
+            "state": "cancelled",
+            "audience": "owing",
             "cancellation_reason": entry.reason,
             "cancellation_requester_agent_id": entry.cancelled_by,
             "cancelled_at_ms": entry.cancelled_at_ms,
@@ -1643,6 +1657,8 @@ fn dispatch_cancel(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceErr
                 "state": "cancelled",
                 "response": if outcome.delivered { "delivered" } else { "recorded" },
                 "message_id": outcome.message_id.map(|id| id.to_string()),
+                "owing_response": if outcome.owing_delivered { "delivered" } else { "recorded" },
+                "owing_message_id": outcome.owing_message_id.map(|id| id.to_string()),
             })
         })
 }

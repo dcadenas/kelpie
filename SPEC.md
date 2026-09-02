@@ -683,14 +683,19 @@ Kelpie MUST expose semantic operations equivalent to:
 Cancelling an ask settles its obligation `cancelled` with the stated reason,
 and MUST deliver a response naming the reason to the asker when that asker is
 addressable: into the asker's Ready pane for `herdr_prompt`, or into the
-asker's socket inbox for `socket_inbox`. The response is authored by Kelpie as
-a `cancellation` message with no sender. It MUST NOT be attributed to the
-responder, and cancellation MUST NOT set the obligation `resolved`. With no
-addressable asker the response MUST stay recorded against the obligation, and
-MUST be surfaced to the asker's first obligation check after it is again
-addressable. A cancellation whose transport outcome is unknown MUST NOT be
-retried; the settled obligation and the recorded response are the durable
-truth.
+asker's socket inbox for `socket_inbox`. When the cancelled ask is no longer a
+queued delivery, Kelpie MUST also deliver a Kelpie-authored cancellation
+notice to the owing agent when that agent is addressable, with the reason.
+The owing occupant's envelope MUST NOT carry `reply-to` and MUST NOT look like
+a new ask. Neither notice MUST be attributed to the asker or the responder,
+and cancellation MUST NOT set the obligation `resolved`. With no addressable
+asker the asker's response MUST stay recorded against the obligation, and MUST
+be surfaced to the asker's first obligation check after it is again
+addressable. With no addressable owing agent the owing notice MUST stay
+recorded against the obligation, and MUST be surfaced to the owing agent's
+first obligation check after it is again addressable. A cancellation notice
+whose transport outcome is unknown MUST NOT be retried; the settled obligation
+and the recorded notices are the durable truth.
 
 Every agent-facing message rendering MUST include enough information for the
 recipient to reply through Kelpie without guessing:
@@ -1055,7 +1060,9 @@ Herdr prompt proofs above.
 | Supervision cannot be disarmed by a stranger | Cancel a policy as an agent that is neither its requester nor its target and verify the refusal names both and leaves the policy armed. |
 | A cancel never abandons an injection | Cancel a policy whose cycle is clearing and verify it is refused, the cycle still completes its resume prompt, and the refusal says to retry after the cycle. |
 | A cancellation reaches the asker | Cancel an ask whose asker is Ready and verify a Kelpie-authored `cancellation` message names the reason in the asker's pane, with the obligation `cancelled`, not `resolved`. |
+| A cancellation tells the owing agent to stop | Cancel an ask whose delivery to the owing pane was accepted and verify a Kelpie-authored cancellation names the ask id and reason in the owing pane, with no `reply-to`, obligation `cancelled` not `resolved`. |
 | A cancellation outlives the asker | Cancel an ask whose asker has no Ready incarnation, then re-adopt that asker and verify pending surfaces the cancellation with its reason and never attributes it to the responder; verify a cancellation whose response was already accepted into a pane does not re-surface. |
+| An owing cancellation outlives the owing agent | Cancel an ask whose owing agent has no Ready incarnation, then re-adopt that owing agent and verify pending surfaces the cancellation with its reason; verify a stop-notice already accepted into a pane does not re-surface. |
 | Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
 | Socket-inbox final resolves only on ACK | Occupant `reply` final to a `socket_inbox` waiter: no Herdr prompt to the waiter, persist does not resolve, ACK resolves once, a dropped host leaves the obligation open. |
 | Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |

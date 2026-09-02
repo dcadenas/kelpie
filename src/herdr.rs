@@ -479,6 +479,9 @@ fn after_write_fault_point(id: &str, method: &str) -> Option<&'static str> {
         ("agent.prompt", id) if id.starts_with("kelpie:reply:") => {
             Some("reply_after_write_before_response")
         }
+        ("agent.prompt", id) if id.starts_with("kelpie:owing-cancellation:") => {
+            Some("owing_cancellation_after_write_before_response")
+        }
         ("agent.prompt", id) if id.starts_with("kelpie:cancellation:") => {
             Some("cancellation_after_write_before_response")
         }

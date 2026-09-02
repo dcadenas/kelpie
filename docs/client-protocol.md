@@ -377,10 +377,11 @@ the source files later changes nothing about an armed policy.
 and `in_progress` final-reply obligations in creation order, followed by the
 agent's cancelled asks whose response no pane has received — the ones settled
 while the agent had no Ready binding, up to the current binding's creation
-(each with `state` `cancelled`, `cancellation_reason`,
-`cancellation_requester_agent_id`, and `cancelled_at_ms`). A failure reading
-cancellations fails the whole request. It does not infer anything from current
-Herdr runtime state.
+(each with `state` `cancelled`, `audience` `waiting`, `cancellation_reason`,
+`cancellation_requester_agent_id`, and `cancelled_at_ms`) — then cancelled
+asks this agent was answering whose stop-notice no pane has received (`audience`
+`owing`, same other fields). A failure reading cancellations fails the whole
+request. It does not infer anything from current Herdr runtime state.
 
 `name.info` takes one public `name` and returns, read-only, every logical agent
 holding that name (`logical_agent_id`, `created_at_ms`, `live`,
@@ -521,11 +522,12 @@ The requester is an unauthenticated same-user identity claim. Kelpie checks the
 neutral durable ownership invariant that it equals the obligation's
 `waiting_agent_id`, records the claim and reason, and permits only `open` or
 `in_progress` to become `cancelled`. A pane waiter receives Kelpie's
-cancellation through Herdr when Ready. A socket waiter receives it on the inbox;
-the obligation is `cancelled`, not `resolved`, and the message is not attributed
-to the responder. Authenticated or capability-bearing
-transports must validate the requester claim above Kelpie before invoking this
-method.
+cancellation through Herdr when Ready. A socket waiter receives it on the inbox.
+The owing agent receives a Kelpie-authored stop-notice when addressable, recorded
+for a later `pending` when not. The obligation is `cancelled`, not `resolved`,
+and neither message is attributed to the asker or the responder. Authenticated
+or capability-bearing transports must validate the requester claim above Kelpie
+before invoking this method.
 
 `recover` negotiates Herdr compatibility, obtains a fresh authoritative
 snapshot, and reconciles durable state without retrying ambiguous effects. A

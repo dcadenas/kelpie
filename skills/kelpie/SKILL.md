@@ -133,9 +133,13 @@ out, having held the answer the whole time.
 - `<kelpie-system cancellation waiting=… cancelled-ask=…>` is Kelpie's own
   notice that one of your asks was cancelled, with the reason. No reply is
   owed; re-ask whoever holds the name now if the question still matters.
+- `<kelpie-system cancellation owing=… cancelled-ask=…>` is Kelpie's own
+  notice that an ask you were answering was cancelled. Stop working on it.
+  No reply is owed; it is not a new ask.
 - `kelpie pending` lists asks you owe, then any of your asks cancelled while
-  you had no Ready binding (state `cancelled`, with the reason). It does not
-  list tells.
+  you had no Ready binding (state `cancelled`, with the reason), then any
+  asks you were answering that were cancelled while you had no Ready binding.
+  It does not list tells.
 - A `<kelpie-reminder …>` for an ask you don't remember is the amnesia
   protocol: your context was replaced but the obligation is real, and the
   reminder carries the original question. `kelpie ask-info <ask-id>` re-reads
@@ -555,7 +559,8 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   the first Herdr write. After submit, existing no-resend and unknown rules
   apply; open/in-progress ask obligations remain cancellable by the waiter.
   A socket waiter receives the Kelpie-authored cancellation on its inbox;
-  state is `cancelled`, not `resolved`.
+  the owing agent receives a stop-notice when addressable, recorded for
+  `pending` when not; state is `cancelled`, not `resolved`.
 - `retire`: record desired retirement for an incarnation. On its own it sends
   nothing to Herdr and leaves the pane occupied. Add `--close-pane` to release
   the pane in the same step; it ends that process but keeps the worktree,

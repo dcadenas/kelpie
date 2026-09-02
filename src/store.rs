@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 /// Host wall clock used for due comparison, in Unix epoch milliseconds.
 ///
@@ -151,12 +151,24 @@ pub enum ReplyReceivePath {
     SocketInbox,
 }
 
-/// IDs atomically created for a cancellation and its response message.
+/// Which occupant a Kelpie-authored cancellation notice is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationAudience {
+    /// The asker, told their wait is over.
+    Waiting,
+    /// The owing agent, told to stop working on the ask.
+    Owing,
+}
+
+/// IDs atomically created for a cancellation and its response messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedCancellation {
     pub message_id: MessageId,
     /// Present only when the asker had a Ready incarnation to deliver to.
     pub delivery: Option<(OperationId, IncarnationId)>,
+    pub owing_message_id: MessageId,
+    /// Present only when the owing agent had a Ready incarnation to deliver to.
+    pub owing_delivery: Option<(OperationId, IncarnationId)>,
 }
 
 /// IDs atomically created for a launch's initial message and delivery intent.
@@ -3729,29 +3741,78 @@ impl Store {
         }
     }
 
+    /// The owing agent's Ready incarnation for a cancellation stop-notice, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the obligation is absent or the Ready match is
+    /// ambiguous.
+    pub fn cancel_owing_incarnation(
+        &self,
+        ask_message_id: MessageId,
+    ) -> Result<Option<IncarnationId>, StoreError> {
+        let owing: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT owing_agent_id FROM obligations WHERE ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(owing) = owing else {
+            return Err(StoreError::Conflict("obligation is absent".into()));
+        };
+        let owing_agent = LogicalAgentId::parse(&owing)
+            .ok_or_else(|| StoreError::InvalidRecord(format!("invalid owing agent id {owing}")))?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM incarnations
+             WHERE logical_agent_id = ?1 AND state = 'ready'
+             ORDER BY created_at_ms ASC",
+        )?;
+        let rows = statement.query_map([owing_agent.to_string()], |row| row.get::<_, String>(0))?;
+        let mut ready = Vec::new();
+        for row in rows {
+            ready.push(row?);
+        }
+        match ready.as_slice() {
+            [incarnation] => IncarnationId::parse(incarnation)
+                .ok_or_else(|| {
+                    StoreError::InvalidRecord(format!("invalid incarnation id {incarnation}"))
+                })
+                .map(Some),
+            [] => Ok(None),
+            [_, _, ..] => Err(StoreError::Conflict(
+                "ambiguous ready incarnation for owing agent".into(),
+            )),
+        }
+    }
+
     /// Cancel one obligation owned by the requester and compose Kelpie's
-    /// cancellation response.
+    /// cancellation notices.
     ///
     /// The obligation settles `cancelled` in the same transaction that records
     /// the durable delivery intent, before any Herdr write. A `herdr_prompt`
     /// asker with a Ready incarnation is prepared for prompt delivery; a
-    /// `socket_inbox` asker is queued on that inbox. Without a live receive
-    /// path the response stays recorded on its message row for revival
-    /// surfacing. The response is authored by Kelpie — a `cancellation`
-    /// message with no sender — and is never attributed to the responder.
+    /// `socket_inbox` asker is queued on that inbox. The owing agent gets the
+    /// same treatment for its stop-notice. Without a live receive path a notice
+    /// stays recorded on its message row for revival surfacing. Notices are
+    /// authored by Kelpie — `cancellation` messages with no sender — and are
+    /// never attributed to the asker or the responder.
     ///
     /// # Errors
     ///
     /// Returns a conflict without mutation for an empty reason, absent
     /// obligation, ownership mismatch, or terminal obligation state.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn cancel_with_response(
         &mut self,
         requester_agent_id: LogicalAgentId,
         ask_message_id: MessageId,
         reason: &str,
         body: &str,
+        owing_body: &str,
         due_at_ms: Option<i64>,
+        owing_due_at_ms: Option<i64>,
     ) -> Result<CreatedCancellation, StoreError> {
         if reason.trim().is_empty() {
             return Err(StoreError::Conflict(
@@ -3760,14 +3821,15 @@ impl Store {
         }
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
-        let obligation: Option<(String, String)> = tx
+        let obligation: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT waiting_agent_id, state FROM obligations WHERE ask_message_id = ?1",
+                "SELECT waiting_agent_id, owing_agent_id, state
+                 FROM obligations WHERE ask_message_id = ?1",
                 [ask_message_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((waiting, state)) = obligation else {
+        let Some((waiting, owing, state)) = obligation else {
             return Err(StoreError::Conflict("obligation is absent".into()));
         };
         if waiting != requester_agent_id.to_string() {
@@ -3780,18 +3842,39 @@ impl Store {
                 "obligation in {state} state is not cancellable"
             )));
         }
-        let message_id = MessageId::new();
-        tx.execute(
-            "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
-              creates_obligation)
-             VALUES (?1, NULL, ?2, 'cancellation', ?3, ?4, 0)",
-            params![message_id.to_string(), waiting, body, now],
+        let waiting_agent = parse_logical_agent_id(&waiting)?;
+        let owing_agent = parse_logical_agent_id(&owing)?;
+        let (message_id, delivery) = record_cancellation_side(
+            &tx,
+            waiting_agent,
+            ask_message_id,
+            reason,
+            body,
+            CancellationAudience::Waiting,
+            due_at_ms,
+            now,
+            "ambiguous ready incarnation for waiting agent",
+        )?;
+        let (owing_message_id, owing_delivery) = record_cancellation_side(
+            &tx,
+            owing_agent,
+            ask_message_id,
+            reason,
+            owing_body,
+            CancellationAudience::Owing,
+            owing_due_at_ms,
+            now,
+            "ambiguous ready incarnation for owing agent",
         )?;
         tx.execute(
-            "UPDATE obligations SET cancellation_response_message_id = ?1
-             WHERE ask_message_id = ?2",
-            params![message_id.to_string(), ask_message_id.to_string()],
+            "UPDATE obligations SET cancellation_response_message_id = ?1,
+             cancellation_owing_message_id = ?2
+             WHERE ask_message_id = ?3",
+            params![
+                message_id.to_string(),
+                owing_message_id.to_string(),
+                ask_message_id.to_string()
+            ],
         )?;
         let changed = tx.execute(
             "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
@@ -3810,91 +3893,12 @@ impl Store {
                 "obligation changed before cancellation committed".into(),
             ));
         }
-        let waiting_agent = parse_logical_agent_id(&waiting)?;
-        let identity = waiter_identity(&tx, waiting_agent)?;
-        let delivery = match identity.transport {
-            DeliveryTransport::SocketInbox => {
-                if !identity.ended {
-                    queue_socket_inbox_delivery(&tx, message_id, waiting_agent, now)?;
-                }
-                None
-            }
-            DeliveryTransport::HerdrPrompt => {
-                // A Ready asker gets the response delivered; an absent one gets it
-                // recorded. More than one Ready incarnation cannot happen by
-                // construction, so only the empty match means attached.
-                let mut statement = tx.prepare(
-                    "SELECT id FROM incarnations
-                     WHERE logical_agent_id = ?1 AND state = 'ready'
-                     ORDER BY created_at_ms ASC",
-                )?;
-                let rows = statement.query_map([&waiting], |row| row.get::<_, String>(0))?;
-                let mut ready = Vec::new();
-                for row in rows {
-                    ready.push(row?);
-                }
-                drop(statement);
-                match ready.as_slice() {
-                    [incarnation] => {
-                        let recipient_incarnation =
-                            IncarnationId::parse(incarnation).ok_or_else(|| {
-                                StoreError::InvalidRecord(format!(
-                                    "invalid incarnation id {incarnation}"
-                                ))
-                            })?;
-                        let operation_id = OperationId::new();
-                        let intent = serde_json::json!({
-                            "message_id": message_id,
-                            "cancelled_ask": ask_message_id,
-                            "reason": reason,
-                            "recipient_incarnation_id": recipient_incarnation
-                        });
-                        tx.execute(
-                            "INSERT INTO operations
-                             (id, idempotency_key, kind, target_incarnation_id, intent_json,
-                              created_at_ms, outcome)
-                             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
-                            params![
-                                operation_id.to_string(),
-                                format!("kelpie:cancellation:{ask_message_id}"),
-                                recipient_incarnation.to_string(),
-                                intent.to_string(),
-                                now
-                            ],
-                        )
-                        .map_err(map_constraint)?;
-                        tx.execute(
-                            "INSERT INTO deliveries
-                             (message_id, recipient_incarnation_id, attempt_number,
-                              scheduled_at_ms, outcome, operation_id)
-                             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
-                            params![
-                                message_id.to_string(),
-                                recipient_incarnation.to_string(),
-                                due_at_ms.unwrap_or(now),
-                                if due_at_ms.is_some() {
-                                    "queued"
-                                } else {
-                                    "pending"
-                                },
-                                operation_id.to_string()
-                            ],
-                        )?;
-                        Some((operation_id, recipient_incarnation))
-                    }
-                    [] => None,
-                    [_, _, ..] => {
-                        return Err(StoreError::Conflict(
-                            "ambiguous ready incarnation for waiting agent".into(),
-                        ));
-                    }
-                }
-            }
-        };
         tx.commit()?;
         Ok(CreatedCancellation {
             message_id,
             delivery,
+            owing_message_id,
+            owing_delivery,
         })
     }
 
@@ -3912,7 +3916,7 @@ impl Store {
     pub fn cancellation_rendering_for_operation(
         &self,
         operation_id: OperationId,
-    ) -> Result<(MessageId, String), StoreError> {
+    ) -> Result<(MessageId, String, CancellationAudience), StoreError> {
         let intent: String = self.connection.query_row(
             "SELECT intent_json FROM operations WHERE id = ?1",
             [operation_id.to_string()],
@@ -3934,9 +3938,21 @@ impl Store {
             .ok_or_else(|| {
                 StoreError::InvalidRecord("cancellation operation intent is missing reason".into())
             })?;
+        let audience = match value
+            .pointer("/audience")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("owing") => CancellationAudience::Owing,
+            Some("waiting") | None => CancellationAudience::Waiting,
+            Some(other) => {
+                return Err(StoreError::InvalidRecord(format!(
+                    "cancellation operation intent has unknown audience {other}"
+                )));
+            }
+        };
         let ask_id = MessageId::parse(ask)
             .ok_or_else(|| StoreError::InvalidRecord(format!("invalid ask message id {ask}")))?;
-        Ok((ask_id, reason.to_string()))
+        Ok((ask_id, reason.to_string(), audience))
     }
 
     /// Re-read one ask's durable content and parties by its message id — the
@@ -4063,6 +4079,64 @@ impl Store {
              LIMIT 20",
         )?;
         let rows = statement.query_map([waiting_agent_id.to_string()], |row| {
+            Ok(CancelledWhileAway {
+                ask_message_id: row.get(0)?,
+                reason: row.get(1)?,
+                cancelled_by: row.get(2)?,
+                cancelled_at_ms: row.get(3)?,
+            })
+        })?;
+        let mut cancelled = Vec::new();
+        for row in rows {
+            cancelled.push(row?);
+        }
+        Ok(cancelled)
+    }
+
+    /// Cancellations of asks this agent owed that no pane has received, from
+    /// the lifetime of the binding before the current one. Read-only.
+    ///
+    /// Same window as [`Self::cancelled_while_away`], keyed on the owing agent
+    /// and its stop-notice rather than the asker's response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the logical agent is absent.
+    pub fn cancelled_owing_while_away(
+        &self,
+        owing_agent_id: LogicalAgentId,
+    ) -> Result<Vec<CancelledWhileAway>, StoreError> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM logical_agents WHERE id = ?1)",
+            [owing_agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Conflict("logical agent is absent".into()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT o.ask_message_id, o.cancellation_reason,
+                    o.cancellation_requester_agent_id, o.last_activity_at_ms
+             FROM obligations o
+             WHERE o.owing_agent_id = ?1 AND o.state = 'cancelled'
+               AND NOT EXISTS (SELECT 1 FROM deliveries d
+                               WHERE d.message_id = o.cancellation_owing_message_id
+                                 AND d.outcome = 'accepted')
+               AND o.last_activity_at_ms > COALESCE(
+                   (SELECT MAX(i2.created_at_ms) FROM incarnations i2
+                    WHERE i2.logical_agent_id = ?1
+                      AND i2.created_at_ms < (SELECT MAX(i3.created_at_ms)
+                                              FROM incarnations i3
+                                              WHERE i3.logical_agent_id = ?1)),
+                   0)
+               AND o.last_activity_at_ms <= COALESCE(
+                   (SELECT MAX(i.created_at_ms) FROM incarnations i
+                    WHERE i.logical_agent_id = ?1 AND i.state = 'ready'),
+                   9223372036854775807)
+             ORDER BY o.last_activity_at_ms DESC
+             LIMIT 20",
+        )?;
+        let rows = statement.query_map([owing_agent_id.to_string()], |row| {
             Ok(CancelledWhileAway {
                 ask_message_id: row.get(0)?,
                 reason: row.get(1)?,
@@ -6986,6 +7060,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         connection.execute_batch(include_str!("../migrations/021_socket_inbox_keys.sql"))?;
         version = 21;
     }
+    if version == 21 {
+        connection.execute_batch(include_str!("../migrations/022_owing_cancellation.sql"))?;
+        version = 22;
+    }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
             "unsupported schema version {version}"
@@ -7348,6 +7426,151 @@ fn queue_socket_inbox_delivery(
         params![message_id.to_string(), recipient_agent_id.to_string(), now],
     )?;
     Ok(())
+}
+
+fn optional_ready_incarnation(
+    tx: &Transaction<'_>,
+    logical_agent_id: LogicalAgentId,
+    conflict: &str,
+) -> Result<Option<IncarnationId>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT id FROM incarnations
+         WHERE logical_agent_id = ?1 AND state = 'ready'
+         ORDER BY created_at_ms ASC",
+    )?;
+    let rows = statement.query_map([logical_agent_id.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut ready = Vec::new();
+    for row in rows {
+        ready.push(row?);
+    }
+    drop(statement);
+    match ready.as_slice() {
+        [incarnation] => IncarnationId::parse(incarnation)
+            .ok_or_else(|| {
+                StoreError::InvalidRecord(format!("invalid incarnation id {incarnation}"))
+            })
+            .map(Some),
+        [] => Ok(None),
+        [_, _, ..] => Err(StoreError::Conflict(conflict.into())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_cancellation_prompt(
+    tx: &Transaction<'_>,
+    message_id: MessageId,
+    ask_message_id: MessageId,
+    reason: &str,
+    recipient_incarnation: IncarnationId,
+    audience: CancellationAudience,
+    due_at_ms: Option<i64>,
+    now: i64,
+) -> Result<OperationId, StoreError> {
+    let operation_id = OperationId::new();
+    let audience_label = match audience {
+        CancellationAudience::Waiting => "waiting",
+        CancellationAudience::Owing => "owing",
+    };
+    let intent = serde_json::json!({
+        "message_id": message_id,
+        "cancelled_ask": ask_message_id,
+        "reason": reason,
+        "audience": audience_label,
+        "recipient_incarnation_id": recipient_incarnation
+    });
+    let idempotency = match audience {
+        CancellationAudience::Waiting => format!("kelpie:cancellation:{ask_message_id}"),
+        CancellationAudience::Owing => format!("kelpie:owing-cancellation:{ask_message_id}"),
+    };
+    tx.execute(
+        "INSERT INTO operations
+         (id, idempotency_key, kind, target_incarnation_id, intent_json,
+          created_at_ms, outcome)
+         VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+        params![
+            operation_id.to_string(),
+            idempotency,
+            recipient_incarnation.to_string(),
+            intent.to_string(),
+            now
+        ],
+    )
+    .map_err(map_constraint)?;
+    tx.execute(
+        "INSERT INTO deliveries
+         (message_id, recipient_incarnation_id, attempt_number,
+          scheduled_at_ms, outcome, operation_id)
+         VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+        params![
+            message_id.to_string(),
+            recipient_incarnation.to_string(),
+            due_at_ms.unwrap_or(now),
+            if due_at_ms.is_some() {
+                "queued"
+            } else {
+                "pending"
+            },
+            operation_id.to_string()
+        ],
+    )?;
+    Ok(operation_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_cancellation_side(
+    tx: &Transaction<'_>,
+    recipient_agent: LogicalAgentId,
+    ask_message_id: MessageId,
+    reason: &str,
+    body: &str,
+    audience: CancellationAudience,
+    due_at_ms: Option<i64>,
+    now: i64,
+    ambiguous_ready: &str,
+) -> Result<(MessageId, Option<(OperationId, IncarnationId)>), StoreError> {
+    let message_id = MessageId::new();
+    tx.execute(
+        "INSERT INTO messages
+         (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
+          creates_obligation)
+         VALUES (?1, NULL, ?2, 'cancellation', ?3, ?4, 0)",
+        params![
+            message_id.to_string(),
+            recipient_agent.to_string(),
+            body,
+            now
+        ],
+    )?;
+    let identity = waiter_identity(tx, recipient_agent)?;
+    let delivery = match identity.transport {
+        DeliveryTransport::SocketInbox => {
+            if !identity.ended {
+                queue_socket_inbox_delivery(tx, message_id, recipient_agent, now)?;
+            }
+            None
+        }
+        DeliveryTransport::HerdrPrompt => {
+            match optional_ready_incarnation(tx, recipient_agent, ambiguous_ready)? {
+                Some(recipient_incarnation) => {
+                    let operation_id = insert_cancellation_prompt(
+                        tx,
+                        message_id,
+                        ask_message_id,
+                        reason,
+                        recipient_incarnation,
+                        audience,
+                        due_at_ms,
+                        now,
+                    )?;
+                    Some((operation_id, recipient_incarnation))
+                }
+                None => None,
+            }
+        }
+    };
+    Ok((message_id, delivery))
 }
 
 fn apply_reply_obligation_activity(
@@ -11233,11 +11456,17 @@ mod tests {
                 ask.message_id,
                 "obsolete question",
                 "Your ask was cancelled. Reason: obsolete question.",
+                "Stop. Ask was cancelled. Reason: obsolete question.",
+                None,
                 None,
             )
             .expect("cancel");
         let (operation_id, incarnation) = created.delivery.expect("Ready asker gets a delivery");
         assert_eq!(incarnation, waiting.incarnation_id);
+        let (owing_operation_id, owing_incarnation) = created
+            .owing_delivery
+            .expect("Ready owing agent gets a stop-notice");
+        assert_eq!(owing_incarnation, owing.incarnation_id);
 
         // The response is Kelpie's own message: kind cancellation, no sender.
         let (kind, sender): (String, Option<String>) = store
@@ -11262,11 +11491,16 @@ mod tests {
         // The deferred fire path renders from this intent, so it must produce
         // exactly the immediate path's envelope inputs: the original ask id and
         // the reason — never the response's own message id or its body text.
-        let (render_ask, render_reason) = store
+        let (render_ask, render_reason, audience) = store
             .cancellation_rendering_for_operation(operation_id)
             .expect("cancellation rendering from intent");
         assert_eq!(render_ask, ask.message_id);
         assert_eq!(render_reason, "obsolete question");
+        assert_eq!(audience, CancellationAudience::Waiting);
+        let (_, _, owing_audience) = store
+            .cancellation_rendering_for_operation(owing_operation_id)
+            .expect("owing cancellation rendering");
+        assert_eq!(owing_audience, CancellationAudience::Owing);
         assert_eq!(
             store.obligation_state(ask.message_id).expect("state"),
             ObligationState::Cancelled
@@ -11299,6 +11533,8 @@ mod tests {
                     ask.message_id,
                     "again",
                     "again",
+                    "again",
+                    None,
                     None,
                 )
                 .is_err()
@@ -11333,10 +11569,16 @@ mod tests {
                 ask.message_id,
                 "answered elsewhere",
                 "Your ask was cancelled. Reason: answered elsewhere.",
+                "Stop. Ask was cancelled. Reason: answered elsewhere.",
+                None,
                 None,
             )
             .expect("cancel");
         assert!(created.delivery.is_none(), "no Ready asker to deliver to");
+        assert!(
+            created.owing_delivery.is_some(),
+            "Ready owing agent still gets a stop-notice"
+        );
 
         // No incarnation at all: every cancellation is visible.
         let away = store
@@ -11374,6 +11616,84 @@ mod tests {
         let revived = store
             .cancelled_while_away(waiting.logical_agent_id)
             .expect("while away after revival");
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].ask_message_id, ask.message_id.to_string());
+    }
+
+    #[test]
+    fn cancellation_without_ready_owing_is_recorded_for_revival() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-waiting", "owing-away-waiting"))
+            .expect("declare waiting");
+        let owing = store
+            .declare_start(&intent("owing", "term-owing", "owing-away-owing"))
+            .expect("declare owing");
+        mark_ready(&mut store, waiting, "waiting", "term-waiting");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "status?",
+                "owing-away-ask",
+            )
+            .expect("ask");
+
+        let created = store
+            .cancel_with_response(
+                waiting.logical_agent_id,
+                ask.message_id,
+                "stand down",
+                "Your ask was cancelled. Reason: stand down.",
+                "Stop. Ask was cancelled. Reason: stand down.",
+                None,
+                None,
+            )
+            .expect("cancel");
+        assert!(
+            created.owing_delivery.is_none(),
+            "no Ready owing to deliver to"
+        );
+        assert!(
+            created.delivery.is_some(),
+            "Ready asker still gets a response"
+        );
+
+        let away = store
+            .cancelled_owing_while_away(owing.logical_agent_id)
+            .expect("owing while away");
+        assert_eq!(away.len(), 1);
+        assert_eq!(away[0].reason, "stand down");
+        assert_eq!(away[0].ask_message_id, ask.message_id.to_string());
+
+        let cancelled_at: i64 = store
+            .connection
+            .query_row(
+                "SELECT last_activity_at_ms FROM obligations WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("cancelled obligation");
+        store
+            .connection
+            .execute(
+                "INSERT INTO incarnations (
+                    id, logical_agent_id, herdr_session, intended_pane_id,
+                    expected_terminal_id, backend_kind, backend_args_json,
+                    working_directory, created_at_ms, state
+                 ) VALUES (?1, ?2, 's', 'w1:p2', 'term-owing', 'codex', '[]', '/tmp', ?3, 'ready')",
+                params![
+                    IncarnationId::new().to_string(),
+                    owing.logical_agent_id.to_string(),
+                    cancelled_at + 1
+                ],
+            )
+            .expect("owing revival incarnation");
+        let revived = store
+            .cancelled_owing_while_away(owing.logical_agent_id)
+            .expect("owing while away after revival");
         assert_eq!(revived.len(), 1);
         assert_eq!(revived[0].ask_message_id, ask.message_id.to_string());
     }
@@ -12401,10 +12721,16 @@ mod tests {
                 ask.message_id,
                 "obsolete",
                 "Your ask was cancelled. Reason: obsolete.",
+                "Stop. Ask was cancelled. Reason: obsolete.",
+                None,
                 None,
             )
             .expect("cancel");
         assert!(created.delivery.is_none());
+        assert!(
+            created.owing_delivery.is_some(),
+            "Ready owing pane still gets a stop-notice"
+        );
         assert_eq!(
             store.obligation_state(ask.message_id).expect("state"),
             ObligationState::Cancelled

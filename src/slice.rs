@@ -12,9 +12,9 @@ use crate::domain::{
 use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
-    AdoptEvidence, BoundaryReminder, CreatedAsk, CreatedReply, CreatedTell, DeclaredStart,
-    DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport, ReplyReceivePath, Store,
-    StoreError, store_clock_ms,
+    AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply, CreatedTell,
+    DeclaredStart, DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport,
+    ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -414,12 +414,14 @@ pub struct Kelpie {
     prompt_settle_delay_ms: i64,
 }
 
-/// Outcome of one cancellation: the obligation is always settled; the response
-/// is either delivered into the asker's Ready pane or recorded for revival.
+/// Outcome of one cancellation: the obligation is always settled; each notice
+/// is either delivered into a Ready pane or recorded for revival.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelOutcome {
     pub delivered: bool,
     pub message_id: Option<crate::domain::MessageId>,
+    pub owing_delivered: bool,
+    pub owing_message_id: Option<crate::domain::MessageId>,
 }
 
 impl Kelpie {
@@ -2437,16 +2439,17 @@ impl Kelpie {
     }
 
     /// Cancel one owned unresolved obligation with a durable reason, and
-    /// deliver Kelpie's cancellation response into the asker's Ready pane or
-    /// socket inbox.
+    /// deliver Kelpie's cancellation notices into the asker's and owing agent's
+    /// Ready panes or socket inboxes.
     ///
     /// `requester_agent_id` is a same-user identity claim, not authentication.
     ///
     /// The obligation settles `cancelled` before any Herdr write. With no Ready
     /// asker the response is only recorded, and `delivered` comes back false;
-    /// the record is what a revived asker reads. A rejected or unknown Herdr
-    /// outcome still leaves the cancellation standing — the notification is
-    /// best-effort, the settlement is not.
+    /// the record is what a revived asker reads. The owing agent's stop-notice
+    /// is the same: recorded when they are not addressable, delivered when they
+    /// are. A rejected or unknown Herdr outcome still leaves the cancellation
+    /// standing — the notification is best-effort, the settlement is not.
     ///
     /// # Errors
     ///
@@ -2466,12 +2469,18 @@ impl Kelpie {
             return Ok(CancelOutcome {
                 delivered: false,
                 message_id: None,
+                owing_delivered: false,
+                owing_message_id: None,
             });
         }
         let waiting_address = self.store.agent_address(requester_agent_id)?;
         let recipient_incarnation = self
             .store
             .cancel_recipient_incarnation(ask_message_id)
+            .map_err(SliceError::Store)?;
+        let owing_incarnation = self
+            .store
+            .cancel_owing_incarnation(ask_message_id)
             .map_err(SliceError::Store)?;
         // Same gates as every prompt: a clear in flight or the post-clear
         // settle gap defers the response into the queued machinery instead of
@@ -2480,32 +2489,82 @@ impl Kelpie {
             Some(incarnation) => self.prompt_schedule(incarnation, None)?,
             None => (None, false),
         };
+        let (owing_due_at_ms, owing_defer) = match owing_incarnation {
+            Some(incarnation) => self.prompt_schedule(incarnation, None)?,
+            None => (None, false),
+        };
         let body = format!(
             "Your ask {ask_message_id} was cancelled by {waiting_address}. Reason: {reason}. \
              No reply is owed. Re-ask the current holder of the name if the question \
              still matters."
         );
+        let owing_body = format!(
+            "Stop working on ask {ask_message_id}. It was cancelled by {waiting_address}. \
+             Reason: {reason}. No reply is owed."
+        );
         let created = self
             .store
-            .cancel_with_response(requester_agent_id, ask_message_id, reason, &body, due_at_ms)
+            .cancel_with_response(
+                requester_agent_id,
+                ask_message_id,
+                reason,
+                &body,
+                &owing_body,
+                due_at_ms,
+                owing_due_at_ms,
+            )
             .map_err(SliceError::Store)?;
-        let Some((operation_id, recipient_incarnation)) = created.delivery else {
-            return Ok(CancelOutcome {
-                delivered: false,
-                message_id: Some(created.message_id),
-            });
+        let delivered = match (created.delivery, defer) {
+            (Some((operation_id, incarnation)), false) => self.deliver_cancellation_notice(
+                operation_id,
+                incarnation,
+                &envelope::render_cancellation(
+                    &waiting_address,
+                    &ask_message_id.to_string(),
+                    reason,
+                )?,
+                "kelpie:cancellation",
+                "cancellation_after_submitted_before_write",
+                "cancellation_after_response_before_commit",
+            )?,
+            _ => false,
         };
-        if defer {
-            // Queued: the due-delivery pass fires it once the clear settles.
-            return Ok(CancelOutcome {
-                delivered: false,
-                message_id: Some(created.message_id),
-            });
-        }
+        let owing_delivered = match (created.owing_delivery, owing_defer) {
+            (Some((operation_id, incarnation)), false) => {
+                let owing_name = self.store.ask_info(ask_message_id)?.responder_name;
+                self.deliver_cancellation_notice(
+                    operation_id,
+                    incarnation,
+                    &envelope::render_owing_cancellation(
+                        &owing_name,
+                        &ask_message_id.to_string(),
+                        reason,
+                    )?,
+                    "kelpie:owing-cancellation",
+                    "owing_cancellation_after_submitted_before_write",
+                    "owing_cancellation_after_response_before_commit",
+                )?
+            }
+            _ => false,
+        };
+        Ok(CancelOutcome {
+            delivered,
+            message_id: Some(created.message_id),
+            owing_delivered,
+            owing_message_id: Some(created.owing_message_id),
+        })
+    }
+
+    fn deliver_cancellation_notice(
+        &mut self,
+        operation_id: OperationId,
+        recipient_incarnation: IncarnationId,
+        envelope: &str,
+        request_prefix: &str,
+        pause_before_write: &str,
+        pause_before_commit: &str,
+    ) -> Result<bool, SliceError> {
         let binding = self.store.ready_binding(recipient_incarnation)?;
-        // Connect failure means the notification provably never left. The
-        // cancellation stands; the delivery gets a terminal non-sent outcome
-        // instead of looking in-flight forever.
         let connection = match self.herdr.connect() {
             Ok(connection) => connection,
             Err(source) => {
@@ -2515,35 +2574,26 @@ impl Kelpie {
                     &source.to_string(),
                     DeliveryOutcome::TargetUnavailable,
                 )?;
-                return Ok(CancelOutcome {
-                    delivered: false,
-                    message_id: Some(created.message_id),
-                });
+                return Ok(false);
             }
         };
-        let request_id = format!("kelpie:cancellation:{operation_id}");
+        let request_id = format!("{request_prefix}:{operation_id}");
         let attempt = self
             .store
             .begin_attempt(operation_id, recipient_incarnation, &request_id)?;
         self.store
             .mark_submitted(operation_id, attempt, &request_id)?;
-        crate::test_fault::pause("cancellation_after_submitted_before_write");
-        let envelope =
-            envelope::render_cancellation(&waiting_address, &ask_message_id.to_string(), reason)
-                .map_err(SliceError::from)?;
-        match connection.prompt_agent(&request_id, &binding.pane_id, &envelope) {
+        crate::test_fault::pause(pause_before_write);
+        match connection.prompt_agent(&request_id, &binding.pane_id, envelope) {
             Ok(agent) => {
-                crate::test_fault::pause("cancellation_after_response_before_commit");
+                crate::test_fault::pause(pause_before_commit);
                 self.store.accept_delivery(
                     operation_id,
                     recipient_incarnation,
                     &agent.pane_id,
                     &agent.terminal_id,
                 )?;
-                Ok(CancelOutcome {
-                    delivered: true,
-                    message_id: Some(created.message_id),
-                })
+                Ok(true)
             }
             Err(source) if matches!(&source, HerdrError::Rejected { .. }) => {
                 self.store.mark_rejected(
@@ -2552,11 +2602,7 @@ impl Kelpie {
                     &source.to_string(),
                     DeliveryOutcome::Rejected,
                 )?;
-                // The settlement is durable; only the notification failed.
-                Ok(CancelOutcome {
-                    delivered: false,
-                    message_id: Some(created.message_id),
-                })
+                Ok(false)
             }
             Err(source) => {
                 self.store.mark_unknown(
@@ -2564,13 +2610,7 @@ impl Kelpie {
                     recipient_incarnation,
                     &source.to_string(),
                 )?;
-                // Same rule as a reply: an unknown Herdr outcome is never
-                // retried. The cancellation stands; the response's outcome is
-                // recorded unknown for diagnosis.
-                Ok(CancelOutcome {
-                    delivered: false,
-                    message_id: Some(created.message_id),
-                })
+                Ok(false)
             }
         }
     }
@@ -2599,6 +2639,21 @@ impl Kelpie {
     ) -> Result<Vec<crate::store::CancelledWhileAway>, SliceError> {
         self.store
             .cancelled_while_away(waiting_agent_id)
+            .map_err(SliceError::Store)
+    }
+
+    /// What was cancelled of this agent's owed asks while it had no Ready
+    /// incarnation. Read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the logical agent is absent.
+    pub fn cancelled_owing_while_away(
+        &self,
+        owing_agent_id: LogicalAgentId,
+    ) -> Result<Vec<crate::store::CancelledWhileAway>, SliceError> {
+        self.store
+            .cancelled_owing_while_away(owing_agent_id)
             .map_err(SliceError::Store)
     }
 
@@ -3064,11 +3119,25 @@ impl Kelpie {
             }
         };
         let connection = self.herdr.connect()?;
-        let request_id = match item.kind {
-            MessageKind::Ask => format!("kelpie:ask:{}", item.operation_id),
-            MessageKind::Tell => format!("kelpie:tell:{}", item.operation_id),
-            MessageKind::Reply => format!("kelpie:reply:{}", item.operation_id),
-            MessageKind::Cancellation => format!("kelpie:cancellation:{}", item.operation_id),
+        let cancellation_audience = match item.kind {
+            MessageKind::Cancellation => {
+                let (_, _, audience) = self
+                    .store
+                    .cancellation_rendering_for_operation(item.operation_id)?;
+                Some(audience)
+            }
+            _ => None,
+        };
+        let request_id = match (item.kind, cancellation_audience) {
+            (MessageKind::Ask, _) => format!("kelpie:ask:{}", item.operation_id),
+            (MessageKind::Tell, _) => format!("kelpie:tell:{}", item.operation_id),
+            (MessageKind::Reply, _) => format!("kelpie:reply:{}", item.operation_id),
+            (MessageKind::Cancellation, Some(CancellationAudience::Owing)) => {
+                format!("kelpie:owing-cancellation:{}", item.operation_id)
+            }
+            (MessageKind::Cancellation, _) => {
+                format!("kelpie:cancellation:{}", item.operation_id)
+            }
         };
         let attempt =
             self.store
@@ -3081,11 +3150,14 @@ impl Kelpie {
             self.store
                 .mark_submitted(item.operation_id, attempt, &request_id)?;
         }
-        let pause_before_write = match item.kind {
-            MessageKind::Ask => "ask_after_submitted_before_write",
-            MessageKind::Tell => "tell_after_submitted_before_write",
-            MessageKind::Reply => "reply_after_submitted_before_write",
-            MessageKind::Cancellation => "cancellation_after_submitted_before_write",
+        let pause_before_write = match (item.kind, cancellation_audience) {
+            (MessageKind::Ask, _) => "ask_after_submitted_before_write",
+            (MessageKind::Tell, _) => "tell_after_submitted_before_write",
+            (MessageKind::Reply, _) => "reply_after_submitted_before_write",
+            (MessageKind::Cancellation, Some(CancellationAudience::Owing)) => {
+                "owing_cancellation_after_submitted_before_write"
+            }
+            (MessageKind::Cancellation, _) => "cancellation_after_submitted_before_write",
         };
         crate::test_fault::pause(pause_before_write);
         let envelope = match rendered {
@@ -3127,27 +3199,38 @@ impl Kelpie {
                 }
                 MessageKind::Cancellation => {
                     // The deferred response must render exactly what the
-                    // immediate path would have: same ask id, same reason.
-                    let waiting_address = self.store.agent_address(item.recipient)?;
-                    let (cancelled_ask, reason) = self
+                    // immediate path would have: same ask id, same reason,
+                    // same occupant role.
+                    let address = self.store.agent_address(item.recipient)?;
+                    let (cancelled_ask, reason, audience) = self
                         .store
                         .cancellation_rendering_for_operation(item.operation_id)?;
-                    envelope::render_cancellation(
-                        &waiting_address,
-                        &cancelled_ask.to_string(),
-                        &reason,
-                    )
+                    match audience {
+                        CancellationAudience::Waiting => envelope::render_cancellation(
+                            &address,
+                            &cancelled_ask.to_string(),
+                            &reason,
+                        ),
+                        CancellationAudience::Owing => envelope::render_owing_cancellation(
+                            &address,
+                            &cancelled_ask.to_string(),
+                            &reason,
+                        ),
+                    }
                 }
             }
             .map_err(SliceError::from)?,
         };
         match connection.prompt_agent(&request_id, &binding.pane_id, &envelope) {
             Ok(agent) => {
-                let pause_before_commit = match item.kind {
-                    MessageKind::Ask => "ask_after_response_before_commit",
-                    MessageKind::Tell => "tell_after_response_before_commit",
-                    MessageKind::Reply => "reply_after_response_before_commit",
-                    MessageKind::Cancellation => "cancellation_after_response_before_commit",
+                let pause_before_commit = match (item.kind, cancellation_audience) {
+                    (MessageKind::Ask, _) => "ask_after_response_before_commit",
+                    (MessageKind::Tell, _) => "tell_after_response_before_commit",
+                    (MessageKind::Reply, _) => "reply_after_response_before_commit",
+                    (MessageKind::Cancellation, Some(CancellationAudience::Owing)) => {
+                        "owing_cancellation_after_response_before_commit"
+                    }
+                    (MessageKind::Cancellation, _) => "cancellation_after_response_before_commit",
                 };
                 crate::test_fault::pause(pause_before_commit);
                 self.store.accept_delivery(
