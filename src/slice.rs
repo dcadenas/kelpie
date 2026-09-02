@@ -14,8 +14,8 @@ use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply, CreatedTell,
-    DeclaredStart, DueDelivery, DueReminder, DueRenew, EndedWaiter, PendingObligation,
-    RecoveryReport, ReplyReceivePath, Store, StoreError, store_clock_ms,
+    DeclaredStart, DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport,
+    ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -423,6 +423,21 @@ pub struct CancelOutcome {
     pub message_id: Option<crate::domain::MessageId>,
     pub owing_delivered: bool,
     pub owing_message_id: Option<crate::domain::MessageId>,
+}
+
+/// One owing stop-notice after retiring a socket waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaiterRetireOwingNotice {
+    pub ask_message_id: crate::domain::MessageId,
+    pub message_id: crate::domain::MessageId,
+    pub delivered: bool,
+}
+
+/// Outcome of ending a socket waiter: targeting ended, waits cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaiterRetireOutcome {
+    pub cancelled_ask_ids: Vec<crate::domain::MessageId>,
+    pub owing_notices: Vec<WaiterRetireOwingNotice>,
 }
 
 impl Kelpie {
@@ -2568,7 +2583,7 @@ impl Kelpie {
     pub fn retire_waiter(
         &mut self,
         logical_agent_id: LogicalAgentId,
-    ) -> Result<EndedWaiter, SliceError> {
+    ) -> Result<WaiterRetireOutcome, SliceError> {
         let asks = self
             .store
             .unresolved_asks_waiting_on(logical_agent_id)
@@ -2593,28 +2608,37 @@ impl Kelpie {
             .store
             .end_socket_waiter_with_owing_due(logical_agent_id, &owing_due)
             .map_err(SliceError::Store)?;
-        for notice in &ended.owing_notices {
-            if defer.contains(&notice.ask_message_id) {
-                continue;
-            }
-            let Some((operation_id, incarnation)) = notice.delivery else {
-                continue;
+        let mut owing_notices = Vec::new();
+        for notice in ended.owing_notices {
+            let delivered = if defer.contains(&notice.ask_message_id) {
+                false
+            } else if let Some((operation_id, incarnation)) = notice.delivery {
+                let owing_name = self.store.ask_info(notice.ask_message_id)?.responder_name;
+                self.deliver_cancellation_notice(
+                    operation_id,
+                    incarnation,
+                    &envelope::render_owing_cancellation(
+                        &owing_name,
+                        &notice.ask_message_id.to_string(),
+                        "waiter retired",
+                    )?,
+                    "kelpie:owing-cancellation",
+                    "owing_cancellation_after_submitted_before_write",
+                    "owing_cancellation_after_response_before_commit",
+                )?
+            } else {
+                false
             };
-            let owing_name = self.store.ask_info(notice.ask_message_id)?.responder_name;
-            self.deliver_cancellation_notice(
-                operation_id,
-                incarnation,
-                &envelope::render_owing_cancellation(
-                    &owing_name,
-                    &notice.ask_message_id.to_string(),
-                    "waiter retired",
-                )?,
-                "kelpie:owing-cancellation",
-                "owing_cancellation_after_submitted_before_write",
-                "owing_cancellation_after_response_before_commit",
-            )?;
+            owing_notices.push(WaiterRetireOwingNotice {
+                ask_message_id: notice.ask_message_id,
+                message_id: notice.message_id,
+                delivered,
+            });
         }
-        Ok(ended)
+        Ok(WaiterRetireOutcome {
+            cancelled_ask_ids: ended.cancelled_ask_ids,
+            owing_notices,
+        })
     }
 
     fn deliver_cancellation_notice(

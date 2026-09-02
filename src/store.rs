@@ -1861,6 +1861,10 @@ impl Store {
         for (ask, owing) in asks {
             let ask_id = parse_message_id(&ask)?;
             let owing_agent = parse_logical_agent_id(&owing)?;
+            if supersede_unsubmitted_ask_delivery(&tx, ask_id, logical_agent_id, REASON, now)? {
+                cancelled_ask_ids.push(ask_id);
+                continue;
+            }
             let waiting_body = format!(
                 "Your ask {ask_id} was cancelled by {public_name}. Reason: {REASON}. \
                  No reply is owed. Re-ask the current holder of the name if the question \
@@ -7692,6 +7696,58 @@ fn insert_cancellation_prompt(
     Ok(operation_id)
 }
 
+fn supersede_unsubmitted_ask_delivery(
+    tx: &Transaction<'_>,
+    ask_id: MessageId,
+    waiter: LogicalAgentId,
+    reason: &str,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT outcome, operation_id FROM deliveries
+             WHERE message_id = ?1 AND delivery_transport = 'herdr_prompt'",
+            [ask_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((outcome, Some(operation_id))) = row else {
+        return Ok(false);
+    };
+    if outcome != "queued" {
+        return Ok(false);
+    }
+    let submitted: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM operation_attempts
+         WHERE operation_id = ?1 AND phase != 'prepared'",
+        [&operation_id],
+        |row| row.get(0),
+    )?;
+    if submitted > 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE deliveries SET outcome = 'superseded', resolved_at_ms = ?1,
+         cancelled_at_ms = ?1, cancellation_requester_agent_id = ?2,
+         cancellation_reason = ?3
+         WHERE operation_id = ?4 AND outcome = 'queued'",
+        params![now, waiter.to_string(), reason, operation_id],
+    )?;
+    tx.execute(
+        "UPDATE operations SET outcome = 'superseded', resolved_at_ms = ?1
+         WHERE id = ?2 AND outcome = 'pending'",
+        params![now, operation_id],
+    )?;
+    let settled = tx.execute(
+        "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
+         cancellation_requester_agent_id = ?2, cancellation_reason = ?3
+         WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+         AND state IN ('open', 'in_progress')",
+        params![now, waiter.to_string(), reason, ask_id.to_string()],
+    )?;
+    Ok(settled == 1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_cancellation_side(
     tx: &Transaction<'_>,
@@ -13127,6 +13183,17 @@ mod tests {
             )
             .expect("queued count");
         assert_eq!(remaining_queued, 0);
+        let waiting_notice_deliveries: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries d
+                 JOIN obligations o ON o.cancellation_response_message_id = d.message_id
+                 WHERE o.ask_message_id = ?1",
+                [open_ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("waiting notice deliveries");
+        assert_eq!(waiting_notice_deliveries, 0);
         let later = store
             .reply_receive_path(open_ask.message_id, owing.logical_agent_id)
             .expect_err("closed")
@@ -13138,6 +13205,56 @@ mod tests {
         store
             .declare_start(&intent("inbox", "term-c", "name-free-after-retire"))
             .expect("name released");
+    }
+
+    #[test]
+    fn waiter_retire_does_not_notify_owing_for_an_undelivered_ask() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "queued-retire")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "queued-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let due_at = store_clock_ms().expect("clock") + 60_000;
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "later",
+                "queued-ask",
+                Some(due_at),
+                None,
+                true,
+            )
+            .expect("queued ask");
+        let ended = store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("retire");
+        assert_eq!(ended.cancelled_ask_ids, vec![ask.message_id]);
+        assert!(ended.owing_notices.is_empty());
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("cancelled"),
+            ObligationState::Cancelled
+        );
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(ask.message_id)
+                .expect("superseded"),
+            DeliveryOutcome::Superseded
+        );
+        let owing_messages: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM obligations
+                 WHERE ask_message_id = ?1 AND cancellation_owing_message_id IS NOT NULL",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("owing message");
+        assert_eq!(owing_messages, 0);
     }
 
     #[test]

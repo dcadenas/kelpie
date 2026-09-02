@@ -186,8 +186,10 @@ MUST remain `socket_inbox` after that end. Start-continue and adopt MUST still
 refuse the agent. `waiter.retire` with no `open` or `in_progress` asks waiting
 on that agent MUST only end targeting. With such asks, it MUST cancel them in
 the same transaction, with reason `waiter retired`, and MUST notify each owing
-agent when that agent is addressable, as `cancel` does. It MUST NOT deliver
-those cancellation notices to the retiring waiter's inbox. Queued socket-inbox
+agent when that agent is addressable, as `cancel` does — including skipping the
+owing stop-notice when the ask's own delivery is still an unsubmitted `queued`
+row. It MUST NOT deliver those cancellation notices to the retiring waiter's
+inbox. Queued socket-inbox
 deliveries for that waiter MUST NOT remain `queued`. After that, occupant
 `pending` MUST NOT list those asks, and a later final MUST be refused because
 the obligation is not open, not because the waiter is no longer a delivery

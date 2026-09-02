@@ -437,12 +437,7 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "logical_agent_id"),
             field(&result, "public_name")
         ),
-        "waiter.retire" => format!(
-            "waiter-retire agent={} targeting-ended={} cancelled-asks={}\n",
-            field(&result, "logical_agent_id"),
-            field(&result, "targeting_ended"),
-            field(&result, "cancelled_ask_ids")
-        ),
+        "waiter.retire" => format_waiter_retire_receipt(&result),
         "rename" => format!(
             "rename name={} agent={} incarnation={}\n",
             field(&result, "public_name"),
@@ -1706,6 +1701,37 @@ fn nested_field(value: &Value, object: &str, name: &str) -> String {
         Some(inner) => field(inner, name),
         None => "-".into(),
     }
+}
+
+fn format_waiter_retire_receipt(result: &Value) -> String {
+    let cancelled = result["cancelled_ask_ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "none".into());
+    let mut delivered = 0;
+    let mut recorded = 0;
+    if let Some(notices) = result["owing_notices"].as_array() {
+        for notice in notices {
+            match notice["owing_response"].as_str() {
+                Some("delivered") => delivered += 1,
+                _ => recorded += 1,
+            }
+        }
+    }
+    format!(
+        "waiter-retire agent={} targeting-ended={} cancelled-asks={} owing-delivered={} owing-recorded={}\n",
+        field(result, "logical_agent_id"),
+        field(result, "targeting_ended"),
+        cancelled,
+        delivered,
+        recorded
+    )
 }
 
 fn field(value: &Value, name: &str) -> String {

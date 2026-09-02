@@ -1311,6 +1311,17 @@ fn dispatch_waiter_retire(params: Value, kelpie: &mut Kelpie) -> Result<Value, S
         "logical_agent_id": params.logical_agent_id,
         "targeting_ended": true,
         "cancelled_ask_ids": ended.cancelled_ask_ids,
+        "owing_notices": ended
+            .owing_notices
+            .iter()
+            .map(|notice| {
+                serde_json::json!({
+                    "ask_message_id": notice.ask_message_id,
+                    "message_id": notice.message_id,
+                    "owing_response": if notice.delivered { "delivered" } else { "recorded" },
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
