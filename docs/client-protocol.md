@@ -35,9 +35,11 @@ and `whoami`, using the fields in the corresponding SPEC contracts.
 reconnects, names its waiter LogicalAgent id (same-user attribution, not
 authentication), and keeps the connection. Kelpie writes `inbox.delivery`
 events for queued deliveries of that waiter only. The client acknowledges with
-`inbox.ack`. Dropping the connection leaves those deliveries `queued`. Claiming
-an id that is not an active socket waiter is `conflict`. `pending` and
-`ask.info` are not this receive path.
+`inbox.ack`. A delivery line is complete only at the newline; discard a trailing
+fragment with no newline and wait for reconnect to re-offer that queued row.
+Dropping the connection leaves those deliveries `queued`. Claiming an id that
+is not an active socket waiter is `conflict`. `pending` and `ask.info` are not
+this receive path.
 
 `kelpie adopt --pane ID --terminal ID [--logical-id ID]` is the client form.
 `--logical-id` continues that exact logical agent in a new incarnation, keeping
