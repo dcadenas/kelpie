@@ -437,11 +437,7 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "logical_agent_id"),
             field(&result, "public_name")
         ),
-        "waiter.retire" => format!(
-            "waiter-retire agent={} targeting-ended={}\n",
-            field(&result, "logical_agent_id"),
-            field(&result, "targeting_ended")
-        ),
+        "waiter.retire" => format_waiter_retire_receipt(&result),
         "rename" => format!(
             "rename name={} agent={} incarnation={}\n",
             field(&result, "public_name"),
@@ -1707,6 +1703,37 @@ fn nested_field(value: &Value, object: &str, name: &str) -> String {
     }
 }
 
+fn format_waiter_retire_receipt(result: &Value) -> String {
+    let cancelled = result["cancelled_ask_ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "none".into());
+    let mut delivered = 0;
+    let mut recorded = 0;
+    if let Some(notices) = result["owing_notices"].as_array() {
+        for notice in notices {
+            match notice["owing_response"].as_str() {
+                Some("delivered") => delivered += 1,
+                _ => recorded += 1,
+            }
+        }
+    }
+    format!(
+        "waiter-retire agent={} targeting-ended={} cancelled-asks={} owing-delivered={} owing-recorded={}\n",
+        field(result, "logical_agent_id"),
+        field(result, "targeting_ended"),
+        cancelled,
+        delivered,
+        recorded
+    )
+}
+
 fn field(value: &Value, name: &str) -> String {
     match &value[name] {
         Value::String(text) => text.clone(),
@@ -2644,6 +2671,36 @@ mod tests {
         assert!(text.contains("response=delivered"), "{text}");
         assert!(text.contains("owing-response=recorded"), "{text}");
         assert!(text.contains("owing-message=owing-notice"), "{text}");
+    }
+
+    #[test]
+    fn waiter_retire_receipt_joins_ids_and_counts_owing_notices() {
+        let text = format_receipt(
+            "waiter.retire",
+            &json!({"result":{
+                "logical_agent_id":"waiter-1",
+                "targeting_ended":true,
+                "cancelled_ask_ids":["ask-a","ask-b"],
+                "owing_notices":[
+                    {"ask_message_id":"ask-a","message_id":"n1","owing_response":"delivered"},
+                    {"ask_message_id":"ask-b","message_id":"n2","owing_response":"recorded"}
+                ]
+            }}),
+        );
+        assert!(text.contains("cancelled-asks=ask-a,ask-b"), "{text}");
+        assert!(text.contains("owing-delivered=1"), "{text}");
+        assert!(text.contains("owing-recorded=1"), "{text}");
+        let empty = format_receipt(
+            "waiter.retire",
+            &json!({"result":{
+                "logical_agent_id":"waiter-1",
+                "targeting_ended":true,
+                "cancelled_ask_ids":[],
+                "owing_notices":[]
+            }}),
+        );
+        assert!(empty.contains("cancelled-asks=none"), "{empty}");
+        assert!(empty.contains("owing-delivered=0"), "{empty}");
     }
 
     #[test]

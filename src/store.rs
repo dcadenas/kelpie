@@ -1,5 +1,6 @@
 //! SQLite-backed durable intent, messaging, and obligation state.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,6 +112,22 @@ pub struct CreatedAsk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedWaiter {
     pub logical_agent_id: LogicalAgentId,
+}
+
+/// One owing stop-notice recorded while ending a socket waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwingRetireNotice {
+    pub ask_message_id: MessageId,
+    pub message_id: MessageId,
+    /// Present when the owing agent had a Ready incarnation to deliver to.
+    pub delivery: Option<(OperationId, IncarnationId)>,
+}
+
+/// Result of ending a socket waiter as a delivery target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedWaiter {
+    pub cancelled_ask_ids: Vec<MessageId>,
+    pub owing_notices: Vec<OwingRetireNotice>,
 }
 
 /// One queued socket-inbox delivery named by waiter agent, not incarnation.
@@ -1745,15 +1762,73 @@ impl Store {
 
     /// End a socket waiter as a delivery target and release its public name.
     ///
+    /// Open and in-progress asks waiting on this waiter are cancelled in the
+    /// same transaction, with reason `waiter retired`. Queued socket-inbox
+    /// deliveries for the waiter become `target_unavailable`.
+    ///
     /// # Errors
     ///
     /// Returns a conflict when the agent is not an active socket waiter.
     pub fn end_socket_waiter(
         &mut self,
         logical_agent_id: LogicalAgentId,
-    ) -> Result<(), StoreError> {
+    ) -> Result<EndedWaiter, StoreError> {
+        self.end_socket_waiter_with_owing_due(logical_agent_id, &HashMap::new())
+    }
+
+    /// Open and in-progress asks this waiter is waiting on, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the logical agent is absent.
+    pub fn unresolved_asks_waiting_on(
+        &self,
+        waiting_agent_id: LogicalAgentId,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM logical_agents WHERE id = ?1)",
+            [waiting_agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Conflict("logical agent is absent".into()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT ask_message_id FROM obligations
+             WHERE waiting_agent_id = ?1 AND state IN ('open', 'in_progress')
+             ORDER BY creation_sequence",
+        )?;
+        let rows = statement.query_map([waiting_agent_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut asks = Vec::new();
+        for row in rows {
+            asks.push(parse_message_id(&row?)?);
+        }
+        Ok(asks)
+    }
+
+    /// End a socket waiter, cancelling its waits with optional owing schedules.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the agent is not an active socket waiter.
+    #[allow(clippy::too_many_lines)]
+    pub fn end_socket_waiter_with_owing_due(
+        &mut self,
+        logical_agent_id: LogicalAgentId,
+        owing_due_at_ms: &HashMap<MessageId, Option<i64>>,
+    ) -> Result<EndedWaiter, StoreError> {
+        const REASON: &str = "waiter retired";
         let now = now_millis()?;
-        let changed = self.connection.execute(
+        let tx = self.connection.transaction()?;
+        require_active_socket_waiter(&tx, logical_agent_id)?;
+        let public_name: String = tx.query_row(
+            "SELECT public_name FROM logical_agents WHERE id = ?1",
+            [logical_agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let changed = tx.execute(
             "UPDATE logical_agents
              SET targeting_ended_at_ms = ?1
              WHERE id = ?2
@@ -1766,7 +1841,109 @@ impl Store {
                 "logical agent {logical_agent_id} is not an active socket waiter"
             )));
         }
-        Ok(())
+        let asks = {
+            let mut statement = tx.prepare(
+                "SELECT ask_message_id, owing_agent_id FROM obligations
+                 WHERE waiting_agent_id = ?1 AND state IN ('open', 'in_progress')
+                 ORDER BY creation_sequence",
+            )?;
+            let rows = statement.query_map([logical_agent_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut asks = Vec::new();
+            for row in rows {
+                asks.push(row?);
+            }
+            asks
+        };
+        let mut cancelled_ask_ids = Vec::new();
+        let mut owing_notices = Vec::new();
+        for (ask, owing) in asks {
+            let ask_id = parse_message_id(&ask)?;
+            let owing_agent = parse_logical_agent_id(&owing)?;
+            if supersede_unsubmitted_ask_delivery(&tx, ask_id, logical_agent_id, REASON, now)? {
+                cancelled_ask_ids.push(ask_id);
+                continue;
+            }
+            let waiting_body = format!(
+                "Your ask {ask_id} was cancelled by {public_name}. Reason: {REASON}. \
+                 No reply is owed. Re-ask the current holder of the name if the question \
+                 still matters."
+            );
+            let owing_body = format!(
+                "Stop working on ask {ask_id}. It was cancelled by {public_name}. \
+                 Reason: {REASON}. No reply is owed."
+            );
+            let due_at_ms = owing_due_at_ms.get(&ask_id).copied().flatten();
+            let (waiting_message_id, _) = record_cancellation_side(
+                &tx,
+                logical_agent_id,
+                ask_id,
+                REASON,
+                &waiting_body,
+                CancellationAudience::Waiting,
+                None,
+                now,
+                "ambiguous ready incarnation for waiting agent",
+            )?;
+            let (owing_message_id, owing_delivery) = record_cancellation_side(
+                &tx,
+                owing_agent,
+                ask_id,
+                REASON,
+                &owing_body,
+                CancellationAudience::Owing,
+                due_at_ms,
+                now,
+                "ambiguous ready incarnation for owing agent",
+            )?;
+            tx.execute(
+                "UPDATE obligations SET cancellation_response_message_id = ?1,
+                 cancellation_owing_message_id = ?2
+                 WHERE ask_message_id = ?3",
+                params![
+                    waiting_message_id.to_string(),
+                    owing_message_id.to_string(),
+                    ask_id.to_string()
+                ],
+            )?;
+            let settled = tx.execute(
+                "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
+                 cancellation_requester_agent_id = ?2, cancellation_reason = ?3
+                 WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+                 AND state IN ('open', 'in_progress')",
+                params![
+                    now,
+                    logical_agent_id.to_string(),
+                    REASON,
+                    ask_id.to_string()
+                ],
+            )?;
+            if settled != 1 {
+                return Err(StoreError::Conflict(
+                    "obligation changed before waiter retirement committed".into(),
+                ));
+            }
+            cancelled_ask_ids.push(ask_id);
+            owing_notices.push(OwingRetireNotice {
+                ask_message_id: ask_id,
+                message_id: owing_message_id,
+                delivery: owing_delivery,
+            });
+        }
+        tx.execute(
+            "UPDATE deliveries
+                SET outcome = 'target_unavailable', resolved_at_ms = ?1
+              WHERE recipient_agent_id = ?2
+                AND delivery_transport = 'socket_inbox'
+                AND outcome = 'queued'",
+            params![now, logical_agent_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(EndedWaiter {
+            cancelled_ask_ids,
+            owing_notices,
+        })
     }
 
     /// Record one socket-inbox delivery named by waiter agent, not incarnation.
@@ -7542,6 +7719,58 @@ fn insert_cancellation_prompt(
     Ok(operation_id)
 }
 
+fn supersede_unsubmitted_ask_delivery(
+    tx: &Transaction<'_>,
+    ask_id: MessageId,
+    waiter: LogicalAgentId,
+    reason: &str,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT outcome, operation_id FROM deliveries
+             WHERE message_id = ?1 AND delivery_transport = 'herdr_prompt'",
+            [ask_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((outcome, Some(operation_id))) = row else {
+        return Ok(false);
+    };
+    if outcome != "queued" {
+        return Ok(false);
+    }
+    let submitted: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM operation_attempts
+         WHERE operation_id = ?1 AND phase != 'prepared'",
+        [&operation_id],
+        |row| row.get(0),
+    )?;
+    if submitted > 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE deliveries SET outcome = 'superseded', resolved_at_ms = ?1,
+         cancelled_at_ms = ?1, cancellation_requester_agent_id = ?2,
+         cancellation_reason = ?3
+         WHERE operation_id = ?4 AND outcome = 'queued'",
+        params![now, waiter.to_string(), reason, operation_id],
+    )?;
+    tx.execute(
+        "UPDATE operations SET outcome = 'superseded', resolved_at_ms = ?1
+         WHERE id = ?2 AND outcome = 'pending'",
+        params![now, operation_id],
+    )?;
+    let settled = tx.execute(
+        "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
+         cancellation_requester_agent_id = ?2, cancellation_reason = ?3
+         WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+         AND state IN ('open', 'in_progress')",
+        params![now, waiter.to_string(), reason, ask_id.to_string()],
+    )?;
+    Ok(settled == 1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_cancellation_side(
     tx: &Transaction<'_>,
@@ -13025,5 +13254,198 @@ mod tests {
         assert_eq!(queued[0].message_id, created.message_id);
         assert_eq!(queued[0].kind, MessageKind::Cancellation);
         assert_eq!(queued[0].body, "Your ask was cancelled. Reason: obsolete.");
+    }
+
+    fn waiter_ask(
+        store: &mut Store,
+        waiter: LogicalAgentId,
+        owing: DeclaredStart,
+        body: &str,
+        key: &str,
+    ) -> CreatedAsk {
+        store
+            .create_ask_with_schedule(
+                waiter,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                body,
+                key,
+                None,
+                None,
+                true,
+            )
+            .expect("ask")
+    }
+
+    #[test]
+    fn waiter_retire_cancels_open_asks_and_queued_finals() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "retire-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "retire-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let open_ask = waiter_ask(&mut store, waiter.logical_agent_id, owing, "open", "open");
+        let queued_ask = waiter_ask(
+            &mut store,
+            waiter.logical_agent_id,
+            owing,
+            "queued",
+            "queued",
+        );
+        let final_reply = store
+            .create_reply(
+                queued_ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "retire-final",
+            )
+            .expect("queued final");
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(final_reply.message_id)
+                .expect("queued"),
+            DeliveryOutcome::Queued
+        );
+        let ended = store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("retire");
+        assert_eq!(ended.cancelled_ask_ids.len(), 2);
+        assert_eq!(
+            store.obligation_state(open_ask.message_id).expect("open"),
+            ObligationState::Cancelled
+        );
+        assert_eq!(
+            store
+                .obligation_state(queued_ask.message_id)
+                .expect("queued"),
+            ObligationState::Cancelled
+        );
+        let reason: String = store
+            .connection
+            .query_row(
+                "SELECT cancellation_reason FROM obligations WHERE ask_message_id = ?1",
+                [open_ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("reason");
+        assert_eq!(reason, "waiter retired");
+        assert!(
+            store
+                .pending_obligations(owing.logical_agent_id)
+                .expect("pending")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(final_reply.message_id)
+                .expect("undeliverable"),
+            DeliveryOutcome::TargetUnavailable
+        );
+        let remaining_queued: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries
+                 WHERE recipient_agent_id = ?1 AND outcome = 'queued'",
+                [waiter.logical_agent_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("queued count");
+        assert_eq!(remaining_queued, 0);
+        let waiting_notice_deliveries: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries d
+                 JOIN obligations o ON o.cancellation_response_message_id = d.message_id
+                 WHERE o.ask_message_id = ?1",
+                [open_ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("waiting notice deliveries");
+        assert_eq!(waiting_notice_deliveries, 0);
+        let later = store
+            .reply_receive_path(open_ask.message_id, owing.logical_agent_id)
+            .expect_err("closed")
+            .to_string();
+        assert!(
+            later.contains("does not name an open obligation"),
+            "later final must fail as not open, not as an ended waiter: {later}"
+        );
+        store
+            .declare_start(&intent("inbox", "term-c", "name-free-after-retire"))
+            .expect("name released");
+    }
+
+    #[test]
+    fn waiter_retire_does_not_notify_owing_for_an_undelivered_ask() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "queued-retire")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "queued-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let due_at = store_clock_ms().expect("clock") + 60_000;
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "later",
+                "queued-ask",
+                Some(due_at),
+                None,
+                true,
+            )
+            .expect("queued ask");
+        let ended = store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("retire");
+        assert_eq!(ended.cancelled_ask_ids, vec![ask.message_id]);
+        assert!(ended.owing_notices.is_empty());
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("cancelled"),
+            ObligationState::Cancelled
+        );
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(ask.message_id)
+                .expect("superseded"),
+            DeliveryOutcome::Superseded
+        );
+        let owing_messages: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM obligations
+                 WHERE ask_message_id = ?1 AND cancellation_owing_message_id IS NOT NULL",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("owing message");
+        assert_eq!(owing_messages, 0);
+    }
+
+    #[test]
+    fn waiter_retire_without_open_asks_only_ends_targeting() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "empty-retire")
+            .expect("register");
+        let ended = store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("retire");
+        assert!(ended.cancelled_ask_ids.is_empty());
+        assert!(ended.owing_notices.is_empty());
+        let again = store.end_socket_waiter(waiter.logical_agent_id);
+        assert!(
+            again
+                .expect_err("already ended")
+                .to_string()
+                .contains("not an active socket waiter")
+        );
     }
 }

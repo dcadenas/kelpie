@@ -183,7 +183,17 @@ resolution MUST fail closed when more than one agent could match. Snapshot
 absence MUST NOT release a socket waiter's name. That name is released only by
 `waiter.retire`, which ends that LogicalAgent as a delivery target. `delivery_transport`
 MUST remain `socket_inbox` after that end. Start-continue and adopt MUST still
-refuse the agent.
+refuse the agent. `waiter.retire` with no `open` or `in_progress` asks waiting
+on that agent MUST only end targeting. With such asks, it MUST cancel them in
+the same transaction, with reason `waiter retired`, and MUST notify each owing
+agent when that agent is addressable, as `cancel` does — including skipping the
+owing stop-notice when the ask's own delivery is still an unsubmitted `queued`
+row. It MUST NOT deliver those cancellation notices to the retiring waiter's
+inbox. Queued socket-inbox
+deliveries for that waiter MUST NOT remain `queued`. After that, occupant
+`pending` MUST NOT list those asks, and a later final MUST be refused because
+the obligation is not open, not because the waiter is no longer a delivery
+target.
 
 `waiter.register` MUST create that pane-less LogicalAgent. The request MUST
 contain a public name, explicit parent or parentless marker, and an idempotency
@@ -1076,6 +1086,7 @@ Herdr prompt proofs above.
 | Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |
 | Same-user cancel is not waiter-only | With the waiter gone, cancel as the owing agent or a third Ready agent by ask id and reason; verify `cancelled` (not `resolved`) and the requester recorded. Cancel with the waiter's id still works. A wrong ask id fails closed. A renew prepare ask is refused and the policy stays armed. |
 | Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming an id that is not an active socket waiter is refused. |
+| Waiter retire does not strand open asks | `waiter.retire` while an ask is `open` or `in_progress`: those asks become `cancelled` with reason `waiter retired`, the owing agent is notified when addressable, occupant `pending` does not list them, and a later final is refused as not an open obligation. Queued finals for that waiter are no longer `queued`. Retire with no open asks still only ends targeting. |
 
 Tests SHOULD use deterministic fake Herdr protocol fixtures for state-machine
 coverage and real Herdr integration tests for transport, lifecycle, and failure

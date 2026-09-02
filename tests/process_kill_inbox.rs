@@ -20,6 +20,7 @@ const DAEMON_BOUND: &str = "daemon_bound";
 const INBOX_BEFORE_WRITE: &str = "inbox_after_queued_before_write";
 const INBOX_AFTER_WRITE: &str = "inbox_after_write_before_ack";
 const INBOX_AFTER_ACK: &str = "inbox_after_ack_before_resolve";
+const OWING_SUBMITTED: &str = "owing_cancellation_after_submitted_before_write";
 
 fn intent(name: &str, pane: &str, terminal: &str, key: &str) -> StartIntent {
     StartIntent {
@@ -524,4 +525,98 @@ fn kill_after_inbox_ack_before_resolve_leaves_obligation_open() {
     assert_eq!(second["error"]["class"], "conflict");
     recovered.kill().expect("stop recovered kelpied");
     recovered.wait().expect("reap recovered kelpied");
+}
+
+fn spawn_unwritten_owing_prompt_herdr(socket: &Path) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).expect("bind unwritten owing Herdr");
+    thread::spawn(move || {
+        for (method, result) in [
+            (
+                "ping",
+                serde_json::json!({"type":"pong","version":"test","protocol":20}),
+            ),
+            (
+                "session.snapshot",
+                serde_json::json!({
+                    "type":"session_snapshot",
+                    "snapshot":{"protocol":20,"panes":[],"agents":authoritative_agents()}
+                }),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept startup");
+            respond(&mut stream, method, &result);
+        }
+        let (mut prompt, _) = listener.accept().expect("accept owing prompt");
+        let mut remainder = Vec::new();
+        prompt
+            .read_to_end(&mut remainder)
+            .expect("wait for daemon death");
+        assert!(
+            remainder.is_empty(),
+            "owing agent.prompt bytes crossed the fault point"
+        );
+    })
+}
+
+#[test]
+fn kill_after_waiter_retire_owing_submitted_settles_before_write() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (waiter, _owing, ask_message_id) = seed_open_ask(&database);
+    let fault_listener = UnixListener::bind(&fault_socket).expect("bind fault");
+    let first_herdr = spawn_unwritten_owing_prompt_herdr(&herdr_socket);
+    let mut first_daemon = spawn_kelpied(
+        &database,
+        &kelpie_socket,
+        &herdr_socket,
+        &fault_socket,
+        &format!("{DAEMON_BOUND},{OWING_SUBMITTED}"),
+    );
+    let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
+    bound.write_all(b"x").expect("release");
+    let client = {
+        let socket = kelpie_socket.clone();
+        let waiter = waiter.logical_agent_id.to_string();
+        thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket).expect("connect");
+            serde_json::to_writer(
+                &mut stream,
+                &serde_json::json!({
+                    "id": "kill-retire",
+                    "method": "waiter.retire",
+                    "params": {"logical_agent_id": waiter}
+                }),
+            )
+            .expect("write");
+            stream.write_all(b"\n").expect("nl");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("until death");
+        })
+    };
+    let submitted = accept_point(&fault_listener, OWING_SUBMITTED);
+    first_daemon.kill().expect("kill");
+    first_daemon.wait().expect("reap");
+    drop(submitted);
+    client.join().expect("client");
+    first_herdr.join().expect("herdr");
+    let (obligation_state, targeting_ended, delivery_outcome): (String, Option<i64>, String) =
+        Connection::open(&database)
+            .expect("db")
+            .query_row(
+                "SELECT ob.state, la.targeting_ended_at_ms, d.outcome
+                 FROM obligations ob
+                 JOIN logical_agents la ON la.id = ob.waiting_agent_id
+                 JOIN operations o ON o.intent_json LIKE '%\"audience\":\"owing\"%'
+                 JOIN deliveries d ON d.operation_id = o.id
+                 WHERE ob.ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("state");
+    assert_eq!(obligation_state, "cancelled");
+    assert!(targeting_ended.is_some());
+    assert_eq!(delivery_outcome, "submitted");
 }

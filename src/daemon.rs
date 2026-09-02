@@ -1306,13 +1306,22 @@ fn dispatch_waiter_register(params: Value, kelpie: &mut Kelpie) -> Result<Value,
 fn dispatch_waiter_retire(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<WaiterRetireParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-    kelpie
-        .store_mut()
-        .end_socket_waiter(params.logical_agent_id)
-        .map_err(SliceError::Store)?;
+    let ended = kelpie.retire_waiter(params.logical_agent_id)?;
     Ok(serde_json::json!({
         "logical_agent_id": params.logical_agent_id,
         "targeting_ended": true,
+        "cancelled_ask_ids": ended.cancelled_ask_ids,
+        "owing_notices": ended
+            .owing_notices
+            .iter()
+            .map(|notice| {
+                serde_json::json!({
+                    "ask_message_id": notice.ask_message_id,
+                    "message_id": notice.message_id,
+                    "owing_response": if notice.delivered { "delivered" } else { "recorded" },
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
