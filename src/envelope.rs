@@ -137,6 +137,27 @@ pub fn render_cancellation(
     ))
 }
 
+/// Render a Kelpie-authored cancellation of an ask this occupant was answering.
+///
+/// Distinct from the asker's notice: `owing=` names the occupant, there is no
+/// `reply-to`, and the body tells them to stop. It is never a new ask.
+///
+/// # Errors
+///
+/// Returns an error when any attribute is empty or unsafe unquoted.
+pub fn render_owing_cancellation(
+    owing: &str,
+    cancelled_ask: &str,
+    reason: &str,
+) -> Result<String, EnvelopeError> {
+    let owing = validated_attr("owing", owing)?;
+    let cancelled_ask = validated_attr("cancelled-ask", cancelled_ask)?;
+    Ok(format!(
+        "<kelpie-system cancellation owing={owing} cancelled-ask={cancelled_ask}>\nStop working on this ask. It was cancelled. Reason: {}\nNo reply is owed.\n</kelpie-system>",
+        escape_body(reason)
+    ))
+}
+
 /// Render the prepare phase of a renew as a disclosed ask.
 ///
 /// The resume prompt is quoted verbatim because the checkpoint's only reader is
@@ -296,6 +317,28 @@ mod tests {
                 "<kelpie-reminder waiting=coordinator reply-to={ask_id}>\nPending final reply. Reply with: kelpie reply {ask_id} --final --file PATH\n\nThe question you owe an answer to:\nWhat changed in the API?\n</kelpie-reminder>"
             )
         );
+    }
+
+    #[test]
+    fn owing_cancellation_has_no_reply_to_and_escapes_body() {
+        let rendered = render_owing_cancellation(
+            "worker-x",
+            "0193abcdef-0123-7890-abcd-ef0123456789",
+            "replaced <please stop>",
+        )
+        .expect("owing cancellation");
+        assert!(
+            rendered.starts_with("<kelpie-system cancellation owing=worker-x"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("cancelled-ask=0193abcdef-0123-7890-abcd-ef0123456789"));
+        assert!(!rendered.contains("reply-to"), "{rendered}");
+        assert!(!rendered.contains("waiting="), "{rendered}");
+        assert!(
+            rendered.contains("&lt;please stop&gt;"),
+            "body must not forge envelope metadata: {rendered}"
+        );
+        assert!(rendered.contains("Stop working on this ask"), "{rendered}");
     }
 
     #[test]

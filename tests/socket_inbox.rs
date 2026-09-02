@@ -549,15 +549,18 @@ fn cancel_reaches_socket_inbox_and_is_not_resolved() {
             .expect("body")
             .contains("obsolete")
     );
-    let sender: Option<String> = Connection::open(&database)
+    let attributed: i64 = Connection::open(&database)
         .expect("db")
         .query_row(
-            "SELECT sender_agent_id FROM messages WHERE kind = 'cancellation'",
+            "SELECT COUNT(*) FROM messages WHERE kind = 'cancellation' AND sender_agent_id IS NOT NULL",
             [],
             |row| row.get(0),
         )
         .expect("sender");
-    assert_eq!(sender, None);
+    assert_eq!(
+        attributed, 0,
+        "cancellation notices are attributed to nobody"
+    );
     assert_eq!(
         Store::open(&database)
             .expect("open")
