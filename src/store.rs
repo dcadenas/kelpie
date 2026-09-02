@@ -3470,15 +3470,15 @@ impl Store {
     /// `ready` is already bound. `retiring`, `retired`, and `superseded` left
     /// the runtime on purpose. `lost` and `unknown` on this exact pane,
     /// terminal, and backend are the prior occupant that lazy create-new would
-    /// fork. `declared` of that same backend is retried so a failed name claim
-    /// does not wedge the pane. `starting` and `failed` on the same pane and
-    /// terminal fail closed.
+    /// fork. `declared` or `failed` of that same backend is retried so a
+    /// rejected name claim does not wedge the pane. `starting` on the same pane
+    /// and terminal fails closed.
     ///
     /// # Errors
     ///
     /// Returns a conflict when more than one logical agent still occupies the
     /// pane and terminal, or when the unique occupant is not a lost, unknown,
-    /// or declared incarnation of the live backend.
+    /// declared, or failed incarnation of the live backend.
     pub fn continuable_logical_agent_for_binding(
         &self,
         pane_id: &str,
@@ -3525,15 +3525,16 @@ impl Store {
             StoreError::InvalidRecord(format!("invalid logical agent id {}", ids[0]))
         })?;
         let matches_live = occupants.iter().any(|(_, state, backend)| {
-            matches!(state.as_str(), "lost" | "unknown" | "declared") && backend == backend_kind
+            matches!(state.as_str(), "lost" | "unknown" | "declared" | "failed")
+                && backend == backend_kind
         });
         if matches_live {
             Ok(Some(id))
         } else {
             Err(StoreError::Conflict(format!(
-                "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost, unknown, or \
-                 declared {backend_kind} incarnation; adopt --logical-id to continue it, or \
-                 adopt the live occupant as a new agent"
+                "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost, unknown, \
+                 declared, or failed {backend_kind} incarnation; adopt --logical-id to continue \
+                 it, or adopt the live occupant as a new agent"
             )))
         }
     }
@@ -10851,6 +10852,19 @@ mod tests {
             store
                 .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
                 .expect("declared retries"),
+            Some(pending.logical_agent_id)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'failed' WHERE id = ?1",
+                [pending.incarnation_id.to_string()],
+            )
+            .expect("fail");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("failed retries"),
             Some(pending.logical_agent_id)
         );
     }
