@@ -25,9 +25,12 @@ that same live name.
 
 Kelpie also performs targeted lazy adoption. A command that needs the calling
 pane's identity adopts that exact live occupant when no Ready binding exists.
-An alias-addressed tell or ask may adopt one unique unnamed live agent whose
-working-directory basename derives to that alias. Ambiguous matches fail
-closed. This does not scan or silently adopt the rest of the Herdr fleet.
+If that pane and terminal already record a unique continuable incarnation, the
+adoption continues that logical agent instead of minting a new one. Several
+continuable agents fail closed. An alias-addressed tell or ask may adopt one
+unique unnamed live agent whose working-directory basename derives to that
+alias. Ambiguous matches fail closed. This does not scan or silently adopt the
+rest of the Herdr fleet.
 
 ## Why not only Herdr plugin hooks
 

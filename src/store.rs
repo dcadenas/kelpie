@@ -3462,6 +3462,54 @@ impl Store {
         )
     }
 
+    /// Find the unique continuable logical agent for one pane and terminal.
+    ///
+    /// `ready` is already bound. `retiring`, `retired`, and `superseded` left
+    /// the runtime on purpose. Any other recorded binding on that exact pane
+    /// and terminal is a prior occupant that lazy create-new would fork.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when more than one logical agent is still continuable
+    /// on the binding.
+    pub fn continuable_logical_agent_for_binding(
+        &self,
+        pane_id: &str,
+        terminal_id: &str,
+    ) -> Result<Option<LogicalAgentId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT logical_agent_id
+             FROM incarnations
+             WHERE observed_pane_id = ?1
+               AND observed_terminal_id = ?2
+               AND state NOT IN ('ready', 'retiring', 'retired', 'superseded')
+             ORDER BY logical_agent_id ASC",
+        )?;
+        let rows =
+            statement.query_map(params![pane_id, terminal_id], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let value = row?;
+            let id = LogicalAgentId::parse(&value).ok_or_else(|| {
+                StoreError::InvalidRecord(format!("invalid logical agent id {value}"))
+            })?;
+            ids.push(id);
+        }
+        match ids.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(*id)),
+            _ => Err(StoreError::Conflict(format!(
+                "pane {pane_id} terminal {terminal_id} has {} continuable logical agents; \
+                 adopt --logical-id to continue one of {}",
+                ids.len(),
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
     /// Read a logical agent's current human-readable address.
     ///
     /// # Errors
@@ -10681,6 +10729,80 @@ mod tests {
                 .pending_obligations(replacement.logical_agent_id)
                 .expect("empty")
                 .is_empty()
+        );
+    }
+
+    fn mark_lost(store: &Store, incarnation_id: IncarnationId) {
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'lost' WHERE id = ?1",
+                [incarnation_id.to_string()],
+            )
+            .expect("lose");
+    }
+
+    #[test]
+    fn continuable_binding_returns_the_unique_lost_agent() {
+        let mut store = Store::in_memory().expect("store");
+        let first = store
+            .declare_adopt(&adopt_intent("cont-first"), &ready_evidence())
+            .expect("adopt");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
+                .expect("ready is not continuable"),
+            None
+        );
+        mark_lost(&store, first.incarnation_id);
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
+                .expect("lost"),
+            Some(first.logical_agent_id)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'retired' WHERE id = ?1",
+                [first.incarnation_id.to_string()],
+            )
+            .expect("retire");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
+                .expect("retired is not continuable"),
+            None
+        );
+    }
+
+    #[test]
+    fn continuable_binding_fails_closed_on_two_lost_agents() {
+        let mut store = Store::in_memory().expect("store");
+        let first = store
+            .declare_adopt(&adopt_intent("amb-first"), &ready_evidence())
+            .expect("first");
+        mark_lost(&store, first.incarnation_id);
+        let second = store
+            .declare_adopt(&adopt_intent("amb-second"), &ready_evidence())
+            .expect("second");
+        mark_lost(&store, second.incarnation_id);
+        let error = store
+            .continuable_logical_agent_for_binding("w1:p9", "term-live")
+            .expect_err("ambiguous");
+        let message = error.to_string();
+        assert!(
+            message.contains("2 continuable logical agents"),
+            "{message}"
+        );
+        assert!(message.contains("adopt --logical-id"), "{message}");
+        assert!(
+            message.contains(&first.logical_agent_id.to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.logical_agent_id.to_string()),
+            "{message}"
         );
     }
 

@@ -2266,9 +2266,13 @@ impl Kelpie {
 
     /// Resolve the caller pane, adopting its exact live occupant when needed.
     ///
+    /// A unique prior incarnation on that pane and terminal is continued
+    /// rather than forked into a new logical agent.
+    ///
     /// # Errors
     ///
-    /// Returns a conflict when the pane has no unique adoptable live agent.
+    /// Returns a conflict when the pane has no unique adoptable live agent,
+    /// or when more than one logical agent is still continuable there.
     pub fn resolve_or_adopt_pane(
         &mut self,
         pane_id: &str,
@@ -2290,11 +2294,14 @@ impl Kelpie {
                 matches.len()
             )));
         };
+        let continuable = self
+            .store
+            .continuable_logical_agent_for_binding(pane_id, &agent.terminal_id)?;
         let intent = AdoptIntent {
             pane_id: pane_id.to_string(),
             expected_terminal_id: agent.terminal_id.clone(),
             public_name: None,
-            logical_agent_id: None,
+            logical_agent_id: continuable,
             parent: crate::domain::Parent::Parentless,
             herdr_session: "default".into(),
             backend_kind: None,
@@ -4047,6 +4054,180 @@ mod tests {
                 .ready_identity_for_pane("w1:p2")
                 .expect("binding"),
             identity
+        );
+        server.join().expect("server");
+    }
+
+    fn foobar_pane_snapshot() -> Value {
+        serde_json::json!({
+            "type":"session_snapshot",
+            "snapshot":{
+                "protocol":20,
+                "panes":[{"pane_id":"w1:p2","terminal_id":"term-2","cwd":"/tmp/other"}],
+                "agents":[{
+                    "terminal_id":"term-2","pane_id":"w1:p2","name":"foobar",
+                    "agent":"opencode","interactive_ready":false,"launch_pending":false
+                }]
+            }
+        })
+    }
+
+    fn foobar_pane_adopt_intent(key: &str) -> AdoptIntent {
+        AdoptIntent {
+            pane_id: "w1:p2".into(),
+            expected_terminal_id: "term-2".into(),
+            public_name: Some("foobar".into()),
+            logical_agent_id: None,
+            parent: Parent::Parentless,
+            herdr_session: "default".into(),
+            backend_kind: Some("opencode".into()),
+            backend_args: Vec::new(),
+            requested_model: None,
+            requested_provider: None,
+            requested_effort: None,
+            idempotency_key: key.into(),
+        }
+    }
+
+    fn foobar_pane_evidence() -> crate::store::AdoptEvidence {
+        crate::store::AdoptEvidence {
+            pane_id: "w1:p2".into(),
+            terminal_id: "term-2".into(),
+            public_name: "foobar".into(),
+            backend_kind: "opencode".into(),
+            working_directory: "/tmp/other".into(),
+            interactive_ready: false,
+            launch_pending: false,
+            native_agent_session: None,
+        }
+    }
+
+    fn serve_lazy_pane_adopt(listener: UnixListener, snapshot: Value) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                ("session.snapshot", snapshot.clone()),
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                ("session.snapshot", snapshot),
+            ];
+            serve_exchanges(&listener, exchanges.into());
+        })
+    }
+
+    #[test]
+    fn lost_pane_binding_continues_the_prior_logical_agent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = serve_lazy_pane_adopt(listener, foobar_pane_snapshot());
+        let mut store = Store::in_memory().expect("store");
+        let prior = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("prior-pane"),
+                &foobar_pane_evidence(),
+            )
+            .expect("prior");
+        let waiting = store.declare_start(&e2e_intent()).expect("waiting");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                prior.logical_agent_id,
+                prior.incarnation_id,
+                "owed",
+                "lazy-continue-ask",
+            )
+            .expect("ask");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose binding");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+
+        let identity = kelpie
+            .resolve_or_adopt_pane("w1:p2", "lazy-continue")
+            .expect("continue");
+        assert_eq!(identity.logical_agent_id, prior.logical_agent_id);
+        assert_ne!(identity.incarnation_id, prior.incarnation_id);
+        assert_eq!(identity.public_name, "foobar");
+        assert_eq!(
+            kelpie
+                .store()
+                .pending_obligations(prior.logical_agent_id)
+                .expect("pending")[0]
+                .ask_message_id,
+            ask.message_id
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn lost_pane_binding_with_ambiguous_priors_fails_closed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = thread::spawn(move || {
+            serve_exchanges(
+                &listener,
+                vec![
+                    (
+                        "ping",
+                        serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                    ),
+                    ("session.snapshot", foobar_pane_snapshot()),
+                ],
+            );
+        });
+        let mut store = Store::in_memory().expect("store");
+        let first = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("prior-a"),
+                &foobar_pane_evidence(),
+            )
+            .expect("first");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose first");
+        let second = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("prior-b"),
+                &foobar_pane_evidence(),
+            )
+            .expect("second");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose second");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+
+        let error = kelpie
+            .resolve_or_adopt_pane("w1:p2", "lazy-ambiguous")
+            .expect_err("ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("continuable logical agents"), "{message}");
+        assert!(message.contains("adopt --logical-id"), "{message}");
+        assert!(
+            message.contains(&first.logical_agent_id.to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.logical_agent_id.to_string()),
+            "{message}"
         );
         server.join().expect("server");
     }

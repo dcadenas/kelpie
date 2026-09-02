@@ -756,7 +756,14 @@ auto-adoption is out of scope.
 
 Kelpie MAY perform targeted lazy adoption when a command needs an unbound
 calling pane or addresses a missing alias. Caller adoption MUST select the
-exact pane and observed terminal. Recipient adoption MUST require exactly one
+exact pane and observed terminal. When that exact pane and terminal already
+record a unique continuable incarnation (any state other than `ready`,
+`retiring`, `retired`, or `superseded`), lazy caller adoption MUST continue
+that logical agent. When more than one such logical agent exists, it MUST fail
+closed and name those ids so the caller can pass an explicit `logical_agent_id`.
+When none exist, it MAY create a new logical agent. Lazy caller adoption MUST
+NOT mint a new logical agent while a continuable prior incarnation occupies
+that exact pane and terminal. Recipient adoption MUST require exactly one
 unnamed, non-launch-pending live agent whose working-directory basename derives
 to the requested alias. Ambiguous or absent matches MUST fail closed. Targeted
 lazy adoption MUST use the normal durable adoption contract below and MUST NOT
@@ -1030,6 +1037,7 @@ Herdr prompt proofs above.
 | Clear completion is observed, not assumed | Hold the backend-native session reference unchanged and verify the resume prompt is never submitted. |
 | An unproven clear is not retried | Leave a clear `unknown` with no rotation observed, request another, and verify it is refused with `clear_unproven` and no command is submitted. |
 | A dead binding does not hold its alias | Close the pane of a Ready incarnation, adopt the same public name on a new pane, and verify the adoption succeeds, the prior incarnation is `lost`, and a notice records the release. |
+| Lazy caller adoption does not fork a pane | Lose the Ready binding on a pane that still hosts the same live agent, run a caller command from that pane, and verify the same logical agent is continued with its obligations attached. |
 | A renew cannot swallow a message | Deliver a tell while a renew is awaiting or performing its clear; verify it stays queued and arrives after the resume prompt. |
 | A renew policy dies with its incarnation | Remove the incarnation's Ready binding and verify the policy terminates instead of re-arming. |
 | A policy never dies quietly | Remove the incarnation's Ready binding and verify one operator notice names the agent, the incarnation, the renew, and the reason, and that `report` stops showing that agent as armed. |
