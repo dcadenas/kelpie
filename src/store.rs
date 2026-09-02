@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// Host wall clock used for due comparison, in Unix epoch milliseconds.
 ///
@@ -135,10 +135,20 @@ pub struct CreatedTell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedReply {
     pub message_id: MessageId,
-    pub operation_id: OperationId,
-    /// Exact Ready incarnation of the waiting logical agent selected at send time.
-    pub recipient_incarnation: IncarnationId,
+    /// Present for `herdr_prompt` waiters. Socket-inbox replies have no operation.
+    pub operation_id: Option<OperationId>,
+    /// Exact Ready incarnation of a `herdr_prompt` waiter selected at send time.
+    pub recipient_incarnation: Option<IncarnationId>,
     pub disposition: ReplyDisposition,
+}
+
+/// Receive path bound when recording a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyReceivePath {
+    /// Unique Ready incarnation, then Herdr prompt.
+    HerdrPrompt(IncarnationId),
+    /// Waiting agent's socket inbox, with no Herdr prompt.
+    SocketInbox,
 }
 
 /// IDs atomically created for a cancellation and its response message.
@@ -1917,6 +1927,7 @@ impl Store {
                         AND outcome = 'queued'",
                     params![now, message_id.to_string(), recipient_agent_id.to_string()],
                 )?;
+                resolve_socket_inbox_final_reply(&tx, message_id, now)?;
                 tx.commit()?;
                 Ok(DeliveryOutcome::Accepted)
             }
@@ -2261,16 +2272,18 @@ impl Store {
     /// Persist a correlated progress or final reply and its delivery intent.
     ///
     /// The ask message ID alone resolves the exact owing sender and waiting
-    /// recipient from the durable obligation. The unique Ready incarnation of
-    /// the waiting agent is bound at this moment. Progress sets the obligation
-    /// to `in_progress` immediately. Final resolution waits for accepted
-    /// delivery so a rejected or unknown Herdr prompt cannot claim the waiter
-    /// received the final answer.
+    /// recipient from the durable obligation. Send intent binds the waiter's
+    /// receive path: a `herdr_prompt` waiter to its unique Ready incarnation,
+    /// a `socket_inbox` waiter to that inbox with no Herdr prompt. Progress
+    /// sets the obligation to `in_progress` immediately. Final resolution
+    /// waits for accepted delivery: Herdr prompt acceptance, or socket ACK.
+    /// Persist is not acceptance.
     ///
     /// # Errors
     ///
-    /// Returns a conflict for an unknown or terminal `reply_to`, missing or
-    /// ambiguous Ready waiting incarnation, or a reused idempotency key.
+    /// Returns a conflict for an unknown or terminal `reply_to`, a missing or
+    /// ambiguous Ready waiting incarnation, an ended socket waiter, or a
+    /// reused idempotency key.
     pub fn create_reply(
         &mut self,
         reply_to: MessageId,
@@ -2333,7 +2346,12 @@ impl Store {
                 "requester does not own the obligation".into(),
             ));
         }
-        let recipient_incarnation = ready_incarnation_for_agent(&tx, waiting_agent)?;
+        let waiting_identity = waiter_identity(&tx, waiting_agent)?;
+        if waiting_identity.ended {
+            return Err(StoreError::Conflict(format!(
+                "socket waiter {waiting_agent} is no longer a delivery target"
+            )));
+        }
         tx.execute(
             "INSERT INTO messages
              (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
@@ -2349,6 +2367,27 @@ impl Store {
                 disposition_name(disposition),
             ],
         )?;
+        match waiting_identity.transport {
+            DeliveryTransport::SocketInbox => {
+                queue_socket_inbox_delivery(&tx, message_id, waiting_agent, now)?;
+                tx.execute(
+                    "INSERT INTO socket_inbox_keys (idempotency_key, message_id)
+                     VALUES (?1, ?2)",
+                    params![idempotency_key, message_id.to_string()],
+                )
+                .map_err(map_constraint)?;
+                apply_reply_obligation_activity(&tx, reply_to, disposition, now)?;
+                tx.commit()?;
+                return Ok(CreatedReply {
+                    message_id,
+                    operation_id: None,
+                    recipient_incarnation: None,
+                    disposition,
+                });
+            }
+            DeliveryTransport::HerdrPrompt => {}
+        }
+        let recipient_incarnation = ready_incarnation_for_agent(&tx, waiting_agent)?;
         let intent = serde_json::json!({
             "message_id": message_id,
             "reply_to": reply_to,
@@ -2385,44 +2424,27 @@ impl Store {
                 operation_id.to_string()
             ],
         )?;
-        match disposition {
-            ReplyDisposition::Progress => {
-                tx.execute(
-                    "UPDATE obligations SET state = 'in_progress', last_activity_at_ms = ?1
-                     WHERE ask_message_id = ?2",
-                    params![now, reply_to.to_string()],
-                )?;
-                refresh_reminder_activity(&tx, reply_to, now)?;
-            }
-            ReplyDisposition::Final => {
-                // Activity only; resolve on accepted delivery.
-                tx.execute(
-                    "UPDATE obligations SET last_activity_at_ms = ?1
-                     WHERE ask_message_id = ?2 AND state IN ('open', 'in_progress')",
-                    params![now, reply_to.to_string()],
-                )?;
-                refresh_reminder_activity(&tx, reply_to, now)?;
-            }
-        }
+        apply_reply_obligation_activity(&tx, reply_to, disposition, now)?;
         tx.commit()?;
         Ok(CreatedReply {
             message_id,
-            operation_id,
-            recipient_incarnation,
+            operation_id: Some(operation_id),
+            recipient_incarnation: Some(recipient_incarnation),
             disposition,
         })
     }
 
-    /// Resolve the exact Ready recipient incarnation for an open reply obligation.
+    /// Bind the waiter's receive path for an open reply obligation.
     ///
     /// # Errors
     ///
-    /// Returns a conflict unless the obligation is open and its waiter is uniquely Ready.
-    pub fn reply_recipient_incarnation(
+    /// Returns a conflict unless the obligation is open, the requester owes it,
+    /// and the waiter is either uniquely Ready or an active socket waiter.
+    pub fn reply_receive_path(
         &self,
         reply_to: MessageId,
         requester_agent_id: LogicalAgentId,
-    ) -> Result<IncarnationId, StoreError> {
+    ) -> Result<ReplyReceivePath, StoreError> {
         let parties: Option<(String, String)> = self
             .connection
             .query_row(
@@ -2451,7 +2473,19 @@ impl Store {
             )));
         }
         let waiting = parse_logical_agent_id(&waiting)?;
-        ready_incarnation_for_agent(&self.connection, waiting)
+        let identity = waiter_identity(&self.connection, waiting)?;
+        if identity.ended {
+            return Err(StoreError::Conflict(format!(
+                "socket waiter {waiting} is no longer a delivery target"
+            )));
+        }
+        match identity.transport {
+            DeliveryTransport::SocketInbox => Ok(ReplyReceivePath::SocketInbox),
+            DeliveryTransport::HerdrPrompt => {
+                ready_incarnation_for_agent(&self.connection, waiting)
+                    .map(ReplyReceivePath::HerdrPrompt)
+            }
+        }
     }
 
     /// Return the correlation and disposition needed to render a queued reply.
@@ -3138,6 +3172,23 @@ impl Store {
         parse_delivery_outcome(&value)
     }
 
+    /// Read the durable delivery outcome for one message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delivery is absent or malformed.
+    pub fn delivery_outcome_for_message(
+        &self,
+        message_id: MessageId,
+    ) -> Result<DeliveryOutcome, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT outcome FROM deliveries WHERE message_id = ?1",
+            [message_id.to_string()],
+            |row| row.get(0),
+        )?;
+        parse_delivery_outcome(&value)
+    }
+
     /// Persist an operator notice before any best-effort display attempt.
     ///
     /// # Errors
@@ -3605,11 +3656,12 @@ impl Store {
     /// cancellation response.
     ///
     /// The obligation settles `cancelled` in the same transaction that records
-    /// the durable delivery intent, before any Herdr write. When the asker has
-    /// a Ready incarnation the response is prepared for delivery; without one
-    /// the response stays recorded on its message row for revival surfacing.
-    /// The response is authored by Kelpie — a `cancellation` message with no
-    /// sender — and is never attributed to the responder.
+    /// the durable delivery intent, before any Herdr write. A `herdr_prompt`
+    /// asker with a Ready incarnation is prepared for prompt delivery; a
+    /// `socket_inbox` asker is queued on that inbox. Without a live receive
+    /// path the response stays recorded on its message row for revival
+    /// surfacing. The response is authored by Kelpie — a `cancellation`
+    /// message with no sender — and is never attributed to the responder.
     ///
     /// # Errors
     ///
@@ -3681,70 +3733,85 @@ impl Store {
                 "obligation changed before cancellation committed".into(),
             ));
         }
-        // A Ready asker gets the response delivered; an absent one gets it
-        // recorded. More than one Ready incarnation cannot happen by
-        // construction, so only the empty match means attached.
-        let mut statement = tx.prepare(
-            "SELECT id FROM incarnations
-             WHERE logical_agent_id = ?1 AND state = 'ready'
-             ORDER BY created_at_ms ASC",
-        )?;
-        let rows = statement.query_map([&waiting], |row| row.get::<_, String>(0))?;
-        let mut ready = Vec::new();
-        for row in rows {
-            ready.push(row?);
-        }
-        drop(statement);
-        let delivery = match ready.as_slice() {
-            [incarnation] => {
-                let recipient_incarnation = IncarnationId::parse(incarnation).ok_or_else(|| {
-                    StoreError::InvalidRecord(format!("invalid incarnation id {incarnation}"))
-                })?;
-                let operation_id = OperationId::new();
-                let intent = serde_json::json!({
-                    "message_id": message_id,
-                    "cancelled_ask": ask_message_id,
-                    "reason": reason,
-                    "recipient_incarnation_id": recipient_incarnation
-                });
-                tx.execute(
-                    "INSERT INTO operations
-                     (id, idempotency_key, kind, target_incarnation_id, intent_json,
-                      created_at_ms, outcome)
-                     VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
-                    params![
-                        operation_id.to_string(),
-                        format!("kelpie:cancellation:{ask_message_id}"),
-                        recipient_incarnation.to_string(),
-                        intent.to_string(),
-                        now
-                    ],
-                )
-                .map_err(map_constraint)?;
-                tx.execute(
-                    "INSERT INTO deliveries
-                     (message_id, recipient_incarnation_id, attempt_number,
-                      scheduled_at_ms, outcome, operation_id)
-                     VALUES (?1, ?2, 1, ?3, ?4, ?5)",
-                    params![
-                        message_id.to_string(),
-                        recipient_incarnation.to_string(),
-                        due_at_ms.unwrap_or(now),
-                        if due_at_ms.is_some() {
-                            "queued"
-                        } else {
-                            "pending"
-                        },
-                        operation_id.to_string()
-                    ],
-                )?;
-                Some((operation_id, recipient_incarnation))
+        let waiting_agent = parse_logical_agent_id(&waiting)?;
+        let identity = waiter_identity(&tx, waiting_agent)?;
+        let delivery = match identity.transport {
+            DeliveryTransport::SocketInbox => {
+                if !identity.ended {
+                    queue_socket_inbox_delivery(&tx, message_id, waiting_agent, now)?;
+                }
+                None
             }
-            [] => None,
-            [_, _, ..] => {
-                return Err(StoreError::Conflict(
-                    "ambiguous ready incarnation for waiting agent".into(),
-                ));
+            DeliveryTransport::HerdrPrompt => {
+                // A Ready asker gets the response delivered; an absent one gets it
+                // recorded. More than one Ready incarnation cannot happen by
+                // construction, so only the empty match means attached.
+                let mut statement = tx.prepare(
+                    "SELECT id FROM incarnations
+                     WHERE logical_agent_id = ?1 AND state = 'ready'
+                     ORDER BY created_at_ms ASC",
+                )?;
+                let rows = statement.query_map([&waiting], |row| row.get::<_, String>(0))?;
+                let mut ready = Vec::new();
+                for row in rows {
+                    ready.push(row?);
+                }
+                drop(statement);
+                match ready.as_slice() {
+                    [incarnation] => {
+                        let recipient_incarnation =
+                            IncarnationId::parse(incarnation).ok_or_else(|| {
+                                StoreError::InvalidRecord(format!(
+                                    "invalid incarnation id {incarnation}"
+                                ))
+                            })?;
+                        let operation_id = OperationId::new();
+                        let intent = serde_json::json!({
+                            "message_id": message_id,
+                            "cancelled_ask": ask_message_id,
+                            "reason": reason,
+                            "recipient_incarnation_id": recipient_incarnation
+                        });
+                        tx.execute(
+                            "INSERT INTO operations
+                             (id, idempotency_key, kind, target_incarnation_id, intent_json,
+                              created_at_ms, outcome)
+                             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+                            params![
+                                operation_id.to_string(),
+                                format!("kelpie:cancellation:{ask_message_id}"),
+                                recipient_incarnation.to_string(),
+                                intent.to_string(),
+                                now
+                            ],
+                        )
+                        .map_err(map_constraint)?;
+                        tx.execute(
+                            "INSERT INTO deliveries
+                             (message_id, recipient_incarnation_id, attempt_number,
+                              scheduled_at_ms, outcome, operation_id)
+                             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+                            params![
+                                message_id.to_string(),
+                                recipient_incarnation.to_string(),
+                                due_at_ms.unwrap_or(now),
+                                if due_at_ms.is_some() {
+                                    "queued"
+                                } else {
+                                    "pending"
+                                },
+                                operation_id.to_string()
+                            ],
+                        )?;
+                        Some((operation_id, recipient_incarnation))
+                    }
+                    [] => None,
+                    [_, _, ..] => {
+                        return Err(StoreError::Conflict(
+                            "ambiguous ready incarnation for waiting agent".into(),
+                        ));
+                    }
+                }
             }
         };
         tx.commit()?;
@@ -6744,6 +6811,7 @@ fn ensure_outside_repository(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {
@@ -6836,6 +6904,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 19 {
         connection.execute_batch(include_str!("../migrations/020_socket_waiter.sql"))?;
         version = 20;
+    }
+    if version == 20 {
+        connection.execute_batch(include_str!("../migrations/021_socket_inbox_keys.sql"))?;
+        version = 21;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
@@ -7162,10 +7234,10 @@ struct WaiterIdentity {
 }
 
 fn waiter_identity(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     logical_agent_id: LogicalAgentId,
 ) -> Result<WaiterIdentity, StoreError> {
-    let row: Option<(String, Option<i64>)> = tx
+    let row: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT delivery_transport, targeting_ended_at_ms
              FROM logical_agents WHERE id = ?1",
@@ -7183,6 +7255,74 @@ fn waiter_identity(
         ended: matches!(transport, DeliveryTransport::SocketInbox) && ended_at.is_some(),
         transport,
     })
+}
+
+fn queue_socket_inbox_delivery(
+    tx: &Transaction<'_>,
+    message_id: MessageId,
+    recipient_agent_id: LogicalAgentId,
+    now: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO deliveries
+         (message_id, delivery_transport, recipient_incarnation_id, recipient_agent_id,
+          attempt_number, scheduled_at_ms, outcome)
+         VALUES (?1, 'socket_inbox', NULL, ?2, 1, ?3, 'queued')",
+        params![message_id.to_string(), recipient_agent_id.to_string(), now],
+    )?;
+    Ok(())
+}
+
+fn apply_reply_obligation_activity(
+    tx: &Transaction<'_>,
+    reply_to: MessageId,
+    disposition: ReplyDisposition,
+    now: i64,
+) -> Result<(), StoreError> {
+    match disposition {
+        ReplyDisposition::Progress => {
+            tx.execute(
+                "UPDATE obligations SET state = 'in_progress', last_activity_at_ms = ?1
+                 WHERE ask_message_id = ?2",
+                params![now, reply_to.to_string()],
+            )?;
+            refresh_reminder_activity(tx, reply_to, now)?;
+        }
+        ReplyDisposition::Final => {
+            tx.execute(
+                "UPDATE obligations SET last_activity_at_ms = ?1
+                 WHERE ask_message_id = ?2 AND state IN ('open', 'in_progress')",
+                params![now, reply_to.to_string()],
+            )?;
+            refresh_reminder_activity(tx, reply_to, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_socket_inbox_final_reply(
+    tx: &Transaction<'_>,
+    message_id: MessageId,
+    now: i64,
+) -> Result<(), StoreError> {
+    let final_reply: Option<(String, String)> = tx
+        .query_row(
+            "SELECT reply_to_message_id, id FROM messages
+             WHERE id = ?1 AND kind = 'reply' AND disposition = 'final'",
+            [message_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((ask_message_id, resolving_message_id)) = final_reply else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE obligations SET state = 'resolved', last_activity_at_ms = ?1,
+         resolving_message_id = ?2
+         WHERE ask_message_id = ?3 AND state IN ('open', 'in_progress')",
+        params![now, resolving_message_id, ask_message_id],
+    )?;
+    Ok(())
 }
 
 struct DeliverySchedule {
@@ -7926,20 +8066,24 @@ mod tests {
         let created = store
             .create_reply(reply_to, requester, body, disposition, key)
             .expect("create reply");
+        let operation_id = created.operation_id.expect("pane reply operation");
+        let recipient_incarnation = created
+            .recipient_incarnation
+            .expect("pane reply incarnation");
         store
             .begin_attempt(
-                created.operation_id,
-                created.recipient_incarnation,
+                operation_id,
+                recipient_incarnation,
                 &format!("reply-request-{key}"),
             )
             .expect("reply attempt");
         store
-            .mark_submitted(created.operation_id, 1, &format!("reply-request-{key}"))
+            .mark_submitted(operation_id, 1, &format!("reply-request-{key}"))
             .expect("reply submitted");
         store
             .accept_delivery(
-                created.operation_id,
-                created.recipient_incarnation,
+                operation_id,
+                recipient_incarnation,
                 "w1:p1",
                 waiting_terminal,
             )
@@ -8391,7 +8535,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .delivery_outcome(progress.operation_id)
+                .delivery_outcome(progress.operation_id.expect("pane reply operation"))
                 .expect("progress delivery"),
             DeliveryOutcome::Accepted
         );
@@ -8411,23 +8555,18 @@ mod tests {
                 .expect("still open path"),
             ObligationState::InProgress
         );
+        let pending_operation = pending_final.operation_id.expect("pane reply operation");
+        let pending_incarnation = pending_final
+            .recipient_incarnation
+            .expect("pane reply incarnation");
         store
-            .begin_attempt(
-                pending_final.operation_id,
-                pending_final.recipient_incarnation,
-                "final-request",
-            )
+            .begin_attempt(pending_operation, pending_incarnation, "final-request")
             .expect("final attempt");
         store
-            .mark_submitted(pending_final.operation_id, 1, "final-request")
+            .mark_submitted(pending_operation, 1, "final-request")
             .expect("final submitted");
         store
-            .accept_delivery(
-                pending_final.operation_id,
-                pending_final.recipient_incarnation,
-                "w1:p1",
-                "term-a",
-            )
+            .accept_delivery(pending_operation, pending_incarnation, "w1:p1", "term-a")
             .expect("final accepted");
         let (reply_sender, reply_recipient) = store
             .message_parties(pending_final.message_id)
@@ -10190,20 +10329,20 @@ mod tests {
                 "final-reject",
             )
             .expect("create final");
+        let rejected_operation = rejected.operation_id.expect("pane reply operation");
+        let rejected_incarnation = rejected
+            .recipient_incarnation
+            .expect("pane reply incarnation");
         store
-            .begin_attempt(
-                rejected.operation_id,
-                rejected.recipient_incarnation,
-                "final-reject-req",
-            )
+            .begin_attempt(rejected_operation, rejected_incarnation, "final-reject-req")
             .expect("attempt");
         store
-            .mark_submitted(rejected.operation_id, 1, "final-reject-req")
+            .mark_submitted(rejected_operation, 1, "final-reject-req")
             .expect("submitted");
         store
             .mark_rejected(
-                rejected.operation_id,
-                rejected.recipient_incarnation,
+                rejected_operation,
+                rejected_incarnation,
                 "target missing",
                 DeliveryOutcome::TargetUnavailable,
             )
@@ -10214,7 +10353,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .delivery_outcome(rejected.operation_id)
+                .delivery_outcome(rejected_operation)
                 .expect("delivery"),
             DeliveryOutcome::TargetUnavailable
         );
@@ -10228,22 +10367,18 @@ mod tests {
                 "final-unknown",
             )
             .expect("second final");
+        let unknown_operation = unknown.operation_id.expect("pane reply operation");
+        let unknown_incarnation = unknown
+            .recipient_incarnation
+            .expect("pane reply incarnation");
         store
-            .begin_attempt(
-                unknown.operation_id,
-                unknown.recipient_incarnation,
-                "final-unknown-req",
-            )
+            .begin_attempt(unknown_operation, unknown_incarnation, "final-unknown-req")
             .expect("attempt");
         store
-            .mark_submitted(unknown.operation_id, 1, "final-unknown-req")
+            .mark_submitted(unknown_operation, 1, "final-unknown-req")
             .expect("submitted");
         store
-            .mark_unknown(
-                unknown.operation_id,
-                unknown.recipient_incarnation,
-                "disconnect",
-            )
+            .mark_unknown(unknown_operation, unknown_incarnation, "disconnect")
             .expect("unknown");
         assert_eq!(
             store.obligation_state(ask.message_id).expect("still open"),
@@ -10251,7 +10386,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .delivery_outcome(unknown.operation_id)
+                .delivery_outcome(unknown_operation)
                 .expect("unknown delivery"),
             DeliveryOutcome::Unknown
         );
@@ -10260,7 +10395,7 @@ mod tests {
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM operation_attempts WHERE operation_id = ?1",
-                [unknown.operation_id.to_string()],
+                [unknown_operation.to_string()],
                 |row| row.get(0),
             )
             .expect("attempt count");
@@ -11913,5 +12048,163 @@ mod tests {
                 .to_string()
                 .contains("not an active socket waiter")
         );
+    }
+
+    #[test]
+    fn socket_inbox_final_resolves_only_on_ack() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "ack-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "ack-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "ack-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let progress = store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "working",
+                ReplyDisposition::Progress,
+                "ack-progress",
+            )
+            .expect("progress");
+        assert!(progress.operation_id.is_none());
+        assert!(progress.recipient_incarnation.is_none());
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("progress"),
+            ObligationState::InProgress
+        );
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(progress.message_id)
+                .expect("queued"),
+            DeliveryOutcome::Queued
+        );
+        let herdr: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries
+                 WHERE message_id = ?1 AND delivery_transport = 'herdr_prompt'",
+                [progress.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("herdr");
+        assert_eq!(herdr, 0);
+        store
+            .ack_socket_inbox_delivery(waiter.logical_agent_id, progress.message_id)
+            .expect("ack progress");
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("still open"),
+            ObligationState::InProgress
+        );
+
+        let final_reply = store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "ack-final",
+            )
+            .expect("final");
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("persist"),
+            ObligationState::InProgress
+        );
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(final_reply.message_id)
+                .expect("queued final"),
+            DeliveryOutcome::Queued
+        );
+        store
+            .ack_socket_inbox_delivery(waiter.logical_agent_id, final_reply.message_id)
+            .expect("ack final");
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("resolved"),
+            ObligationState::Resolved
+        );
+        assert_eq!(
+            store
+                .ack_socket_inbox_delivery(waiter.logical_agent_id, final_reply.message_id)
+                .expect("idempotent"),
+            DeliveryOutcome::Accepted
+        );
+        let second = store.create_reply(
+            ask.message_id,
+            owing.logical_agent_id,
+            "again",
+            ReplyDisposition::Final,
+            "ack-second",
+        );
+        assert!(matches!(second, Err(StoreError::Conflict(_))));
+    }
+
+    #[test]
+    fn socket_inbox_cancel_queues_cancellation_not_resolved() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "cancel-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "cancel-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "cancel-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let created = store
+            .cancel_with_response(
+                waiter.logical_agent_id,
+                ask.message_id,
+                "obsolete",
+                "Your ask was cancelled. Reason: obsolete.",
+                None,
+            )
+            .expect("cancel");
+        assert!(created.delivery.is_none());
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("state"),
+            ObligationState::Cancelled
+        );
+        let (kind, sender): (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT kind, sender_agent_id FROM messages WHERE id = ?1",
+                [created.message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("message");
+        assert_eq!(kind, "cancellation");
+        assert_eq!(sender, None);
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("inbox");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, created.message_id);
+        assert_eq!(queued[0].kind, MessageKind::Cancellation);
+        assert_eq!(queued[0].body, "Your ask was cancelled. Reason: obsolete.");
     }
 }

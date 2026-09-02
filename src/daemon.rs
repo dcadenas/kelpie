@@ -1562,10 +1562,16 @@ fn dispatch_reply(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceErro
         params.disposition,
         &params.idempotency_key,
     )?;
-    let delivery_outcome = kelpie
-        .store_mut()
-        .delivery_outcome(created.operation_id)
-        .map_err(SliceError::Store)?;
+    let delivery_outcome = match created.operation_id {
+        Some(operation_id) => kelpie
+            .store_mut()
+            .delivery_outcome(operation_id)
+            .map_err(SliceError::Store)?,
+        None => kelpie
+            .store_mut()
+            .delivery_outcome_for_message(created.message_id)
+            .map_err(SliceError::Store)?,
+    };
     let obligation_state = kelpie
         .store_mut()
         .obligation_state(params.reply_to)
@@ -2264,23 +2270,18 @@ mod tests {
                 "socket-resolve",
             )
             .expect("create final");
+        let operation_id = created.operation_id.expect("pane reply operation");
+        let recipient_incarnation = created
+            .recipient_incarnation
+            .expect("pane reply incarnation");
         store
-            .begin_attempt(
-                created.operation_id,
-                created.recipient_incarnation,
-                "socket-resolve-req",
-            )
+            .begin_attempt(operation_id, recipient_incarnation, "socket-resolve-req")
             .expect("attempt");
         store
-            .mark_submitted(created.operation_id, 1, "socket-resolve-req")
+            .mark_submitted(operation_id, 1, "socket-resolve-req")
             .expect("submitted");
         store
-            .accept_delivery(
-                created.operation_id,
-                created.recipient_incarnation,
-                "w1:p1",
-                "term-a",
-            )
+            .accept_delivery(operation_id, recipient_incarnation, "w1:p1", "term-a")
             .expect("resolve");
         let kelpie = Kelpie::new(
             store,
@@ -2972,5 +2973,155 @@ mod tests {
         let ack = read_json(&mut reader);
         assert_eq!(ack["id"], "ack-half");
         assert_eq!(ack["result"]["outcome"], "accepted");
+    }
+
+    fn seed_socket_ask(store: &mut Store) -> (LogicalAgentId, LogicalAgentId, MessageId) {
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "reply-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&test_intent("owing", "term-b", "reply-owing"))
+            .expect("owing");
+        let ask = store
+            .create_ask(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "socket-reply-ask",
+            )
+            .expect("ask");
+        (
+            waiter.logical_agent_id,
+            owing.logical_agent_id,
+            ask.message_id,
+        )
+    }
+
+    #[test]
+    fn socket_reply_final_resolves_only_after_inbox_ack() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, owing, ask) = seed_socket_ask(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let replied = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "reply-1",
+                "method": "reply",
+                "params": {
+                    "reply_to": ask,
+                    "requester_agent_id": owing,
+                    "body": "done",
+                    "disposition": "final",
+                    "idempotency_key": "socket-final",
+                }
+            }),
+        );
+        assert!(replied["error"].is_null(), "{replied}");
+        assert_eq!(replied["result"]["delivery_outcome"], "queued");
+        assert_eq!(replied["result"]["obligation_state"], "open");
+        assert!(replied["result"]["recipient_incarnation"].is_null());
+        assert!(replied["result"]["operation_id"].is_null());
+        assert_eq!(
+            daemon
+                .kelpie
+                .store()
+                .obligation_state(ask)
+                .expect("persist"),
+            crate::domain::ObligationState::Open
+        );
+
+        let mut stream = claim_waiter(&socket, waiter, "claim-final");
+        while daemon.inboxes.is_empty() {
+            daemon.poll().expect("claim");
+        }
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let _claim = read_json(&mut reader);
+        let delivery = read_json(&mut reader);
+        assert_eq!(delivery["method"], "inbox.delivery");
+        assert_eq!(delivery["params"]["kind"], "reply");
+        assert_eq!(delivery["params"]["disposition"], "final");
+        assert_eq!(delivery["params"]["body"], "done");
+        let reply_id = delivery["params"]["message_id"].clone();
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "id": "ack-final",
+                "method": "inbox.ack",
+                "params": {"message_id": reply_id},
+            }),
+        )
+        .expect("ack");
+        stream.write_all(b"\n").expect("nl");
+        for _ in 0..20 {
+            daemon.poll().expect("ack poll");
+            if daemon.kelpie.store().obligation_state(ask).expect("state")
+                == crate::domain::ObligationState::Resolved
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            daemon
+                .kelpie
+                .store()
+                .obligation_state(ask)
+                .expect("resolved"),
+            crate::domain::ObligationState::Resolved
+        );
+        let second = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "reply-2",
+                "method": "reply",
+                "params": {
+                    "reply_to": ask,
+                    "requester_agent_id": owing,
+                    "body": "again",
+                    "disposition": "final",
+                    "idempotency_key": "socket-final-2",
+                }
+            }),
+        );
+        assert_eq!(second["error"]["class"], "conflict");
+    }
+
+    #[test]
+    fn socket_cancel_reaches_the_waiter_inbox() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let (waiter, _, ask) = seed_socket_ask(&mut store);
+        let (mut daemon, socket) = bind_inbox_daemon(directory.path(), store);
+        let cancelled = rpc(
+            &mut daemon,
+            &socket,
+            serde_json::json!({
+                "id": "cancel-1",
+                "method": "cancel",
+                "params": {
+                    "requester_agent_id": waiter,
+                    "ask_message_id": ask,
+                    "reason": "obsolete",
+                }
+            }),
+        );
+        assert!(cancelled["error"].is_null(), "{cancelled}");
+        assert_eq!(cancelled["result"]["state"], "cancelled");
+        assert_eq!(
+            daemon.kelpie.store().obligation_state(ask).expect("state"),
+            crate::domain::ObligationState::Cancelled
+        );
+        let delivery = drain_reply(&mut daemon, &socket, waiter, "claim-cancel");
+        assert_eq!(delivery["method"], "inbox.delivery");
+        assert_eq!(delivery["params"]["kind"], "cancellation");
+        assert!(
+            delivery["params"]["body"]
+                .as_str()
+                .expect("body")
+                .contains("obsolete")
+        );
     }
 }

@@ -169,14 +169,15 @@ fn settled_prepare(
         )
         .expect("final reply");
     let request = format!("reply-request:{renew_id}");
+    let operation_id = reply.operation_id.expect("pane reply operation");
     store
-        .begin_attempt(reply.operation_id, worker.incarnation_id, &request)
+        .begin_attempt(operation_id, worker.incarnation_id, &request)
         .expect("attempt");
     store
-        .mark_submitted(reply.operation_id, 1, &request)
+        .mark_submitted(operation_id, 1, &request)
         .expect("submitted");
     store
-        .accept_delivery(reply.operation_id, worker.incarnation_id, "w:p1", "term-1")
+        .accept_delivery(operation_id, worker.incarnation_id, "w:p1", "term-1")
         .expect("accepted");
     ask.message_id
 }

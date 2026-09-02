@@ -187,9 +187,9 @@ a sender stay idle instead of holding a turn open for work that can take hours.
 
 `reply` takes `reply_to` (the ask message ID), `body`, `disposition`
 (`progress` or `final`), and `idempotency_key`. Kelpie resolves the exact owing
-sender and waiting recipient from the durable obligation, binds the unique Ready
-incarnation of the waiting agent, and delivers a compact receiver envelope to
-that incarnation through Herdr:
+sender and waiting recipient from the durable obligation and binds the waiter's
+receive path. A `herdr_prompt` waiter is the unique Ready incarnation, delivered
+as a compact receiver envelope through Herdr:
 
 ```text
 <kelpie from=bob re=<ask-message-id> progress>
@@ -201,14 +201,18 @@ BODY
 </kelpie>
 ```
 
+A `socket_inbox` waiter is that inbox, with no Herdr prompt. Persist queues the
+delivery; the socket client's `inbox.ack` is acceptance. Dropping the host
+leaves the delivery queued and the obligation open.
+
 Wrong or stale correlation fails closed. Progress sets the obligation
 `in_progress` when the reply is recorded and does not resolve it. A final reply
 resolves the obligation only when delivery is accepted; rejected or unknown
 final deliveries leave the obligation open/in-progress and report the delivery
 outcome without claiming the waiter received the answer. Ambiguous submitted
 reply prompts are never blindly resent. On success the result includes
-`message_id`, `operation_id`, `recipient_incarnation`, `delivery_outcome`, and
-`obligation_state`.
+`message_id`, `delivery_outcome`, and `obligation_state`. Pane replies also
+include `operation_id` and `recipient_incarnation`.
 
 `clear` replaces one Ready incarnation's backend-native conversation without a
 prepare ask or resume prompt. Params take the same recipient shapes as `tell`
@@ -514,7 +518,10 @@ is read from the newest assistant row because a session can change model mid-run
 The requester is an unauthenticated same-user identity claim. Kelpie checks the
 neutral durable ownership invariant that it equals the obligation's
 `waiting_agent_id`, records the claim and reason, and permits only `open` or
-`in_progress` to become `cancelled`. Authenticated or capability-bearing
+`in_progress` to become `cancelled`. A pane waiter receives Kelpie's
+cancellation through Herdr when Ready. A socket waiter receives it on the inbox;
+the obligation is `cancelled`, not `resolved`, and the message is not attributed
+to the responder. Authenticated or capability-bearing
 transports must validate the requester claim above Kelpie before invoking this
 method.
 

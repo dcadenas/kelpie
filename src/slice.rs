@@ -13,8 +13,8 @@ use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CreatedAsk, CreatedReply, CreatedTell, DeclaredStart,
-    DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport, Store, StoreError,
-    store_clock_ms,
+    DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport, ReplyReceivePath, Store,
+    StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -2122,17 +2122,17 @@ impl Kelpie {
     /// Persist and deliver a correlated progress or final reply to the waiter.
     ///
     /// The ask message ID alone resolves the exact owing sender and waiting
-    /// recipient. Delivery targets the unique Ready incarnation of the waiting
-    /// agent. Progress sets the obligation `in_progress` when the reply is
-    /// recorded. Final resolves the obligation only after accepted delivery so
-    /// rejected or unknown Herdr outcomes never claim the waiter received the
-    /// answer.
+    /// recipient. Delivery binds the waiter's receive path: Herdr prompt for a
+    /// Ready pane, or the socket inbox with no Herdr write. Progress sets the
+    /// obligation `in_progress` when recorded. Final resolves only after
+    /// accepted delivery — Herdr prompt acceptance, or socket ACK.
     ///
     /// # Errors
     ///
-    /// Returns a conflict for unknown/terminal `reply_to` or a missing/ambiguous
-    /// Ready waiting incarnation, and classified Herdr or unknown-outcome errors
-    /// after durable intent is recorded.
+    /// Returns a conflict for unknown/terminal `reply_to`, a missing/ambiguous
+    /// Ready waiting incarnation, or an ended socket waiter, and classified
+    /// Herdr or unknown-outcome errors after durable intent is recorded.
+    #[allow(clippy::too_many_lines)]
     pub fn reply(
         &mut self,
         reply_to: MessageId,
@@ -2141,9 +2141,22 @@ impl Kelpie {
         disposition: ReplyDisposition,
         idempotency_key: &str,
     ) -> Result<CreatedReply, SliceError> {
-        let recipient_incarnation = self
+        let receive_path = self
             .store
-            .reply_recipient_incarnation(reply_to, requester_agent_id)?;
+            .reply_receive_path(reply_to, requester_agent_id)?;
+        let recipient_incarnation = match receive_path {
+            ReplyReceivePath::SocketInbox => {
+                return Ok(self.store.create_reply_with_due(
+                    reply_to,
+                    requester_agent_id,
+                    body,
+                    disposition,
+                    idempotency_key,
+                    None,
+                )?);
+            }
+            ReplyReceivePath::HerdrPrompt(incarnation) => incarnation,
+        };
         let (due_at_ms, defer) = self.prompt_schedule(recipient_incarnation, None)?;
         let created = self.store.create_reply_with_due(
             reply_to,
@@ -2156,20 +2169,28 @@ impl Kelpie {
         if defer {
             return Ok(created);
         }
-        let binding = self.store.ready_binding(created.recipient_incarnation)?;
+        let recipient_incarnation = created.recipient_incarnation.ok_or_else(|| {
+            SliceError::Store(StoreError::InvalidRecord(
+                "herdr_prompt reply is missing recipient incarnation".into(),
+            ))
+        })?;
+        let operation_id = created.operation_id.ok_or_else(|| {
+            SliceError::Store(StoreError::InvalidRecord(
+                "herdr_prompt reply is missing operation".into(),
+            ))
+        })?;
+        let binding = self.store.ready_binding(recipient_incarnation)?;
         let sender_address = {
             let (sender, _) = self.store.message_parties(created.message_id)?;
             self.store.agent_address(sender)?
         };
         let connection = self.herdr.connect()?;
-        let request_id = format!("kelpie:reply:{}", created.operation_id);
-        let attempt = self.store.begin_attempt(
-            created.operation_id,
-            created.recipient_incarnation,
-            &request_id,
-        )?;
+        let request_id = format!("kelpie:reply:{operation_id}");
+        let attempt = self
+            .store
+            .begin_attempt(operation_id, recipient_incarnation, &request_id)?;
         self.store
-            .mark_submitted(created.operation_id, attempt, &request_id)?;
+            .mark_submitted(operation_id, attempt, &request_id)?;
         crate::test_fault::pause("reply_after_submitted_before_write");
         let envelope = match disposition {
             ReplyDisposition::Progress => envelope::render_progress(
@@ -2190,8 +2211,8 @@ impl Kelpie {
             Ok(agent) => {
                 crate::test_fault::pause("reply_after_response_before_commit");
                 self.store.accept_delivery(
-                    created.operation_id,
-                    created.recipient_incarnation,
+                    operation_id,
+                    recipient_incarnation,
                     &agent.pane_id,
                     &agent.terminal_id,
                 )?;
@@ -2208,8 +2229,8 @@ impl Kelpie {
                     DeliveryOutcome::Rejected
                 };
                 self.store.mark_rejected(
-                    created.operation_id,
-                    created.recipient_incarnation,
+                    operation_id,
+                    recipient_incarnation,
                     &source.to_string(),
                     delivery_outcome,
                 )?;
@@ -2217,12 +2238,12 @@ impl Kelpie {
             }
             Err(source) => {
                 self.store.mark_unknown(
-                    created.operation_id,
-                    created.recipient_incarnation,
+                    operation_id,
+                    recipient_incarnation,
                     &source.to_string(),
                 )?;
                 Err(SliceError::UnknownOutcome {
-                    operation_id: created.operation_id.to_string(),
+                    operation_id: operation_id.to_string(),
                     source,
                 })
             }
@@ -2378,8 +2399,8 @@ impl Kelpie {
     }
 
     /// Cancel one owned unresolved obligation with a durable reason, and
-    /// deliver Kelpie's cancellation response into the asker's Ready pane when
-    /// one exists.
+    /// deliver Kelpie's cancellation response into the asker's Ready pane or
+    /// socket inbox.
     ///
     /// `requester_agent_id` is a same-user identity claim, not authentication.
     ///
@@ -4618,7 +4639,7 @@ mod tests {
         assert_eq!(
             kelpie
                 .store_mut()
-                .delivery_outcome(reply.operation_id)
+                .delivery_outcome(reply.operation_id.expect("pane reply operation"))
                 .expect("reply delivery"),
             DeliveryOutcome::Accepted
         );
