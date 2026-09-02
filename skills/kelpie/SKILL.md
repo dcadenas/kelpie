@@ -557,7 +557,10 @@ Each request has `id`, `method`, and `params`. The daemon supports:
 - `cancel`: provide `requester_agent_id`, `ask_message_id` (the message ID),
   and a non-empty reason. A queued tell or ask can be cancelled only before
   the first Herdr write. After submit, existing no-resend and unknown rules
-  apply; open/in-progress ask obligations remain cancellable by the waiter.
+  apply; open/in-progress ask obligations remain cancellable from any Ready
+  pane. The waiter is not required; `--sender-id` of the waiter still works.
+  A renew prepare ask is not this `cancel` — end the policy with
+  `renew.cancel`.
   A socket waiter receives the Kelpie-authored cancellation on its inbox;
   the owing agent receives a stop-notice when addressable, recorded for
   `pending` when not; state is `cancelled`, not `resolved`.
