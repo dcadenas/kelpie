@@ -719,17 +719,20 @@ impl Store {
             )));
         }
         refuse_name_held_by_socket_waiter(&tx, &public_name)?;
-        if intent.logical_agent_id.is_none() {
-            // A create-new adopt under a name a prior logical agent still holds
-            // unresolved obligations under would strand them: the new identity
-            // cannot resolve an obligation it does not own, and a reply addressed
-            // to the prior agent has no Ready incarnation to reach. Names are
-            // reusable, so this is not a conflict over the live runtime — it is a
-            // refusal to fork an identity somebody is still waiting on.
-            let info = Self::name_info_on(&tx, &public_name)?;
-            if !info.unresolved.is_empty() {
-                return Err(StoreError::Conflict(Self::name_conflict_message(&info)));
-            }
+        // A create-new adopt under a name a prior logical agent still holds
+        // unresolved obligations under would strand them: the new identity
+        // cannot resolve an obligation it does not own, and a reply addressed
+        // to the prior agent has no Ready incarnation to reach. Continue is
+        // the remedy for that agent's own debts, not a way to take a name
+        // somebody else is still waiting on.
+        let info = Self::name_info_on(&tx, &public_name)?;
+        let continued = intent.logical_agent_id.map(|id| id.to_string());
+        let foreign_unresolved = info.unresolved.iter().any(|obligation| {
+            continued.as_deref() != Some(obligation.asker_agent_id.as_str())
+                && continued.as_deref() != Some(obligation.responder_agent_id.as_str())
+        });
+        if foreign_unresolved {
+            return Err(StoreError::Conflict(Self::name_conflict_message(&info)));
         }
         let logical_agent_id = if let Some(existing) = intent.logical_agent_id {
             let found: Option<String> = tx
@@ -3460,6 +3463,80 @@ impl Store {
             pane_id,
             "pane",
         )
+    }
+
+    /// Find the unique continuable logical agent for one live binding.
+    ///
+    /// `ready` is already bound. `retiring`, `retired`, and `superseded` left
+    /// the runtime on purpose. `lost` and `unknown` on this exact pane,
+    /// terminal, and backend are the prior occupant that lazy create-new would
+    /// fork. `declared` or `failed` of that same backend is retried so a
+    /// rejected name claim does not wedge the pane. `starting` on the same pane
+    /// and terminal fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when more than one logical agent still occupies the
+    /// pane and terminal, or when the unique occupant is not a lost, unknown,
+    /// declared, or failed incarnation of the live backend.
+    pub fn continuable_logical_agent_for_binding(
+        &self,
+        pane_id: &str,
+        terminal_id: &str,
+        backend_kind: &str,
+    ) -> Result<Option<LogicalAgentId>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT logical_agent_id, state, backend_kind
+             FROM incarnations
+             WHERE observed_pane_id = ?1
+               AND observed_terminal_id = ?2
+               AND state NOT IN ('ready', 'retiring', 'retired', 'superseded')
+             ORDER BY logical_agent_id ASC",
+        )?;
+        let rows = statement.query_map(params![pane_id, terminal_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut occupants = Vec::new();
+        for row in rows {
+            occupants.push(row?);
+        }
+        if occupants.is_empty() {
+            return Ok(None);
+        }
+        let mut ids = Vec::new();
+        for (id, _, _) in &occupants {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.clone());
+            }
+        }
+        if ids.len() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "pane {pane_id} terminal {terminal_id} has {} continuable logical agents; \
+                 adopt --logical-id to continue one of {}",
+                ids.len(),
+                ids.join(", ")
+            )));
+        }
+        let id = LogicalAgentId::parse(&ids[0]).ok_or_else(|| {
+            StoreError::InvalidRecord(format!("invalid logical agent id {}", ids[0]))
+        })?;
+        let matches_live = occupants.iter().any(|(_, state, backend)| {
+            matches!(state.as_str(), "lost" | "unknown" | "declared" | "failed")
+                && backend == backend_kind
+        });
+        if matches_live {
+            Ok(Some(id))
+        } else {
+            Err(StoreError::Conflict(format!(
+                "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost, unknown, \
+                 declared, or failed {backend_kind} incarnation; adopt --logical-id to continue \
+                 it, or adopt the live occupant as a new agent"
+            )))
+        }
     }
 
     /// Read a logical agent's current human-readable address.
@@ -10681,6 +10758,149 @@ mod tests {
                 .pending_obligations(replacement.logical_agent_id)
                 .expect("empty")
                 .is_empty()
+        );
+    }
+
+    fn mark_lost(store: &Store, incarnation_id: IncarnationId) {
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'lost' WHERE id = ?1",
+                [incarnation_id.to_string()],
+            )
+            .expect("lose");
+    }
+
+    #[test]
+    fn continuable_binding_returns_the_unique_lost_agent() {
+        let mut store = Store::in_memory().expect("store");
+        let first = store
+            .declare_adopt(&adopt_intent("cont-first"), &ready_evidence())
+            .expect("adopt");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("ready is not continuable"),
+            None
+        );
+        mark_lost(&store, first.incarnation_id);
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("lost"),
+            Some(first.logical_agent_id)
+        );
+        let backend_mismatch = store
+            .continuable_logical_agent_for_binding("w1:p9", "term-live", "claude")
+            .expect_err("wrong backend");
+        assert!(
+            backend_mismatch.to_string().contains("adopt --logical-id"),
+            "{backend_mismatch}"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'retired' WHERE id = ?1",
+                [first.incarnation_id.to_string()],
+            )
+            .expect("retire");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("retired is not continuable"),
+            None
+        );
+    }
+
+    #[test]
+    fn continuable_binding_fails_closed_on_two_lost_agents() {
+        let mut store = Store::in_memory().expect("store");
+        let first = store
+            .declare_adopt(&adopt_intent("amb-first"), &ready_evidence())
+            .expect("first");
+        mark_lost(&store, first.incarnation_id);
+        let second = store
+            .declare_adopt(&adopt_intent("amb-second"), &ready_evidence())
+            .expect("second");
+        mark_lost(&store, second.incarnation_id);
+        let error = store
+            .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+            .expect_err("ambiguous");
+        let message = error.to_string();
+        assert!(
+            message.contains("2 continuable logical agents"),
+            "{message}"
+        );
+        assert!(message.contains("adopt --logical-id"), "{message}");
+        assert!(
+            message.contains(&first.logical_agent_id.to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.logical_agent_id.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn continuable_binding_retries_a_declared_occupant() {
+        let mut store = Store::in_memory().expect("store");
+        let pending = store
+            .declare_adopt_pending(&adopt_intent("pend-only"), &ready_evidence())
+            .expect("pending");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("declared retries"),
+            Some(pending.logical_agent_id)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'failed' WHERE id = ?1",
+                [pending.incarnation_id.to_string()],
+            )
+            .expect("fail");
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .expect("failed retries"),
+            Some(pending.logical_agent_id)
+        );
+    }
+
+    #[test]
+    fn continue_adopt_refuses_a_name_someone_else_still_owes_on() {
+        let mut store = Store::in_memory().expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-w", "wait-foreign"))
+            .expect("waiting");
+        let holder = store
+            .declare_adopt(&adopt_intent("holder"), &ready_evidence())
+            .expect("holder");
+        store
+            .create_ask(
+                waiting.logical_agent_id,
+                holder.logical_agent_id,
+                holder.incarnation_id,
+                "owed",
+                "foreign-ask",
+            )
+            .expect("ask");
+        mark_lost(&store, holder.incarnation_id);
+        let other = store
+            .declare_start(&intent("other", "term-o", "other-start"))
+            .expect("other");
+        let mut cont = adopt_intent("steal-name");
+        cont.logical_agent_id = Some(other.logical_agent_id);
+        let error = store
+            .declare_adopt(&cont, &ready_evidence())
+            .expect_err("foreign debts");
+        assert!(
+            error
+                .to_string()
+                .contains(&holder.logical_agent_id.to_string()),
+            "{error}"
         );
     }
 

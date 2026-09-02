@@ -300,6 +300,11 @@ Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Use exactly
 one recipient form: a live name, or both `--recipient-id` and
 `--recipient-incarnation`. Exact addressing does not take a fake alias.
 When the calling pane has no Ready binding, Kelpie lazily adopts its exact live
+agent. If that pane, terminal, and backend already have a unique lost, unknown,
+declared, or failed incarnation, the adoption continues that logical agent and
+keeps its recorded alias. An unnamed occupant is renamed back to that alias. A
+different live name, a backend mismatch, or several continuable agents fail
+closed: continue with `adopt --logical-id`, or bind the live occupant as a new
 agent. A missing recipient alias may likewise adopt one unique unnamed live
 agent whose cwd basename derives to that alias. Ambiguity fails closed.
 
