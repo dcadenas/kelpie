@@ -390,7 +390,7 @@ parties resolved to agent IDs, names, and liveness (`asker` is the waiter,
 `responder` is the agent that owes the final reply). It is the diagnosis behind
 a create-new refusal in one command: a refusal under this name lists the same
 asks, parties, and three remedies — continue the claimant with `--logical-id`,
-cancel each ask (`kelpie cancel <ask-id> --reason <why> --sender-id <asker-id>`),
+cancel each ask (`kelpie cancel <ask-id> --reason <why>`),
 or take a different name by renaming the agent in Herdr and adopting under it.
 
 `retire` records that an incarnation is finished. On its own it sends nothing to
@@ -518,10 +518,10 @@ is searched for rather than assumed to live in a default file, and model identit
 is read from the newest assistant row because a session can change model mid-run.
 
 `cancel` takes `requester_agent_id`, `ask_message_id`, and a non-empty `reason`.
-The requester is an unauthenticated same-user identity claim. Kelpie checks the
-neutral durable ownership invariant that it equals the obligation's
-`waiting_agent_id`, records the claim and reason, and permits only `open` or
-`in_progress` to become `cancelled`. A pane waiter receives Kelpie's
+The requester is an unauthenticated same-user identity claim, not a waiter-only
+check. Kelpie records the claim and reason and permits only `open` or
+`in_progress` to become `cancelled`. The calling pane need not be the waiter;
+`--sender-id` of the waiter remains a valid override. A pane waiter receives Kelpie's
 cancellation through Herdr when Ready. A socket waiter receives it on the inbox.
 The owing agent receives a Kelpie-authored stop-notice when addressable, recorded
 for a later `pending` when not. The obligation is `cancelled`, not `resolved`,

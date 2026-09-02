@@ -2438,11 +2438,12 @@ impl Kelpie {
         Ok(self.store.name_info(public_name)?)
     }
 
-    /// Cancel one owned unresolved obligation with a durable reason, and
-    /// deliver Kelpie's cancellation notices into the asker's and owing agent's
-    /// Ready panes or socket inboxes.
+    /// Cancel one unresolved obligation with a durable reason, and deliver
+    /// Kelpie's cancellation notices into the asker's and owing agent's Ready
+    /// panes or socket inboxes.
     ///
     /// `requester_agent_id` is a same-user identity claim, not authentication.
+    /// The caller need not be the waiter.
     ///
     /// The obligation settles `cancelled` before any Herdr write. With no Ready
     /// asker the response is only recorded, and `delivered` comes back false;
@@ -2453,8 +2454,8 @@ impl Kelpie {
     ///
     /// # Errors
     ///
-    /// Returns a conflict for absent, unowned, or terminal obligations, and
-    /// classified Herdr or unknown-outcome errors after durable intent.
+    /// Returns a conflict for absent or terminal obligations, and classified
+    /// Herdr or unknown-outcome errors after durable intent.
     #[allow(clippy::too_many_lines)]
     pub fn cancel(
         &mut self,
@@ -2473,7 +2474,10 @@ impl Kelpie {
                 owing_message_id: None,
             });
         }
-        let waiting_address = self.store.agent_address(requester_agent_id)?;
+        let requester_address = self.store.agent_address(requester_agent_id)?;
+        let waiting_address = self
+            .store
+            .agent_address(self.store.ask_waiting_agent(ask_message_id)?)?;
         let recipient_incarnation = self
             .store
             .cancel_recipient_incarnation(ask_message_id)
@@ -2494,12 +2498,12 @@ impl Kelpie {
             None => (None, false),
         };
         let body = format!(
-            "Your ask {ask_message_id} was cancelled by {waiting_address}. Reason: {reason}. \
+            "Your ask {ask_message_id} was cancelled by {requester_address}. Reason: {reason}. \
              No reply is owed. Re-ask the current holder of the name if the question \
              still matters."
         );
         let owing_body = format!(
-            "Stop working on ask {ask_message_id}. It was cancelled by {waiting_address}. \
+            "Stop working on ask {ask_message_id}. It was cancelled by {requester_address}. \
              Reason: {reason}. No reply is owed."
         );
         let created = self

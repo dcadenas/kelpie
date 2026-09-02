@@ -3635,7 +3635,8 @@ impl Store {
     /// # Errors
     ///
     /// Returns a conflict without mutation for an empty reason, absent
-    /// obligation, ownership mismatch, or terminal obligation state.
+    /// obligation, or terminal obligation state. The requester need not be
+    /// the waiter; the claim is recorded, not authenticated.
     pub fn cancel_obligation(
         &mut self,
         requester_agent_id: LogicalAgentId,
@@ -3649,21 +3650,16 @@ impl Store {
         }
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
-        let obligation: Option<(String, String)> = tx
+        let obligation: Option<String> = tx
             .query_row(
-                "SELECT waiting_agent_id, state FROM obligations WHERE ask_message_id = ?1",
+                "SELECT state FROM obligations WHERE ask_message_id = ?1",
                 [ask_message_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((waiting_agent_id, state)) = obligation else {
+        let Some(state) = obligation else {
             return Err(StoreError::Conflict("obligation is absent".into()));
         };
-        if waiting_agent_id != requester_agent_id.to_string() {
-            return Err(StoreError::Conflict(
-                "requester does not own the obligation".into(),
-            ));
-        }
         if !matches!(state.as_str(), "open" | "in_progress") {
             return Err(StoreError::Conflict(format!(
                 "obligation in {state} state is not cancellable"
@@ -3672,7 +3668,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
              cancellation_requester_agent_id = ?2, cancellation_reason = ?3
-             WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+             WHERE ask_message_id = ?4
              AND state IN ('open', 'in_progress')",
             params![
                 now,
@@ -3690,6 +3686,30 @@ impl Store {
         Ok(())
     }
 
+    /// The waiter `LogicalAgent` for one ask.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the obligation is absent.
+    pub fn ask_waiting_agent(
+        &self,
+        ask_message_id: MessageId,
+    ) -> Result<LogicalAgentId, StoreError> {
+        let waiting: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(waiting) = waiting else {
+            return Err(StoreError::Conflict("obligation is absent".into()));
+        };
+        LogicalAgentId::parse(&waiting)
+            .ok_or_else(|| StoreError::InvalidRecord(format!("invalid waiting agent id {waiting}")))
+    }
+
     /// The asker's Ready incarnation for a cancellation response, if any.
     ///
     /// Resolved before durable intent so the delivery can honour the same
@@ -3703,20 +3723,7 @@ impl Store {
         &self,
         ask_message_id: MessageId,
     ) -> Result<Option<IncarnationId>, StoreError> {
-        let waiting: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
-                [ask_message_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(waiting) = waiting else {
-            return Err(StoreError::Conflict("obligation is absent".into()));
-        };
-        let waiting_agent = LogicalAgentId::parse(&waiting).ok_or_else(|| {
-            StoreError::InvalidRecord(format!("invalid waiting agent id {waiting}"))
-        })?;
+        let waiting_agent = self.ask_waiting_agent(ask_message_id)?;
         let mut statement = self.connection.prepare(
             "SELECT id FROM incarnations
              WHERE logical_agent_id = ?1 AND state = 'ready'
@@ -3787,8 +3794,8 @@ impl Store {
         }
     }
 
-    /// Cancel one obligation owned by the requester and compose Kelpie's
-    /// cancellation notices.
+    /// Cancel one unresolved obligation and compose Kelpie's cancellation
+    /// notices. The requester is attribution, not the waiter.
     ///
     /// The obligation settles `cancelled` in the same transaction that records
     /// the durable delivery intent, before any Herdr write. A `herdr_prompt`
@@ -3802,7 +3809,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns a conflict without mutation for an empty reason, absent
-    /// obligation, ownership mismatch, or terminal obligation state.
+    /// obligation, or terminal obligation state.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn cancel_with_response(
         &mut self,
@@ -3832,11 +3839,6 @@ impl Store {
         let Some((waiting, owing, state)) = obligation else {
             return Err(StoreError::Conflict("obligation is absent".into()));
         };
-        if waiting != requester_agent_id.to_string() {
-            return Err(StoreError::Conflict(
-                "requester does not own the obligation".into(),
-            ));
-        }
         if !matches!(state.as_str(), "open" | "in_progress") {
             return Err(StoreError::Conflict(format!(
                 "obligation in {state} state is not cancellable"
@@ -3879,7 +3881,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
              cancellation_requester_agent_id = ?2, cancellation_reason = ?3
-             WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+             WHERE ask_message_id = ?4
              AND state IN ('open', 'in_progress')",
             params![
                 now,
@@ -4159,8 +4161,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns a conflict for an empty reason, absent message, ownership
-    /// mismatch, a submitted attempt, or a delivery that is not queued.
+    /// Returns a conflict for an empty reason, absent message, tell ownership
+    /// mismatch, a submitted attempt, or a delivery that is not queued. Ask
+    /// cancel does not require the requester to be the waiter.
     pub fn cancel_queued_delivery(
         &mut self,
         requester_agent_id: LogicalAgentId,
@@ -4196,17 +4199,13 @@ impl Store {
             ));
         }
         if kind == "ask" {
-            let waiting: Option<String> = tx
-                .query_row(
-                    "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
-                    [message_id.to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if waiting.as_deref() != Some(&requester_agent_id.to_string()) {
-                return Err(StoreError::Conflict(
-                    "requester does not own the obligation".into(),
-                ));
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM obligations WHERE ask_message_id = ?1)",
+                [message_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::Conflict("obligation is absent".into()));
             }
         }
         let submitted: i64 = tx.query_row(
@@ -4246,7 +4245,7 @@ impl Store {
             let obligation_changed = tx.execute(
                 "UPDATE obligations SET state = 'cancelled', last_activity_at_ms = ?1,
                  cancellation_requester_agent_id = ?2, cancellation_reason = ?3
-                 WHERE ask_message_id = ?4 AND waiting_agent_id = ?2
+                 WHERE ask_message_id = ?4
                  AND state IN ('open', 'in_progress')",
                 params![
                     now,
@@ -4271,8 +4270,9 @@ impl Store {
     /// answer one whose scheduled delivery has not fired yet. Firing it then
     /// would present settled work as a fresh demand — the recipient has no way
     /// to tell a late envelope from a new request — so the delivery is
-    /// superseded instead. Cancellation is the waiter's to request; this is not
-    /// cancellation, it is Kelpie refusing to contradict its own record.
+    /// superseded instead. Ask cancel is a same-user claim, not waiter-only;
+    /// this sweep is not that cancel, it is Kelpie refusing to contradict its
+    /// own record.
     ///
     /// # Errors
     ///
@@ -9396,7 +9396,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_enforces_owner_reason_and_terminal_states() {
+    fn cancellation_accepts_any_requester_records_claim_and_refuses_terminal() {
         let mut store = Store::in_memory().expect("store");
         let waiting = store
             .declare_start(&intent("waiting", "term-a", "cancel-waiting"))
@@ -9404,9 +9404,9 @@ mod tests {
         let owing = store
             .declare_start(&intent("owing", "term-b", "cancel-owing"))
             .expect("owing");
-        let spoof = store
-            .declare_start(&intent("spoof", "term-c", "cancel-spoof"))
-            .expect("spoof");
+        let third = store
+            .declare_start(&intent("third", "term-c", "cancel-third"))
+            .expect("third");
         let ask = store
             .create_ask(
                 waiting.logical_agent_id,
@@ -9418,7 +9418,6 @@ mod tests {
             .expect("ask");
         for conflict in [
             store.cancel_obligation(waiting.logical_agent_id, ask.message_id, "  "),
-            store.cancel_obligation(spoof.logical_agent_id, ask.message_id, "spoofed"),
             store.cancel_obligation(waiting.logical_agent_id, MessageId::new(), "absent"),
         ] {
             assert!(matches!(conflict, Err(StoreError::Conflict(_))));
@@ -9428,8 +9427,8 @@ mod tests {
             ObligationState::Open
         );
         store
-            .cancel_obligation(waiting.logical_agent_id, ask.message_id, "no longer needed")
-            .expect("cancel");
+            .cancel_obligation(third.logical_agent_id, ask.message_id, "no longer needed")
+            .expect("third-party cancel");
         assert_eq!(
             store.obligation_state(ask.message_id).expect("cancelled"),
             ObligationState::Cancelled
@@ -9446,7 +9445,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("cancellation evidence");
-        assert_eq!(requester, waiting.logical_agent_id.to_string());
+        assert_eq!(requester, third.logical_agent_id.to_string());
         assert_eq!(reason, "no longer needed");
 
         mark_ready(&mut store, waiting, "waiting", "term-a");
@@ -11799,6 +11798,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancellation_from_owing_agent_when_waiter_is_not_ready() {
+        let mut store = Store::in_memory().expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-waiting", "gone-waiting"))
+            .expect("waiting");
+        let owing = store
+            .declare_start(&intent("owing", "term-owing", "gone-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-owing");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "status?",
+                "gone-ask",
+            )
+            .expect("ask");
+        let created = store
+            .cancel_with_response(
+                owing.logical_agent_id,
+                ask.message_id,
+                "answered elsewhere",
+                "Your ask was cancelled. Reason: answered elsewhere.",
+                "Stop. Ask was cancelled. Reason: answered elsewhere.",
+                None,
+                None,
+            )
+            .expect("owing cancel");
+        assert!(created.delivery.is_none(), "waiter is not Ready");
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("state"),
+            ObligationState::Cancelled
+        );
+        let requester: String = store
+            .connection
+            .query_row(
+                "SELECT cancellation_requester_agent_id FROM obligations
+                 WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("requester");
+        assert_eq!(requester, owing.logical_agent_id.to_string());
+        let sender: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT sender_agent_id FROM messages WHERE id = ?1",
+                [created.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("response");
+        assert_eq!(sender, None);
+    }
+
     fn unnamed_intent(key: &str) -> crate::domain::AdoptIntent {
         crate::domain::AdoptIntent {
             pane_id: "w7:p1H".into(),
@@ -12538,6 +12593,51 @@ mod tests {
                 .cancel_queued_delivery(waiter.logical_agent_id, ask.message_id, "host down")
                 .expect("cancel")
         );
+    }
+
+    #[test]
+    fn queued_ask_cancels_from_a_third_agent() {
+        let mut store = Store::in_memory().expect("store");
+        let waiting = store
+            .declare_start(&intent("waiting", "term-a", "queued-third-waiting"))
+            .expect("waiting");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "queued-third-owing"))
+            .expect("owing");
+        let third = store
+            .declare_start(&intent("third", "term-c", "queued-third"))
+            .expect("third");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let due_at = store_clock_ms().expect("clock") + 1_000;
+        let ask = store
+            .create_ask_with_due(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "later?",
+                "queued-third-ask",
+                Some(due_at),
+            )
+            .expect("queued ask");
+        assert!(
+            store
+                .cancel_queued_delivery(third.logical_agent_id, ask.message_id, "host down")
+                .expect("third cancel")
+        );
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("cancelled"),
+            ObligationState::Cancelled
+        );
+        let requester: String = store
+            .connection
+            .query_row(
+                "SELECT cancellation_requester_agent_id FROM obligations
+                 WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("requester");
+        assert_eq!(requester, third.logical_agent_id.to_string());
     }
 
     #[test]

@@ -678,7 +678,13 @@ Kelpie MUST expose semantic operations equivalent to:
 - `pending(agent)`;
 - `ask-info(message_id)` — read-only re-read of one ask's durable body,
   parties, and state, through the id its reminder carries;
-- `cancel(message_id, reason)` where authorization permits it.
+- `cancel(message_id, reason)`.
+
+A cancel MUST settle an `open` or `in_progress` ask for any same-user
+requester claim. It MUST NOT require the requester to be the waiter. It MUST
+record the claimed requester and the reason. An absent ask or a terminal
+obligation MUST be refused without mutation. This is attribution, not
+authentication.
 
 Cancelling an ask settles its obligation `cancelled` with the stated reason,
 and MUST deliver a response naming the reason to the asker when that asker is
@@ -1066,6 +1072,7 @@ Herdr prompt proofs above.
 | Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
 | Socket-inbox final resolves only on ACK | Occupant `reply` final to a `socket_inbox` waiter: no Herdr prompt to the waiter, persist does not resolve, ACK resolves once, a dropped host leaves the obligation open. |
 | Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |
+| Same-user cancel is not waiter-only | With the waiter gone, cancel as the owing agent or a third Ready agent by ask id and reason; verify `cancelled` (not `resolved`) and the requester recorded. Cancel with the waiter's id still works. A wrong ask id fails closed. |
 | Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming an id that is not an active socket waiter is refused. |
 
 Tests SHOULD use deterministic fake Herdr protocol fixtures for state-machine

@@ -2241,7 +2241,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn local_socket_cancel_enforces_claimed_owner_and_terminal_state() {
+    fn local_socket_cancel_accepts_any_requester_and_refuses_terminal_state() {
         let directory = tempfile::tempdir().expect("tempdir");
         let socket = directory.path().join("kelpie.sock");
         let mut store = Store::in_memory().expect("store");
@@ -2338,16 +2338,25 @@ mod tests {
             })
         };
 
-        let spoofed = send_request(
-            &socket,
-            &request("spoofed", spoof.logical_agent_id, "spoof"),
-        );
-        assert_eq!(spoofed["error"]["class"], "conflict");
         let cancelled = send_request(
             &socket,
-            &request("owner", waiting.logical_agent_id, "no longer needed"),
+            &request("third", spoof.logical_agent_id, "no longer needed"),
         );
         assert_eq!(cancelled["result"]["state"], "cancelled");
+        assert_eq!(cancelled["result"]["response"], "recorded");
+        let absent = send_request(
+            &socket,
+            &serde_json::json!({
+                "id": "absent",
+                "method": "cancel",
+                "params": {
+                    "requester_agent_id": waiting.logical_agent_id,
+                    "ask_message_id": MessageId::new(),
+                    "reason": "no such ask"
+                }
+            }),
+        );
+        assert_eq!(absent["error"]["class"], "conflict");
         let terminal = send_request(
             &socket,
             &request("terminal", waiting.logical_agent_id, "repeat"),
