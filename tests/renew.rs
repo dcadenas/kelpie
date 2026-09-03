@@ -189,7 +189,13 @@ fn far_clear_deadline() -> i64 {
 }
 
 fn earn_interval(store: &mut Store, renew_id: kelpie::domain::RenewId, every_ms: i64) {
-    let mut t = store_clock_ms().expect("clock");
+    let mut t = store
+        .scheduled_interval_renews()
+        .expect("clocks")
+        .into_iter()
+        .find(|clock| clock.renew_id == renew_id)
+        .and_then(|clock| clock.occupancy_sampled_at_ms)
+        .unwrap_or_else(|| store_clock_ms().expect("clock"));
     let mut earned = 0;
     while earned < every_ms {
         let step = 1_000.min(every_ms - earned);
@@ -1821,7 +1827,11 @@ fn an_unobserved_working_gap_does_not_exhaust_an_every_interval() {
         "a kelpied-down gap must not count as observed occupancy"
     );
     let clocks = store.scheduled_interval_renews().expect("clocks");
-    assert_eq!(clocks[0].active_remaining_ms, remaining);
+    assert_eq!(
+        clocks[0].active_remaining_ms,
+        remaining - kelpie::store::RENEW_OCCUPANCY_MAX_CREDIT_MS,
+        "a long outage credits at most one sampling bound, never the whole interval"
+    );
 }
 
 #[test]

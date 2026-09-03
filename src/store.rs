@@ -28,9 +28,9 @@ pub const RENEW_OCCUPANCY_SAMPLE_MS: i64 = 1_000;
 
 /// Largest gap a sample may credit as observed occupancy.
 ///
-/// Anything larger is unobserved (kelpied was down, Herdr was silent) and MUST
-/// NOT exhaust the interval. Continuous sampling under
-/// [`RENEW_OCCUPANCY_SAMPLE_MS`] stays inside this bound.
+/// A longer gap is clamped to this, not discarded: a 6-hour outage credits two
+/// seconds against a 45-minute interval, and a merely slow Herdr RPC still
+/// counts. Zeroing anything over the bound would stall the clock under load.
 pub const RENEW_OCCUPANCY_MAX_CREDIT_MS: i64 = RENEW_OCCUPANCY_SAMPLE_MS * 2;
 
 /// Recorded finals whose delivery has not terminal-failed hold reminder injection.
@@ -5230,11 +5230,10 @@ impl Store {
     /// Apply one occupancy sample to a scheduled `--every` cycle.
     ///
     /// When `accumulating` is true the elapsed time since the last sample
-    /// counts as `working`/`blocked` occupancy, but only when that gap is at
-    /// most [`RENEW_OCCUPANCY_MAX_CREDIT_MS`]. A larger gap, or a NULL last
-    /// sample, is unobserved and does not consume remaining time. Otherwise the
-    /// remaining interval is unchanged and the projected due time slides
-    /// forward so idle time cannot exhaust it.
+    /// counts as `working`/`blocked` occupancy, clamped to
+    /// [`RENEW_OCCUPANCY_MAX_CREDIT_MS`]. A NULL last sample credits nothing.
+    /// Otherwise the remaining interval is unchanged and the projected due time
+    /// slides forward so idle time cannot exhaust it.
     ///
     /// # Errors
     ///
@@ -5248,18 +5247,14 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE renews
              SET active_remaining_ms = MAX(0, active_remaining_ms - CASE
-                    WHEN ?2
-                     AND occupancy_sampled_at_ms IS NOT NULL
-                     AND MAX(0, ?1 - occupancy_sampled_at_ms) <= ?4
-                    THEN MAX(0, ?1 - occupancy_sampled_at_ms)
+                    WHEN ?2 AND occupancy_sampled_at_ms IS NOT NULL
+                    THEN MIN(MAX(0, ?1 - occupancy_sampled_at_ms), ?4)
                     ELSE 0
                  END),
                  occupancy_sampled_at_ms = ?1,
                  scheduled_at_ms = ?1 + MAX(0, active_remaining_ms - CASE
-                    WHEN ?2
-                     AND occupancy_sampled_at_ms IS NOT NULL
-                     AND MAX(0, ?1 - occupancy_sampled_at_ms) <= ?4
-                    THEN MAX(0, ?1 - occupancy_sampled_at_ms)
+                    WHEN ?2 AND occupancy_sampled_at_ms IS NOT NULL
+                    THEN MIN(MAX(0, ?1 - occupancy_sampled_at_ms), ?4)
                     ELSE 0
                  END)
              WHERE id = ?3 AND phase = 'scheduled' AND every_ms IS NOT NULL

@@ -271,8 +271,10 @@ kelpie clear <recipient> | --recipient-id ID --recipient-incarnation ID
 re-seeding it. Params take `requester`, exact `recipient` plus
 `recipient_incarnation`, `prepare_prompt`, `prompt`, `on_timeout` (`abort` or
 `proceed`), `prepare_timeout_ms`, and at most one of `due_at_ms` or
-`every_ms`. Unlike every other addressed operation, `renew` takes **no**
-`recipient_alias` and the daemon refuses one: a public name is a reusable live
+`every_ms`. The daemon refuses both together, the same as the CLI: a due time
+is a one-shot, and `every_ms` re-arms itself. Unlike every other addressed
+operation, `renew` takes **no** `recipient_alias` and the daemon refuses one: a
+public name is a reusable live
 alias, and a policy aimed at the agent that happens to hold it clears that
 agent's context once a cycle. The client sends
 the caller's own IDs when no recipient is given. The result carries `renew_id`,

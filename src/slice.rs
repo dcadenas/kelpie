@@ -41,6 +41,15 @@ fn renew_interval_accumulates(status: crate::herdr::AgentStatus) -> bool {
     )
 }
 
+fn occupancy_is_accumulating(
+    live: &crate::herdr::LifecycleObservation,
+    clock: &IntervalRenewClock,
+) -> bool {
+    live.agent.pane_id == clock.pane_id
+        && live.agent.terminal_id == clock.terminal_id
+        && renew_interval_accumulates(live.agent_status)
+}
+
 /// The clear command for each backend whose behaviour has been verified.
 ///
 /// Deliberately not a guess and not a fallback. An unlisted backend refuses the
@@ -1553,11 +1562,9 @@ impl Kelpie {
             if !occupancy_sample_is_due(&clock, now_ms) {
                 continue;
             }
-            let accumulating = snapshot.iter().any(|live| {
-                live.agent.pane_id == clock.pane_id
-                    && live.agent.terminal_id == clock.terminal_id
-                    && renew_interval_accumulates(live.agent_status)
-            });
+            let accumulating = snapshot
+                .iter()
+                .any(|live| occupancy_is_accumulating(live, &clock));
             self.store
                 .accrue_renew_occupancy(clock.renew_id, accumulating, now_ms)?;
         }
@@ -3718,6 +3725,35 @@ mod tests {
         assert!(!renew_interval_accumulates(
             crate::herdr::AgentStatus::Unknown
         ));
+    }
+
+    #[test]
+    fn occupancy_join_is_pane_and_terminal_not_swapped() {
+        let clock = IntervalRenewClock {
+            renew_id: crate::domain::RenewId::new(),
+            pane_id: "w:p1".into(),
+            terminal_id: "term-1".into(),
+            active_remaining_ms: 1_000,
+            occupancy_sampled_at_ms: None,
+        };
+        let matching = crate::herdr::LifecycleObservation {
+            agent: crate::herdr::AgentObservation {
+                pane_id: "w:p1".into(),
+                terminal_id: "term-1".into(),
+                ..crate::herdr::AgentObservation::default()
+            },
+            agent_status: crate::herdr::AgentStatus::Working,
+        };
+        let swapped = crate::herdr::LifecycleObservation {
+            agent: crate::herdr::AgentObservation {
+                pane_id: "term-1".into(),
+                terminal_id: "w:p1".into(),
+                ..crate::herdr::AgentObservation::default()
+            },
+            agent_status: crate::herdr::AgentStatus::Working,
+        };
+        assert!(occupancy_is_accumulating(&matching, &clock));
+        assert!(!occupancy_is_accumulating(&swapped, &clock));
     }
 
     /// Serve one scripted request per connection, asserting the method order.
