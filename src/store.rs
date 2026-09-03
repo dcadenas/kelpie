@@ -18,6 +18,16 @@ use crate::herdr::Snapshot;
 
 const SCHEMA_VERSION: i64 = 22;
 
+/// Recorded finals whose delivery has not terminal-failed hold reminder injection.
+const NO_IN_FLIGHT_FINAL: &str = "AND NOT EXISTS (
+    SELECT 1 FROM messages inflight
+    JOIN deliveries inflight_d ON inflight_d.message_id = inflight.id
+    WHERE inflight.kind = 'reply'
+      AND inflight.disposition = 'final'
+      AND inflight.reply_to_message_id = r.ask_message_id
+      AND inflight_d.outcome IN ('queued','submitted','accepted','unknown')
+)";
+
 /// Host wall clock used for due comparison, in Unix epoch milliseconds.
 ///
 /// A delivery is due when `now_ms >= scheduled_at_ms`. This is the same
@@ -4545,11 +4555,14 @@ impl Store {
 
     /// Return overdue reminders bound to one exact Ready owing incarnation.
     ///
+    /// A recorded final whose delivery is `queued`, `submitted`, `accepted`, or
+    /// `unknown` is held here. Persist is not resolve.
+    ///
     /// # Errors
     ///
     /// Returns an error if durable IDs are malformed.
     pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<DueReminder>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
                     i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
                     m.body
@@ -4569,8 +4582,9 @@ impl Store {
                AND (SELECT COUNT(*) FROM incarnations current
                     WHERE current.logical_agent_id = o.owing_agent_id
                       AND current.state = 'ready') = 1
-             ORDER BY r.next_due_at_ms, o.creation_sequence",
-        )?;
+               {NO_IN_FLIGHT_FINAL}
+             ORDER BY r.next_due_at_ms, o.creation_sequence"
+        ))?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -4606,7 +4620,7 @@ impl Store {
     ///
     /// Returns an error if durable IDs are malformed.
     pub fn boundary_reminders(&self, now_ms: i64) -> Result<Vec<BoundaryReminder>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
                     i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
                     r.saw_working_at_ms IS NOT NULL, m.body
@@ -4627,8 +4641,9 @@ impl Store {
                AND (SELECT COUNT(*) FROM incarnations current
                     WHERE current.logical_agent_id = o.owing_agent_id
                       AND current.state = 'ready') = 1
-             ORDER BY r.boundary_check_at_ms, o.creation_sequence",
-        )?;
+               {NO_IN_FLIGHT_FINAL}
+             ORDER BY r.boundary_check_at_ms, o.creation_sequence"
+        ))?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -4706,7 +4721,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         let eligible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM obligation_reminders r
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE r.ask_message_id = ?1 AND o.state IN ('open','in_progress')
@@ -4716,7 +4732,9 @@ impl Store {
                         AND r.saw_working_at_ms IS NOT NULL
                         AND r.boundary_check_at_ms <= ?2
                         AND COALESCE(r.snoozed_until_ms, 0) <= ?2))
-               AND i.id = ?3 AND i.state = 'ready')",
+               AND i.id = ?3 AND i.state = 'ready'
+               {NO_IN_FLIGHT_FINAL})"
+            ),
             params![
                 reminder.ask_message_id.to_string(),
                 now_ms,
@@ -6380,11 +6398,14 @@ impl Store {
     pub fn next_reminder_due_at_ms(&self) -> Result<Option<i64>, StoreError> {
         self.connection
             .query_row(
-                "SELECT MIN(MAX(r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)))
+                &format!(
+                    "SELECT MIN(MAX(r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)))
                  FROM obligation_reminders r JOIN obligations o
                    ON o.ask_message_id = r.ask_message_id
                  WHERE o.state IN ('open','in_progress')
-                   AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL",
+                   AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
+                   {NO_IN_FLIGHT_FINAL}"
+                ),
                 [],
                 |row| row.get(0),
             )
@@ -6399,11 +6420,14 @@ impl Store {
     pub fn next_boundary_check_at_ms(&self) -> Result<Option<i64>, StoreError> {
         self.connection
             .query_row(
-                "SELECT MIN(MAX(r.boundary_check_at_ms, COALESCE(r.snoozed_until_ms, 0)))
+                &format!(
+                    "SELECT MIN(MAX(r.boundary_check_at_ms, COALESCE(r.snoozed_until_ms, 0)))
                  FROM obligation_reminders r JOIN obligations o
                    ON o.ask_message_id = r.ask_message_id
                  WHERE o.state = 'open' AND r.last_accepted_at_ms IS NULL
-                   AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL",
+                   AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
+                   {NO_IN_FLIGHT_FINAL}"
+                ),
                 [],
                 |row| row.get(0),
             )

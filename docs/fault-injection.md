@@ -201,6 +201,12 @@ is the one place Kelpie retries a submitted prompt: a duplicate resume prompt
 tells an agent its own instructions twice, while a missing one leaves an agent
 cleared, idle, and instructionless, with nothing inside it that could notice.
 
+The queued-final reminder process-kill test seeds an accepted ask whose final
+reply is already `queued` and whose reminder interval has elapsed. Kill at
+`daemon_bound` and recover. No `agent.prompt` reminder crosses to Herdr, and
+no `reminder_attempts` row is inserted. The obligation stays `open`. Persist
+is not resolve.
+
 The socket-inbox process-kill tests cover the same three boundaries on the
 inbox write rather than a Herdr prompt. Persist queues the delivery and does
 not resolve. Kill before write proves zero `inbox.delivery` bytes. Kill after

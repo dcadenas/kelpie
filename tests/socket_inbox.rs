@@ -391,7 +391,7 @@ fn occupant_ask_envelope_uses_waiter_from_and_reply_to() {
 }
 
 #[test]
-fn dropped_host_leaves_obligation_open_and_occupant_is_reminded() {
+fn dropped_host_leaves_obligation_open_without_reminding_a_queued_final() {
     let directory = tempfile::tempdir().expect("tempdir");
     let database = directory.path().join("kelpie.sqlite3");
     let kelpie_socket = directory.path().join("kelpie.sock");
@@ -442,16 +442,14 @@ fn dropped_host_leaves_obligation_open_and_occupant_is_reminded() {
     let (parsed_tx, parsed_rx) = mpsc::channel();
     let _herdr = spawn_prompt_herdr(&herdr_socket, parsed_tx);
     let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
-    let prompt = parsed_rx.recv().expect("reminder");
-    assert_eq!(prompt["method"], "agent.prompt");
-    let envelope = prompt["params"]["text"].as_str().expect("text");
-    assert!(
-        envelope.starts_with("<kelpie-reminder waiting=inbox"),
-        "envelope: {envelope}"
+    let recover = send_request(
+        &kelpie_socket,
+        &serde_json::json!({"id": "recover", "method": "recover", "params": {}}),
     );
+    assert!(recover.get("result").is_some(), "{recover}");
     assert!(
-        envelope.contains(&format!("reply-to={}", ask.message_id)),
-        "envelope: {envelope}"
+        parsed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "queued final must not inject a reminder"
     );
     assert_eq!(
         Store::open(&database)

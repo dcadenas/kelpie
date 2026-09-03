@@ -166,7 +166,10 @@ default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
 disables automatic nudges for that ask. The interval begins only after Herdr
 accepts the ask. When overdue, `kelpied` obtains a fresh snapshot and injects
 only if the exact owing incarnation is `idle` or `done`. Progress resets the
-interval. If an unanswered receiver first works and then reaches `idle` or
+interval. A recorded final whose delivery is `queued`, `submitted`,
+`accepted`, or `unknown` holds both interval and boundary injection until
+that delivery terminals. Rejected and `target_unavailable` finals may be
+reminded again. If an unanswered receiver first works and then reaches `idle` or
 `done`, the stopped boundary can trigger the initial reminder before the
 interval. Final reply resolution stops reminders. `reminder-snooze <ask-id>
 --until-ms MS` pauses injection, and `reminder-disable <ask-id>` stops it without
