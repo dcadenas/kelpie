@@ -379,8 +379,12 @@ logical agent's exact Ready incarnation is `idle` or `done`. A `socket_inbox`
 owing agent has no Herdr pane; Kelpie MUST NOT require reminder injection for
 that owing agent. A first observed working-to-idle/done boundary MAY trigger the
 initial reminder before the interval when no reply activity has occurred.
-Progress and final-reply activity reset its interval. An
-unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
+Progress and final-reply activity reset its interval. A recorded final reply
+whose delivery is `queued`, `submitted`, `accepted`, or `unknown` MUST NOT
+receive reminder injection until that delivery terminals. Persist is not
+resolve: waiter ACK or Herdr accept remains the only resolve. Rejected and
+`target_unavailable` finals leave the obligation open; reminders MAY resume.
+An unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
 a reminder MUST NOT resolve its obligation. Reminders are not cron and MUST NOT
 require receiver acknowledgement. Every reminder MUST carry the original ask
 body: the obligation is durable while the owing agent's context may have been
