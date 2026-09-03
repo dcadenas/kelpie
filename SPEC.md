@@ -576,8 +576,10 @@ interval of observed active occupancy away rather than immediately. Arming
 states an interval, not a request to clear now.
 
 The interval MUST accumulate only while a fresh Herdr snapshot observes the
-target incarnation as `working` or `blocked`. Time spent `idle` or `done`, and
-time with no occupancy observation, MUST NOT advance that cycle's due time.
+target incarnation as `working` or `blocked`. Time spent `idle` or `done` MUST
+NOT advance that cycle's due time. Time with no occupancy observation MUST NOT
+exhaust the interval; a sample MAY credit at most a bounded sampling allowance
+of previously unobserved time.
 This clock MUST NOT infer that idle means the work is done. A cycle already in
 `Preparing`, `Ready`, `Clearing`, `Injected`, or `TimedOut` MUST complete its
 clear and resume; occupancy MUST NOT abort it. A `socket_inbox` waiter has no

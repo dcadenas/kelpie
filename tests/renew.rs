@@ -1911,6 +1911,17 @@ fn idle_herdr_status_does_not_deliver_a_prepare() {
 
     let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
     assert_eq!(kelpie.drive_renews().expect("drive"), 0);
+    thread::sleep(Duration::from_millis(5));
+    assert_eq!(kelpie.drive_renews().expect("drive again"), 0);
+    assert_eq!(
+        kelpie
+            .store_mut()
+            .scheduled_interval_renews()
+            .expect("clocks")[0]
+            .active_remaining_ms,
+        every_ms,
+        "an idle sample must consume no remaining time"
+    );
     assert!(
         kelpie
             .store_mut()
