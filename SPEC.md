@@ -572,8 +572,16 @@ inferring it from anything else. That due time is the cycle's own and MUST NOT
 be presented as the next fire for a cycle already in flight.
 
 A policy armed with no explicit due time MUST schedule its first cycle one
-interval away rather than immediately. Arming states an interval, not a request
-to clear now.
+interval of observed active occupancy away rather than immediately. Arming
+states an interval, not a request to clear now.
+
+The interval MUST accumulate only while a fresh Herdr snapshot observes the
+target incarnation as `working` or `blocked`. Time spent `idle` or `done`, and
+time with no occupancy observation, MUST NOT advance that cycle's due time.
+This clock MUST NOT infer that idle means the work is done. A cycle already in
+`Preparing`, `Ready`, `Clearing`, `Injected`, or `TimedOut` MUST complete its
+clear and resume; occupancy MUST NOT abort it. A `socket_inbox` waiter has no
+Herdr occupancy and is not this clock. Token counts MUST NOT be the trigger.
 
 ## State machines
 
@@ -1078,6 +1086,7 @@ Herdr prompt proofs above.
 | An ended cycle owes nothing | Let a prepare deadline elapse, then verify the ask is cancelled with a reason, absent from `pending`, and no longer reminding. |
 | A cycle needs no third party | Arm a policy from one agent onto another, retire the arming agent, and verify the renewed agent can still answer its prepare and the cycle reaches `ready`. |
 | A policy cannot be armed on a name | Request a renew naming a live public name and verify it is refused, with no policy armed, over both the CLI and the socket. |
+| `--every` ignores idle occupancy | Keep a Ready agent `idle` longer than `--every` and verify it never enters Preparing; then observe `working` for that accumulated interval and verify it does. A cycle already Preparing still completes its clear. |
 | A policy aimed wrong can be undone | Arm a policy on another agent, cancel it as that agent, and verify it stops being armed, its prepare ask is settled, and a notice names the canceller and the reason. |
 | Supervision cannot be disarmed by a stranger | Cancel a policy as an agent that is neither its requester nor its target and verify the refusal names both and leaves the policy armed. |
 | A cancel never abandons an injection | Cancel a policy whose cycle is clearing and verify it is refused, the cycle still completes its resume prompt, and the refusal says to retry after the cycle. |

@@ -188,6 +188,13 @@ fn far_clear_deadline() -> i64 {
     store_clock_ms().expect("clock") + 3_600_000
 }
 
+fn earn_interval(store: &mut Store, renew_id: kelpie::domain::RenewId, every_ms: i64) {
+    let now = store_clock_ms().expect("clock");
+    store
+        .accrue_renew_occupancy(renew_id, true, now.saturating_add(every_ms))
+        .expect("earn active occupancy");
+}
+
 /// Serve every request that arrives within a short window, then stop.
 ///
 /// Bounded by time rather than by a request count: the point of these tests is
@@ -498,9 +505,18 @@ fn a_cycle_whose_clear_is_never_proven_ends_and_arms_the_next_one() {
     kelpie.drive_renews().expect("give up");
     server.join().expect("server");
 
+    let successor_id = kelpie
+        .store_mut()
+        .scheduled_interval_renews()
+        .expect("clocks")
+        .into_iter()
+        .find(|clock| clock.renew_id != renew_id)
+        .expect("the policy arms its next cycle")
+        .renew_id;
+    earn_interval(kelpie.store_mut(), successor_id, every_ms);
     let actionable = kelpie
         .store_mut()
-        .actionable_renews(store_clock_ms().expect("clock") + every_ms + 60_000)
+        .actionable_renews(store_clock_ms().expect("clock"))
         .expect("actionable");
     assert!(
         actionable.iter().all(|item| item.renew_id != renew_id),
@@ -508,8 +524,8 @@ fn a_cycle_whose_clear_is_never_proven_ends_and_arms_the_next_one() {
     );
     let successor = actionable
         .iter()
-        .find(|item| item.every_ms == Some(every_ms))
-        .expect("the policy arms its next cycle");
+        .find(|item| item.renew_id == successor_id)
+        .expect("the successor is due after active occupancy");
     assert_eq!(successor.phase, RenewPhase::Scheduled);
     assert_eq!(successor.cycle, 2);
     assert!(
@@ -668,9 +684,10 @@ fn a_skipped_cycle_does_not_disarm_the_policy_that_asked_for_it() {
         .abort_renew(policy, "prepare deadline elapsed")
         .expect("abort")
         .expect("a policy arms its successor even when a cycle is skipped");
+    earn_interval(&mut store, next, every_ms);
 
     let armed = store
-        .actionable_renews(store_clock_ms().expect("clock") + every_ms + 60_000)
+        .actionable_renews(store_clock_ms().expect("clock"))
         .expect("actionable")
         .into_iter()
         .find(|item| item.renew_id == next)
@@ -773,9 +790,10 @@ fn a_policy_rearms_with_the_next_cycle_and_a_one_shot_does_not() {
         .complete_renew(policy)
         .expect("complete")
         .expect("a policy arms its successor");
+    earn_interval(&mut store, next, 45 * 60 * 1_000);
 
     let armed = store
-        .actionable_renews(store_clock_ms().expect("clock") + 60 * 60 * 1_000)
+        .actionable_renews(store_clock_ms().expect("clock"))
         .expect("actionable")
         .into_iter()
         .find(|item| item.renew_id == next)
@@ -1698,4 +1716,126 @@ fn a_cycle_completes_when_the_agent_that_armed_it_is_gone() {
         "and the cycle is authorised to clear"
     );
     server.join().expect("server");
+}
+
+#[test]
+fn idle_occupancy_does_not_exhaust_an_every_interval() {
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+    let every_ms = 45 * 60 * 1_000;
+    let mut intent = renew_intent(&worker, Some(every_ms));
+    let armed_at = store_clock_ms().expect("clock");
+    intent.scheduled_at_ms = armed_at + every_ms;
+    let policy = store.create_renew(&intent).expect("create");
+
+    store
+        .accrue_renew_occupancy(policy, false, armed_at + every_ms + 60_000)
+        .expect("idle sample");
+    assert!(
+        store
+            .actionable_renews(armed_at + every_ms + 60_000)
+            .expect("actionable")
+            .is_empty(),
+        "wall-clock idle must not enter Preparing"
+    );
+    let clocks = store.scheduled_interval_renews().expect("clocks");
+    assert_eq!(clocks[0].active_remaining_ms, every_ms);
+}
+
+#[test]
+fn working_occupancy_exhausts_an_every_interval() {
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+    let every_ms = 45 * 60 * 1_000;
+    let mut intent = renew_intent(&worker, Some(every_ms));
+    let armed_at = store_clock_ms().expect("clock");
+    intent.scheduled_at_ms = armed_at + every_ms;
+    let policy = store.create_renew(&intent).expect("create");
+
+    earn_interval(&mut store, policy, every_ms);
+    let due = store
+        .actionable_renews(store_clock_ms().expect("clock"))
+        .expect("actionable");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].renew_id, policy);
+    assert_eq!(due[0].phase, RenewPhase::Scheduled);
+    assert_eq!(due[0].active_remaining_ms, Some(0));
+}
+
+#[test]
+fn an_in_flight_cycle_is_not_paused_by_idle_occupancy() {
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+    let renew_id = store
+        .create_renew(&renew_intent(&worker, Some(45 * 60 * 1_000)))
+        .expect("create");
+    armed_prepare(&mut store, &worker, renew_id);
+
+    let err = store
+        .accrue_renew_occupancy(renew_id, false, store_clock_ms().expect("clock") + 1)
+        .expect_err("preparing is not this clock");
+    assert!(matches!(err, kelpie::store::StoreError::Conflict(_)));
+    let item = store
+        .actionable_renews(store_clock_ms().expect("clock"))
+        .expect("actionable")
+        .into_iter()
+        .find(|item| item.renew_id == renew_id)
+        .expect("still owed");
+    assert_eq!(item.phase, RenewPhase::Preparing);
+}
+
+#[test]
+fn idle_herdr_status_does_not_deliver_a_prepare() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        serve_briefly(&listener, |request| {
+            assert_eq!(request["method"], "session.snapshot");
+            serde_json::json!({
+                "type": "session_snapshot",
+                "snapshot": {
+                    "protocol": 20,
+                    "agents": [{
+                        "terminal_id": "term-1",
+                        "pane_id": "w:p1",
+                        "name": "worker",
+                        "agent": "claude",
+                        "agent_status": "idle",
+                        "interactive_ready": true,
+                        "launch_pending": false
+                    }]
+                }
+            })
+        })
+    });
+
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+    let every_ms = 500;
+    let mut intent = renew_intent(&worker, Some(every_ms));
+    intent.scheduled_at_ms = store_clock_ms().expect("clock") + every_ms;
+    store.create_renew(&intent).expect("create");
+
+    let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+    assert_eq!(kelpie.drive_renews().expect("drive"), 0);
+    assert!(
+        kelpie
+            .store_mut()
+            .actionable_renews(store_clock_ms().expect("clock"))
+            .expect("actionable")
+            .is_empty()
+    );
+    drop(kelpie);
+    let requests = server.join().expect("server");
+    assert!(
+        !requests.is_empty(),
+        "remaining time at the sample bound must ask Herdr"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] == "session.snapshot"),
+        "idle occupancy must not submit a prepare: {requests:?}"
+    );
 }

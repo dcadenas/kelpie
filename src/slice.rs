@@ -14,8 +14,8 @@ use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply, CreatedTell,
-    DeclaredStart, DueDelivery, DueReminder, DueRenew, PendingObligation, RecoveryReport,
-    ReplyReceivePath, Store, StoreError, store_clock_ms,
+    DeclaredStart, DueDelivery, DueReminder, DueRenew, IntervalRenewClock, PendingObligation,
+    RecoveryReport, ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -26,6 +26,25 @@ use crate::store::{
 /// this deadline keeps trying, because the context is already gone and only the
 /// resume prompt can re-seed it.
 const CLEAR_ROTATION_STALL_MS: i64 = 60_000;
+
+/// How often a scheduled `--every` clock asks Herdr whether the agent is still
+/// occupying its pane. Remaining time at or below this bound is sampled every
+/// drive so a cycle that has earned its interval enters Preparing promptly.
+const RENEW_OCCUPANCY_SAMPLE_MS: i64 = 1_000;
+
+fn occupancy_sample_is_due(clock: &IntervalRenewClock, now_ms: i64) -> bool {
+    clock.active_remaining_ms <= RENEW_OCCUPANCY_SAMPLE_MS
+        || clock
+            .occupancy_sampled_at_ms
+            .is_none_or(|sampled_at| now_ms.saturating_sub(sampled_at) >= RENEW_OCCUPANCY_SAMPLE_MS)
+}
+
+fn renew_interval_accumulates(status: crate::herdr::AgentStatus) -> bool {
+    matches!(
+        status,
+        crate::herdr::AgentStatus::Working | crate::herdr::AgentStatus::Blocked
+    )
+}
 
 /// The clear command for each backend whose behaviour has been verified.
 ///
@@ -1471,6 +1490,7 @@ impl Kelpie {
             )?;
         }
         let now_ms = store_clock_ms()?;
+        self.accrue_scheduled_interval_renews(now_ms)?;
         let actionable = self.store.actionable_renews(now_ms)?;
         let mut advanced = 0;
         for item in actionable {
@@ -1516,6 +1536,37 @@ impl Kelpie {
             }
             RenewPhase::Done | RenewPhase::Aborted | RenewPhase::Terminated => Ok(false),
         }
+    }
+
+    /// Tick scheduled `--every` clocks from a fresh Herdr occupancy snapshot.
+    ///
+    /// Idle, done, unknown, and missing agents do not consume remaining time.
+    /// A snapshot failure leaves remaining unchanged rather than guessing.
+    /// In-flight cycles are not sampled: occupancy must not abort a clear.
+    fn accrue_scheduled_interval_renews(&mut self, now_ms: i64) -> Result<(), SliceError> {
+        let clocks = self.store.scheduled_interval_renews()?;
+        if !clocks
+            .iter()
+            .any(|clock| occupancy_sample_is_due(clock, now_ms))
+        {
+            return Ok(());
+        }
+        let Ok(snapshot) = self.herdr.lifecycle_snapshot() else {
+            return Ok(());
+        };
+        for clock in clocks {
+            if !occupancy_sample_is_due(&clock, now_ms) {
+                continue;
+            }
+            let accumulating = snapshot.iter().any(|live| {
+                live.agent.pane_id == clock.pane_id
+                    && live.agent.terminal_id == clock.terminal_id
+                    && renew_interval_accumulates(live.agent_status)
+            });
+            self.store
+                .accrue_renew_occupancy(clock.renew_id, accumulating, now_ms)?;
+        }
+        Ok(())
     }
 
     /// Deliver the prepare prompt as a disclosed ask and start its deadline.
@@ -3658,6 +3709,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn working_and_blocked_occupancy_accumulate_idle_does_not() {
+        assert!(renew_interval_accumulates(
+            crate::herdr::AgentStatus::Working
+        ));
+        assert!(renew_interval_accumulates(
+            crate::herdr::AgentStatus::Blocked
+        ));
+        assert!(!renew_interval_accumulates(crate::herdr::AgentStatus::Idle));
+        assert!(!renew_interval_accumulates(crate::herdr::AgentStatus::Done));
+        assert!(!renew_interval_accumulates(
+            crate::herdr::AgentStatus::Unknown
+        ));
+    }
 
     /// Serve one scripted request per connection, asserting the method order.
     fn serve_exchanges(listener: &UnixListener, exchanges: Vec<(&str, Value)>) {

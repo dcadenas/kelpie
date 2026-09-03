@@ -1126,6 +1126,17 @@ fn active_agents(report: &crate::store::FleetReport) -> Vec<&crate::store::Repor
         .collect()
 }
 
+fn cycle_due_at_ms(renew: &crate::store::ReportRenew) -> i64 {
+    if renew.phase == crate::domain::RenewPhase::Scheduled
+        && let Some(remaining) = renew.active_remaining_ms
+    {
+        return crate::store::store_clock_ms()
+            .unwrap_or(renew.scheduled_at_ms)
+            .saturating_add(remaining);
+    }
+    renew.scheduled_at_ms
+}
+
 fn report_incarnation(
     incarnation: &crate::store::ReportIncarnation,
     live: Option<&crate::slice::LiveStatus>,
@@ -1169,10 +1180,11 @@ fn report_incarnation(
             "phase": renew.phase,
             "cycle": renew.cycle,
             "every_ms": renew.every_ms,
-            // This cycle's due time, written once and never updated. It is the
-            // next fire only while the phase is `scheduled`; naming it
-            // `next_due_at_ms` would be a lie for every in-flight cycle.
-            "cycle_due_at_ms": renew.scheduled_at_ms,
+            // For a scheduled `--every` cycle this is remaining active occupancy
+            // projected onto the wall clock, so `next-in` does not run down
+            // while the incarnation is idle. For a one-shot, and for a cycle
+            // already in flight, it is the wall-clock time written when armed.
+            "cycle_due_at_ms": cycle_due_at_ms(renew),
         })),
     });
     if let Some(live) = live {
@@ -1431,10 +1443,11 @@ fn dispatch_tell(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError
 /// When a renew's first cycle comes due.
 ///
 /// An explicit due time is obeyed. Otherwise `--every 45m` means the first
-/// cycle is 45 minutes away, not now: an agent arms a policy once it has read
-/// itself in, so clearing on arming would discard exactly the context that was
-/// just paid for and re-read it a minute later. A one-shot with no due time is
-/// a request to renew now, and stays that way.
+/// cycle is 45 minutes of observed `working`/`blocked` occupancy away, not now:
+/// an agent arms a policy once it has read itself in, so clearing on arming
+/// would discard exactly the context that was just paid for and re-read it a
+/// minute later. A one-shot with no due time is a request to renew now, and
+/// stays that way.
 fn first_cycle_at_ms(due_at_ms: Option<i64>, every_ms: Option<i64>, now_ms: i64) -> i64 {
     match (due_at_ms, every_ms) {
         (Some(due_at_ms), _) => due_at_ms,

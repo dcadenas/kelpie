@@ -16,7 +16,7 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// Recorded finals whose delivery has not terminal-failed hold reminder injection.
 const NO_IN_FLIGHT_FINAL: &str = "AND NOT EXISTS (
@@ -345,6 +345,9 @@ pub struct DueRenew {
     pub prepare_timeout_ms: i64,
     pub every_ms: Option<i64>,
     pub cycle: i64,
+    /// Remaining observed active occupancy before a scheduled `--every` cycle
+    /// may enter Preparing. `None` for a one-shot, whose due time is wall-clock.
+    pub active_remaining_ms: Option<i64>,
     pub ask_message_id: Option<MessageId>,
     pub pre_clear_session_json: Option<String>,
     pub prepare_deadline_ms: Option<i64>,
@@ -468,10 +471,26 @@ pub struct ReportRenew {
     pub cycle: i64,
     /// `None` for a one-shot renew; set means a standing policy re-arms.
     pub every_ms: Option<i64>,
-    /// When *this* cycle was due. Written once at insert and never updated, so
-    /// it is the next fire only while the phase is `scheduled`; for a cycle
-    /// already in flight it is that cycle's original due time, in the past.
+    /// When *this* cycle was due.
+    ///
+    /// For a one-shot, and for a cycle already in flight, this is the wall-clock
+    /// time written when the cycle was armed. For a scheduled `--every` cycle it
+    /// is remaining active occupancy projected onto the wall clock, and it moves
+    /// while the incarnation is idle so `next-in` does not run down.
     pub scheduled_at_ms: i64,
+    /// Remaining observed `working`/`blocked` time for a scheduled `--every`
+    /// cycle. `None` for a one-shot or an in-flight cycle that no longer ticks.
+    pub active_remaining_ms: Option<i64>,
+}
+
+/// A scheduled `--every` cycle whose remaining active time still has to tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntervalRenewClock {
+    pub renew_id: RenewId,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub active_remaining_ms: i64,
+    pub occupancy_sampled_at_ms: Option<i64>,
 }
 
 /// One logical agent with its incarnations, newest first.
@@ -5012,12 +5031,20 @@ impl Store {
         }
         let renew_id = RenewId::new();
         let now = now_millis()?;
+        let (active_remaining_ms, occupancy_sampled_at_ms) = match intent.every_ms {
+            Some(_) => (
+                Some(intent.scheduled_at_ms.saturating_sub(now).max(0)),
+                Some(now),
+            ),
+            None => (None, None),
+        };
         tx.execute(
             "INSERT INTO renews
              (id, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
               resume_prompt, on_timeout, prepare_timeout_ms, every_ms, cycle,
-              scheduled_at_ms, phase, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'scheduled', ?11)",
+              scheduled_at_ms, phase, created_at_ms, active_remaining_ms,
+              occupancy_sampled_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'scheduled', ?11, ?12, ?13)",
             params![
                 renew_id.to_string(),
                 intent.logical_agent_id.to_string(),
@@ -5029,7 +5056,9 @@ impl Store {
                 intent.prepare_timeout_ms,
                 intent.every_ms,
                 intent.scheduled_at_ms,
-                now
+                now,
+                active_remaining_ms,
+                occupancy_sampled_at_ms
             ],
         )?;
         tx.commit()?;
@@ -5057,7 +5086,8 @@ impl Store {
                      WHERE o.ask_message_id = r.ask_message_id),
                     (SELECT o.last_activity_at_ms FROM obligations o
                      WHERE o.ask_message_id = r.ask_message_id
-                       AND o.state = 'resolved')
+                       AND o.state = 'resolved'),
+                    r.active_remaining_ms
              FROM renews r
              JOIN incarnations i ON i.id = r.incarnation_id
              WHERE i.state = 'ready'
@@ -5065,7 +5095,10 @@ impl Store {
                                WHERE clear.kind = 'clear'
                                  AND clear.target_incarnation_id = r.incarnation_id
                                  AND clear.outcome IN ('pending','accepted'))
-               AND ((r.phase = 'scheduled' AND r.scheduled_at_ms <= ?1)
+               AND ((r.phase = 'scheduled'
+                     AND ((r.every_ms IS NULL AND r.scheduled_at_ms <= ?1)
+                          OR (r.every_ms IS NOT NULL
+                              AND COALESCE(r.active_remaining_ms, 0) <= 0)))
                     OR r.phase IN ('preparing','ready','clearing','injected','timed_out'))
              ORDER BY r.created_at_ms",
         )?;
@@ -5092,6 +5125,7 @@ impl Store {
                 row.get::<_, Option<i64>>(18)?,
                 row.get::<_, Option<String>>(19)?,
                 row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<i64>>(21)?,
             ))
         })?;
         let mut due = Vec::new();
@@ -5119,6 +5153,7 @@ impl Store {
                 prepare_timeout_ms: row.10,
                 every_ms: row.11,
                 cycle: row.12,
+                active_remaining_ms: row.21,
                 ask_message_id: ask,
                 pre_clear_session_json: row.14,
                 prepare_deadline_ms: row.15,
@@ -5130,6 +5165,91 @@ impl Store {
             });
         }
         Ok(due)
+    }
+
+    /// Scheduled `--every` cycles that still have remaining active occupancy.
+    ///
+    /// One-shot renews and cycles that have already entered Preparing are
+    /// absent: idle occupancy must not pause a clear already in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durable IDs are malformed.
+    pub fn scheduled_interval_renews(&self) -> Result<Vec<IntervalRenewClock>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, i.observed_pane_id, i.observed_terminal_id,
+                    r.active_remaining_ms, r.occupancy_sampled_at_ms
+             FROM renews r
+             JOIN incarnations i ON i.id = r.incarnation_id
+             WHERE i.state = 'ready'
+               AND r.phase = 'scheduled'
+               AND r.every_ms IS NOT NULL
+               AND COALESCE(r.active_remaining_ms, 0) > 0
+             ORDER BY r.created_at_ms",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?;
+        let mut clocks = Vec::new();
+        for row in rows {
+            let (id, pane_id, terminal_id, remaining, sampled_at) = row?;
+            clocks.push(IntervalRenewClock {
+                renew_id: parse_renew_id(&id)?,
+                pane_id,
+                terminal_id,
+                active_remaining_ms: remaining,
+                occupancy_sampled_at_ms: sampled_at,
+            });
+        }
+        Ok(clocks)
+    }
+
+    /// Apply one occupancy sample to a scheduled `--every` cycle.
+    ///
+    /// When `accumulating` is true the elapsed time since the last sample
+    /// counts as `working`/`blocked` occupancy. Otherwise the remaining interval
+    /// is unchanged and the projected due time slides forward so idle time
+    /// cannot exhaust it. An unobserved gap (`occupancy_sampled_at_ms` NULL)
+    /// never backfills.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict unless the renew is still a scheduled interval policy.
+    pub fn accrue_renew_occupancy(
+        &mut self,
+        renew_id: RenewId,
+        accumulating: bool,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE renews
+             SET active_remaining_ms = CASE
+                    WHEN ?2 THEN MAX(0, active_remaining_ms
+                        - MAX(0, ?1 - COALESCE(occupancy_sampled_at_ms, ?1)))
+                    ELSE active_remaining_ms
+                 END,
+                 occupancy_sampled_at_ms = ?1,
+                 scheduled_at_ms = ?1 + CASE
+                    WHEN ?2 THEN MAX(0, active_remaining_ms
+                        - MAX(0, ?1 - COALESCE(occupancy_sampled_at_ms, ?1)))
+                    ELSE active_remaining_ms
+                 END
+             WHERE id = ?3 AND phase = 'scheduled' AND every_ms IS NOT NULL
+               AND active_remaining_ms IS NOT NULL",
+            params![now_ms, accumulating, renew_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "renew is not a scheduled interval policy".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Return non-terminal renews whose incarnation is no longer Ready.
@@ -5932,7 +6052,8 @@ impl Store {
                     i.created_at_ms, i.terminal_at_ms, i.terminal_reason,
                     i.native_session_rotated_at_ms,
                     o.id, o.kind, o.outcome,
-                    r.id, r.phase, r.cycle, r.every_ms, r.scheduled_at_ms
+                    r.id, r.phase, r.cycle, r.every_ms, r.scheduled_at_ms,
+                    r.active_remaining_ms
              FROM incarnations i
              LEFT JOIN operations o ON o.id = (
                 SELECT id FROM operations
@@ -5971,6 +6092,7 @@ impl Store {
                 row.get::<_, Option<i64>>(23)?,
                 row.get::<_, Option<i64>>(24)?,
                 row.get::<_, Option<i64>>(25)?,
+                row.get::<_, Option<i64>>(26)?,
             ))
         })?;
         let mut incarnations: Vec<(String, ReportIncarnation)> = Vec::new();
@@ -6011,7 +6133,7 @@ impl Store {
                         )),
                         _ => None,
                     },
-                    renew: report_renew(row.21, row.22, row.23, row.24, row.25)?,
+                    renew: report_renew(row.21, row.22, row.23, row.24, row.25, row.26)?,
                 },
             ));
         }
@@ -7014,16 +7136,18 @@ fn arm_next_renew_cycle(
         "INSERT INTO renews
          (id, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
           resume_prompt, on_timeout, prepare_timeout_ms, every_ms, cycle,
-          scheduled_at_ms, phase, created_at_ms)
+          scheduled_at_ms, phase, created_at_ms, active_remaining_ms,
+          occupancy_sampled_at_ms)
          SELECT ?1, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
                 resume_prompt, on_timeout, prepare_timeout_ms, every_ms, ?2,
-                ?3, 'scheduled', ?4
-         FROM renews WHERE id = ?5",
+                ?3, 'scheduled', ?4, ?5, ?4
+         FROM renews WHERE id = ?6",
         params![
             next_id.to_string(),
             cycle + 1,
             now.saturating_add(every_ms),
             now,
+            every_ms,
             renew_id.to_string()
         ],
     )?;
@@ -7094,13 +7218,14 @@ fn parse_renew_id(value: &str) -> Result<RenewId, StoreError> {
 /// Build the armed-renew view of one report row.
 ///
 /// Split out of `report_incarnations` so the row mapping there stays within one
-/// screen; the LEFT JOIN yields all five columns or none.
+/// screen; the LEFT JOIN yields all six columns or none.
 fn report_renew(
     id: Option<String>,
     phase: Option<String>,
     cycle: Option<i64>,
     every_ms: Option<i64>,
     scheduled_at_ms: Option<i64>,
+    active_remaining_ms: Option<i64>,
 ) -> Result<Option<ReportRenew>, StoreError> {
     let (Some(id), Some(phase), Some(cycle), Some(scheduled_at_ms)) =
         (id, phase, cycle, scheduled_at_ms)
@@ -7113,6 +7238,7 @@ fn report_renew(
         cycle,
         every_ms,
         scheduled_at_ms,
+        active_remaining_ms,
     }))
 }
 
@@ -7288,6 +7414,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 21 {
         connection.execute_batch(include_str!("../migrations/022_owing_cancellation.sql"))?;
         version = 22;
+    }
+    if version == 22 {
+        connection.execute_batch(include_str!("../migrations/023_renew_active_clock.sql"))?;
+        version = 23;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(

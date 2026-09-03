@@ -486,9 +486,12 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   `proceed` clears regardless (unsaved work is lost). A prepare timeout raises an
   operator notice either way and never disarms a policy.
   `--due-in`/`--due-at` renew once; `--every 45m` re-arms after every cycle and
-  ends only when the incarnation stops being Ready. A policy's first cycle is
-  one interval away, so arming one does not clear you on the spot. Every other
-  ending re-arms — skipped, aborted, or abandoned unproven — so a policy never
+  ends only when the incarnation stops being Ready. `--every` accumulates only
+  while Herdr observes the incarnation as `working` or `blocked`; `idle` and
+  `done` do not advance `next-in`. A policy's first cycle is one interval of
+  that active time away, so arming one does not clear you on the spot. A cycle
+  already preparing or clearing is not paused because the agent went idle. Every
+  other ending re-arms — skipped, aborted, or abandoned unproven — so a policy never
   stops quietly while the agent believes it is still supervised. Only backends with a
   verified clear protocol are accepted — `claude`, `codex`, `opencode`, `grok`,
   and `pi`; anything else fails closed as `incompatible_runtime` with code
