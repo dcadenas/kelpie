@@ -1790,6 +1790,7 @@ fn idle_occupancy_does_not_exhaust_an_every_interval() {
     let armed_at = store_clock_ms().expect("clock");
     intent.scheduled_at_ms = armed_at + every_ms;
     let policy = store.create_renew(&intent).expect("create");
+    let remaining = store.scheduled_interval_renews().expect("clocks")[0].active_remaining_ms;
 
     store
         .accrue_renew_occupancy(policy, false, armed_at + every_ms + 60_000)
@@ -1802,7 +1803,7 @@ fn idle_occupancy_does_not_exhaust_an_every_interval() {
         "wall-clock idle must not enter Preparing"
     );
     let clocks = store.scheduled_interval_renews().expect("clocks");
-    assert_eq!(clocks[0].active_remaining_ms, every_ms);
+    assert_eq!(clocks[0].active_remaining_ms, remaining);
 }
 
 #[test]
@@ -1908,6 +1909,7 @@ fn idle_herdr_status_does_not_deliver_a_prepare() {
     let mut intent = renew_intent(&worker, Some(every_ms));
     intent.scheduled_at_ms = store_clock_ms().expect("clock") + every_ms;
     store.create_renew(&intent).expect("create");
+    let remaining = store.scheduled_interval_renews().expect("clocks")[0].active_remaining_ms;
 
     let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
     assert_eq!(kelpie.drive_renews().expect("drive"), 0);
@@ -1919,7 +1921,7 @@ fn idle_herdr_status_does_not_deliver_a_prepare() {
             .scheduled_interval_renews()
             .expect("clocks")[0]
             .active_remaining_ms,
-        every_ms,
+        remaining,
         "an idle sample must consume no remaining time"
     );
     assert!(
