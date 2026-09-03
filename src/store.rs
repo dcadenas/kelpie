@@ -18,6 +18,21 @@ use crate::herdr::Snapshot;
 
 const SCHEMA_VERSION: i64 = 23;
 
+/// How often a scheduled `--every` clock asks Herdr for occupancy.
+///
+/// A sample attributes the whole gap since the last sample to one instantaneous
+/// status, so a coarser interval would mis-credit idle as working (or the
+/// reverse). One second is the tradeoff against a snapshot-and-row-update each
+/// time any policy is armed.
+pub const RENEW_OCCUPANCY_SAMPLE_MS: i64 = 1_000;
+
+/// Largest gap a sample may credit as observed occupancy.
+///
+/// Anything larger is unobserved (kelpied was down, Herdr was silent) and MUST
+/// NOT exhaust the interval. Continuous sampling under
+/// [`RENEW_OCCUPANCY_SAMPLE_MS`] stays inside this bound.
+pub const RENEW_OCCUPANCY_MAX_CREDIT_MS: i64 = RENEW_OCCUPANCY_SAMPLE_MS * 2;
+
 /// Recorded finals whose delivery has not terminal-failed hold reminder injection.
 const NO_IN_FLIGHT_FINAL: &str = "AND NOT EXISTS (
     SELECT 1 FROM messages inflight
@@ -473,10 +488,12 @@ pub struct ReportRenew {
     pub every_ms: Option<i64>,
     /// When *this* cycle was due.
     ///
-    /// For a one-shot, and for a cycle already in flight, this is the wall-clock
-    /// time written when the cycle was armed. For a scheduled `--every` cycle it
-    /// is remaining active occupancy projected onto the wall clock, and it moves
-    /// while the incarnation is idle so `next-in` does not run down.
+    /// For a scheduled `--every` cycle this is remaining active occupancy
+    /// projected onto the wall clock, and it moves while the incarnation is
+    /// idle so `next-in` does not run down. For a one-shot it is the wall-clock
+    /// time written when the cycle was armed. For a cycle already in flight it
+    /// is the instant that cycle left `scheduled` (when remaining hit zero),
+    /// already past.
     pub scheduled_at_ms: i64,
     /// Remaining observed `working`/`blocked` time for a scheduled `--every`
     /// cycle. `None` for a one-shot or an in-flight cycle that no longer ticks.
@@ -5213,10 +5230,11 @@ impl Store {
     /// Apply one occupancy sample to a scheduled `--every` cycle.
     ///
     /// When `accumulating` is true the elapsed time since the last sample
-    /// counts as `working`/`blocked` occupancy. Otherwise the remaining interval
-    /// is unchanged and the projected due time slides forward so idle time
-    /// cannot exhaust it. An unobserved gap (`occupancy_sampled_at_ms` NULL)
-    /// never backfills.
+    /// counts as `working`/`blocked` occupancy, but only when that gap is at
+    /// most [`RENEW_OCCUPANCY_MAX_CREDIT_MS`]. A larger gap, or a NULL last
+    /// sample, is unobserved and does not consume remaining time. Otherwise the
+    /// remaining interval is unchanged and the projected due time slides
+    /// forward so idle time cannot exhaust it.
     ///
     /// # Errors
     ///
@@ -5229,20 +5247,29 @@ impl Store {
     ) -> Result<(), StoreError> {
         let changed = self.connection.execute(
             "UPDATE renews
-             SET active_remaining_ms = CASE
-                    WHEN ?2 THEN MAX(0, active_remaining_ms
-                        - MAX(0, ?1 - COALESCE(occupancy_sampled_at_ms, ?1)))
-                    ELSE active_remaining_ms
-                 END,
+             SET active_remaining_ms = MAX(0, active_remaining_ms - CASE
+                    WHEN ?2
+                     AND occupancy_sampled_at_ms IS NOT NULL
+                     AND MAX(0, ?1 - occupancy_sampled_at_ms) <= ?4
+                    THEN MAX(0, ?1 - occupancy_sampled_at_ms)
+                    ELSE 0
+                 END),
                  occupancy_sampled_at_ms = ?1,
-                 scheduled_at_ms = ?1 + CASE
-                    WHEN ?2 THEN MAX(0, active_remaining_ms
-                        - MAX(0, ?1 - COALESCE(occupancy_sampled_at_ms, ?1)))
-                    ELSE active_remaining_ms
-                 END
+                 scheduled_at_ms = ?1 + MAX(0, active_remaining_ms - CASE
+                    WHEN ?2
+                     AND occupancy_sampled_at_ms IS NOT NULL
+                     AND MAX(0, ?1 - occupancy_sampled_at_ms) <= ?4
+                    THEN MAX(0, ?1 - occupancy_sampled_at_ms)
+                    ELSE 0
+                 END)
              WHERE id = ?3 AND phase = 'scheduled' AND every_ms IS NOT NULL
                AND active_remaining_ms IS NOT NULL",
-            params![now_ms, accumulating, renew_id.to_string()],
+            params![
+                now_ms,
+                accumulating,
+                renew_id.to_string(),
+                RENEW_OCCUPANCY_MAX_CREDIT_MS
+            ],
         )?;
         if changed != 1 {
             return Err(StoreError::Conflict(

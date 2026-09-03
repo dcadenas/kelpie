@@ -1182,8 +1182,9 @@ fn report_incarnation(
             "every_ms": renew.every_ms,
             // For a scheduled `--every` cycle this is remaining active occupancy
             // projected onto the wall clock, so `next-in` does not run down
-            // while the incarnation is idle. For a one-shot, and for a cycle
-            // already in flight, it is the wall-clock time written when armed.
+            // while the incarnation is idle. For a one-shot it is the arming
+            // due time. For a cycle already in flight it is when that cycle
+            // left `scheduled`.
             "cycle_due_at_ms": cycle_due_at_ms(renew),
         })),
     });
@@ -1542,6 +1543,13 @@ fn dispatch_renew(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceErro
                 .into(),
         )));
     };
+    if params.every_ms.is_some() && params.due_at_ms.is_some() {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "renew accepts either a one-shot due time or every_ms, not both: every_ms re-arms \
+             itself after each cycle"
+                .into(),
+        )));
+    }
     let scheduled_at_ms = first_cycle_at_ms(
         params.due_at_ms,
         params.every_ms,
@@ -1952,10 +1960,10 @@ mod tests {
             1_000 + every_ms,
             "arming a policy is not a request to clear right now"
         );
-        // A one-shot with no due time still means now, and an explicit due time
-        // outranks both.
+        // A one-shot with no due time still means now. An explicit due time is
+        // a one-shot; combining it with `--every` is refused before this runs.
         assert_eq!(first_cycle_at_ms(None, None, 1_000), 1_000);
-        assert_eq!(first_cycle_at_ms(Some(50), Some(every_ms), 1_000), 50);
+        assert_eq!(first_cycle_at_ms(Some(50), None, 1_000), 50);
     }
 
     fn ask_params(remind_after_ms: Option<i64>, no_remind: bool) -> AskParams {

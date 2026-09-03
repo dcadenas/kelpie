@@ -15,7 +15,7 @@ use crate::herdr::{HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply, CreatedTell,
     DeclaredStart, DueDelivery, DueReminder, DueRenew, IntervalRenewClock, PendingObligation,
-    RecoveryReport, ReplyReceivePath, Store, StoreError, store_clock_ms,
+    RENEW_OCCUPANCY_SAMPLE_MS, RecoveryReport, ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
 /// How long a clear may go unproven before the silence is reported.
@@ -26,11 +26,6 @@ use crate::store::{
 /// this deadline keeps trying, because the context is already gone and only the
 /// resume prompt can re-seed it.
 const CLEAR_ROTATION_STALL_MS: i64 = 60_000;
-
-/// How often a scheduled `--every` clock asks Herdr whether the agent is still
-/// occupying its pane. Remaining time at or below this bound is sampled every
-/// drive so a cycle that has earned its interval enters Preparing promptly.
-const RENEW_OCCUPANCY_SAMPLE_MS: i64 = 1_000;
 
 fn occupancy_sample_is_due(clock: &IntervalRenewClock, now_ms: i64) -> bool {
     clock.active_remaining_ms <= RENEW_OCCUPANCY_SAMPLE_MS

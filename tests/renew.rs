@@ -189,10 +189,16 @@ fn far_clear_deadline() -> i64 {
 }
 
 fn earn_interval(store: &mut Store, renew_id: kelpie::domain::RenewId, every_ms: i64) {
-    let now = store_clock_ms().expect("clock");
-    store
-        .accrue_renew_occupancy(renew_id, true, now.saturating_add(every_ms))
-        .expect("earn active occupancy");
+    let mut t = store_clock_ms().expect("clock");
+    let mut earned = 0;
+    while earned < every_ms {
+        let step = 1_000.min(every_ms - earned);
+        t = t.saturating_add(step);
+        store
+            .accrue_renew_occupancy(renew_id, true, t)
+            .expect("earn active occupancy");
+        earned += step;
+    }
 }
 
 /// Serve every request that arrives within a short window, then stop.
@@ -1640,6 +1646,57 @@ fn the_renew_rpc_will_not_resolve_an_alias() {
     );
 }
 
+#[test]
+fn the_renew_rpc_refuses_every_combined_with_a_due_time() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let _listener = UnixListener::bind(&herdr_socket).expect("bind herdr");
+
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+
+    let kelpie = Kelpie::new(
+        store,
+        HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
+    );
+    let mut daemon = kelpie::daemon::Daemon::bind(&kelpie_socket, kelpie).expect("daemon");
+
+    let response = daemon_rpc(
+        &mut daemon,
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "r",
+            "method": "renew",
+            "params": {
+                "requester": worker.logical_agent_id.to_string(),
+                "recipient": worker.logical_agent_id.to_string(),
+                "recipient_incarnation": worker.incarnation_id.to_string(),
+                "prepare_prompt": "checkpoint",
+                "prompt": "resume",
+                "on_timeout": "abort",
+                "prepare_timeout_ms": 60_000,
+                "every_ms": 2_700_000,
+                "due_at_ms": store_clock_ms().expect("clock") + 3_600_000
+            }
+        }),
+    );
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("the combination is refused");
+    assert!(message.contains("not both"), "and says why: {message}");
+
+    let after = daemon_rpc(
+        &mut daemon,
+        &kelpie_socket,
+        &serde_json::json!({"id":"r2","method":"report","params":{}}),
+    );
+    assert!(
+        armed_renew(&after).is_none(),
+        "and nothing was armed: {after}"
+    );
+}
+
 /// A renew cycle must not depend on any agent other than the one being cleared.
 ///
 /// The prepare obligation is what authorises the clear, and an obligation
@@ -1740,6 +1797,31 @@ fn idle_occupancy_does_not_exhaust_an_every_interval() {
     );
     let clocks = store.scheduled_interval_renews().expect("clocks");
     assert_eq!(clocks[0].active_remaining_ms, every_ms);
+}
+
+#[test]
+fn an_unobserved_working_gap_does_not_exhaust_an_every_interval() {
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");
+    let every_ms = 45 * 60 * 1_000;
+    let mut intent = renew_intent(&worker, Some(every_ms));
+    let armed_at = store_clock_ms().expect("clock");
+    intent.scheduled_at_ms = armed_at + every_ms;
+    let policy = store.create_renew(&intent).expect("create");
+    let remaining = store.scheduled_interval_renews().expect("clocks")[0].active_remaining_ms;
+
+    store
+        .accrue_renew_occupancy(policy, true, armed_at + every_ms)
+        .expect("stale working sample");
+    assert!(
+        store
+            .actionable_renews(armed_at + every_ms)
+            .expect("actionable")
+            .is_empty(),
+        "a kelpied-down gap must not count as observed occupancy"
+    );
+    let clocks = store.scheduled_interval_renews().expect("clocks");
+    assert_eq!(clocks[0].active_remaining_ms, remaining);
 }
 
 #[test]

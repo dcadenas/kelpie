@@ -468,12 +468,12 @@ one, and adoption restores addressing without restoring the policy.
 `cycle_due_at_ms` is the due time of the cycle named by `phase`. For a
 scheduled `--every` cycle it is remaining active occupancy (`working` or
 `blocked`) projected onto the wall clock, so `next-in` does not run down while
-the incarnation is `idle` or `done`. For a one-shot, and for a cycle already in
-flight, it is the wall-clock time written when that cycle was armed, already
-past once the cycle has started. The client renders `next-in=` only for a
-scheduled cycle for that reason. `renew_id` names the cycle, not the rule: a
-standing policy mints a new id for each successor, so continuity is `every_ms`
-plus a rising `cycle`, not a stable id.
+the incarnation is `idle` or `done`. For a one-shot it is the wall-clock time
+written when that cycle was armed. For a cycle already in flight it is the
+instant that cycle left `scheduled`, already past. The client renders
+`next-in=` only for a scheduled cycle for that reason. `renew_id` names the
+cycle, not the rule: a standing policy mints a new id for each successor, so
+continuity is `every_ms` plus a rising `cycle`, not a stable id.
 
 The report never interprets. No state is labelled healthy, stuck, or missing,
 because whether a state warrants attention is the consumer's policy. Requested
