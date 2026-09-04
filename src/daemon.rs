@@ -2373,9 +2373,7 @@ impl Daemon {
                     error,
                 } => match self.herdr_owners.get(&job_id).copied() {
                     Some(HerdrOwner::Prompt) => self.fail_parked_prompt(job_id, Err(error)),
-                    Some(HerdrOwner::Start) => {
-                        self.fail_parked_start(job_id, SliceError::Herdr(error));
-                    }
+                    Some(HerdrOwner::Start) => self.on_start_failed(job_id, error),
                     Some(HerdrOwner::ReminderSnapshot) => {
                         self.reminder_job = None;
                         self.pending_reminders = None;
@@ -2533,6 +2531,30 @@ impl Daemon {
                 let _ = lease.send(LeaseCmd::Drop);
                 self.fail_parked_start(job_id, error);
             }
+        }
+    }
+
+    /// Route a failed start job by what the failure proves.
+    ///
+    /// A `Rejected` error during `Sending` means Herdr read the `agent.start`
+    /// and answered no: a decisive outcome that belongs to
+    /// [`Kelpie::apply_agent_start_result`], which retries a busy pane within
+    /// its budget and records every other refusal against the operation. Only
+    /// that path can reach the busy retry; answering the client straight from
+    /// the lease failure left the operation `pending` and the pane untried.
+    /// Transport failures keep their existing fast fail.
+    fn on_start_failed(&mut self, job_id: u64, error: HerdrError) {
+        let rejected_while_sending = matches!(error, HerdrError::Rejected { .. })
+            && self.start_index_for_job(job_id).is_some_and(|index| {
+                matches!(
+                    self.awaiting_starts[index].phase,
+                    StartPhase::Sending { .. }
+                )
+            });
+        if rejected_while_sending {
+            self.on_start_done(job_id, Err(error));
+        } else {
+            self.fail_parked_start(job_id, SliceError::Herdr(error));
         }
     }
 
