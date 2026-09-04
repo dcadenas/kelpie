@@ -660,15 +660,37 @@ impl Kelpie {
                 return Ok(report);
             };
             crate::test_fault::pause("name_projection_after_intent_before_write");
-            self.herdr
-                .rename_agent(&work.request_id, &work.pane_id, &work.new_name)
-                .map_err(|source| {
-                    self.apply_rename_write_error(&work, source)
-                        .expect_err("name projection repair error must fail")
-                })?;
+            if let Err(source) =
+                self.herdr
+                    .rename_agent(&work.request_id, &work.pane_id, &work.new_name)
+            {
+                let error = self
+                    .apply_rename_write_error(&work, source)
+                    .expect_err("name projection repair error must fail");
+                self.store.create_operator_notice(&format!(
+                    "name projection repair for incarnation {} could not be applied: {error}",
+                    work.incarnation_id
+                ))?;
+                return self.recover_with_snapshot(&snapshot);
+            }
             crate::test_fault::pause("name_projection_after_response_before_commit");
-            let confirmed = self.blocking_snapshot()?;
-            self.commit_rename_confirm(&work, &confirmed)?;
+            let confirmed = match self.blocking_snapshot() {
+                Ok(confirmed) => confirmed,
+                Err(error) => {
+                    self.store.create_operator_notice(&format!(
+                        "name projection repair for incarnation {} could not be confirmed: {error}",
+                        work.incarnation_id
+                    ))?;
+                    return self.recover_with_snapshot(&snapshot);
+                }
+            };
+            if let Err(error) = self.commit_rename_confirm(&work, &confirmed) {
+                self.store.create_operator_notice(&format!(
+                    "name projection repair for incarnation {} could not be confirmed: {error}",
+                    work.incarnation_id
+                ))?;
+                return self.recover_with_snapshot(&confirmed);
+            }
             names_reprojected += 1;
         }
     }
@@ -6173,6 +6195,59 @@ mod tests {
                 .obligation_state(ask.message_id)
                 .expect("obligation"),
             crate::domain::ObligationState::Open
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn startup_recovery_survives_a_refused_name_projection() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = thread::spawn(move || {
+            serve_exchanges(
+                &listener,
+                vec![
+                    (
+                        "ping",
+                        serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                    ),
+                    ("session.snapshot", unnamed_foobar_snapshot()),
+                    (
+                        "agent.rename",
+                        serde_json::json!({"error":{
+                            "code":"agent_name_taken","message":"name is live elsewhere"
+                        }}),
+                    ),
+                ],
+            );
+        });
+        let mut store = Store::in_memory().expect("store");
+        let prior = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("refused-repair"),
+                &foobar_pane_evidence(),
+            )
+            .expect("prior");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+
+        let report = kelpie.recover().expect("startup recovery stays available");
+        assert_eq!(report.names_reprojected, 0);
+        assert_eq!(report.incarnations_marked_lost, 0);
+        assert_eq!(
+            kelpie
+                .store()
+                .incarnation_state(prior.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Ready
+        );
+        assert!(
+            kelpie
+                .store_mut()
+                .operator_notices()
+                .expect("notices")
+                .iter()
+                .any(|notice| notice.body.contains("could not be applied"))
         );
         server.join().expect("server");
     }

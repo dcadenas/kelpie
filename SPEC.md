@@ -99,9 +99,10 @@ maintain an independent opinion about whether a terminal or process is alive.
 The Herdr agent name is a projection of Kelpie's desired public name. A missing
 name MUST NOT by itself invalidate a Ready binding; Kelpie MUST repair that
 projection only when the recorded pane and terminal still identify the live
-seat and no different live name claims it. Automatic continuation MUST use a
-recorded pane-and-terminal seat, MUST NOT require a backend-kind match, and MUST
-fail closed when more than one logical agent matches that seat.
+seat, the current incarnation's backend still matches, and no different live
+name claims it. A backend change ends the current incarnation but MUST NOT
+prevent automatic continuation of its logical agent on that recorded seat.
+Continuation MUST fail closed when more than one logical agent matches the seat.
 
 ## System boundary
 

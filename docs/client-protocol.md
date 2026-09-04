@@ -611,10 +611,11 @@ before invoking this method.
 snapshot. A missing Herdr name on the recorded pane and terminal is repairable
 projection drift: Kelpie records the intent, restores its desired name through
 `agent.rename`, confirms it with another snapshot, and reports the count as
-`names_reprojected`. A present different name fails closed. A missing seat marks
-the incarnation Lost. Backend kind and native session are refreshed runtime
-observations, not identity preconditions. Recovery preserves logical identity,
-messages, obligations, and the recorded working directory.
+`names_reprojected`. A present different name fails closed. A missing seat or
+backend replacement marks the incarnation Lost, but a later adoption on the
+same recorded seat continues its logical agent without requiring the backend to
+match. Native sessions are refreshed observations. Recovery preserves logical
+identity, messages, obligations, and the recorded working directory.
 
 `kelpie` is the local client. Ordinary use is typed (`kelpie tell NAME --stdin`,
 `kelpie ask NAME --file PATH [--due-at-ms MS]`, `kelpie reply ASK --final --stdin`,

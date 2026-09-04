@@ -129,10 +129,11 @@ explicitly. Do not rename them to match the package.
 - **A binding is anchored by its pane + terminal seat.** Kelpie owns the desired
   public name and projects it into Herdr; a missing Herdr name is drift to repair,
   while a present different name fails closed. Backend kind and the native
-  session reference are runtime evidence, not identity preconditions. A live
-  agent can rotate its conversation or change backend while preserving logical
-  identity, so reconciliation refreshes those observations instead of requiring
-  them to match.
+  session reference are runtime evidence, not logical-identity preconditions.
+  A backend change ends the current incarnation but does not prevent the same
+  logical agent from continuing in a new incarnation on that recorded seat.
+  A native-session rotation keeps the current incarnation and refreshes the
+  recorded observation.
 - **Recovery is idempotent.** Repeating it against unchanged durable + Herdr state
   produces no new external effects.
 

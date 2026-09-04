@@ -628,9 +628,10 @@ Each request has `id`, `method`, and `params`. The daemon supports:
 - `recover`: obtain a fresh Herdr snapshot and reconcile durable records. A
   missing name on the recorded pane and terminal is projection drift: Kelpie
   records repair intent, restores the desired name, and confirms it. A present
-  different name fails closed. Backend and native session are runtime evidence,
-  not identity preconditions. Exact seat absence is required to complete
-  retirement.
+  different name fails closed. A backend replacement ends the current
+  incarnation but does not prevent a new incarnation from continuing the same
+  logical agent on that seat. Native sessions are refreshed observations. Exact
+  seat absence is required to complete retirement.
 - `notice.create` and `notice.list`: write and inspect durable operator notices.
 
 Read `docs/client-protocol.md` and `SPEC.md` in the release for exact fields.

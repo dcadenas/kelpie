@@ -922,7 +922,21 @@ impl Store {
                 && continued.as_deref() != Some(obligation.responder_agent_id.as_str())
         });
         if foreign_unresolved {
-            return Err(StoreError::Conflict(Self::name_conflict_message(&info)));
+            let seat_match = if let Some(id) = intent.logical_agent_id {
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM incarnations
+                         WHERE logical_agent_id = ?1 AND observed_pane_id = ?2
+                           AND observed_terminal_id = ?3)",
+                    params![id.to_string(), evidence.pane_id, evidence.terminal_id],
+                    |row| row.get(0),
+                )?;
+                matches.then_some(id)
+            } else {
+                None
+            };
+            return Err(StoreError::Conflict(Self::name_conflict_message(
+                &info, seat_match,
+            )));
         }
         let logical_agent_id = if let Some(existing) = intent.logical_agent_id {
             let found: Option<String> = tx
@@ -3190,15 +3204,20 @@ impl Store {
     /// different name. The refusal names the prior agent id, the unresolved
     /// count, and both remedies; the asks themselves are here so the operator
     /// does not re-derive the diagnosis by hand.
-    fn name_conflict_message(info: &NameInfo) -> String {
-        let prior = info
-            .claimants
-            .iter()
-            .max_by_key(|claimant| {
-                (
-                    claimant.unresolved_count,
-                    std::cmp::Reverse(claimant.logical_agent_id.clone()),
-                )
+    fn name_conflict_message(info: &NameInfo, seat_match: Option<LogicalAgentId>) -> String {
+        let prior = seat_match
+            .and_then(|id| {
+                info.claimants
+                    .iter()
+                    .find(|claimant| claimant.logical_agent_id == id.to_string())
+            })
+            .or_else(|| {
+                info.claimants.iter().max_by_key(|claimant| {
+                    (
+                        claimant.unresolved_count,
+                        std::cmp::Reverse(claimant.logical_agent_id.clone()),
+                    )
+                })
             })
             .cloned()
             .expect("a refusal is only composed when an obligation has a claimant");
@@ -3244,15 +3263,34 @@ impl Store {
             .expect("a refusal is only composed when an obligation exists");
         let _ = write!(
             text,
-            "\nremedies:\n  - continue that agent: kelpie adopt --pane <pane> \
-             --terminal <terminal> --logical-id {}\n  - cancel each ask, e.g.: \
+            "\nremedies (recorded seat match first):\n  - continue logical agent {}{}: \
+             kelpie adopt --pane <pane> \
+             --terminal <terminal> --logical-id {}",
+            prior.logical_agent_id,
+            if seat_match.is_some() {
+                " (matches this pane and terminal)"
+            } else {
+                ""
+            },
+            prior.logical_agent_id,
+        );
+        for claimant in &info.claimants {
+            if claimant.logical_agent_id != prior.logical_agent_id {
+                let _ = write!(
+                    text,
+                    "\n  - other claimant {} (no recorded match for this pane and terminal): \
+                     inspect before using adopt --logical-id",
+                    claimant.logical_agent_id
+                );
+            }
+        }
+        let _ = write!(
+            text,
+            "\n  - cancel each ask, e.g.: \
              kelpie cancel {} --reason \"<why>\" --sender-id {}\n  - or take a \
              different name: rename this agent in herdr, then run kelpie adopt\
              \nkelpie who {} --history shows the full picture any time",
-            prior.logical_agent_id,
-            example.ask_message_id,
-            example.asker_agent_id,
-            info.public_name,
+            example.ask_message_id, example.asker_agent_id, info.public_name,
         );
         text
     }
@@ -4238,8 +4276,8 @@ impl Store {
         if ids.len() != 1 {
             return Err(StoreError::Conflict(format!(
                 "pane {pane_id} terminal {terminal_id} has {} continuable logical agents; \
-                 candidates ranked by recorded seat evidence: {}; adopt --logical-id to \
-                 continue the intended one",
+                 all candidates match that recorded seat (newest incarnation first): {}; \
+                 adopt --logical-id to continue the intended one",
                 ids.len(),
                 ids.join(", ")
             )));
@@ -12614,7 +12652,7 @@ mod tests {
         );
         assert!(message.contains("adopt --logical-id"), "{message}");
         assert!(
-            message.contains("ranked by recorded seat evidence"),
+            message.contains("all candidates match that recorded seat"),
             "{message}"
         );
         assert!(
@@ -12686,6 +12724,58 @@ mod tests {
                 .to_string()
                 .contains(&holder.logical_agent_id.to_string()),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn adopt_refusal_ranks_the_recorded_seat_before_an_obligation_holder() {
+        let mut store = Store::in_memory().expect("store");
+        let seat_match = store
+            .declare_adopt(&adopt_intent("seat-match"), &ready_evidence())
+            .expect("seat match");
+        mark_lost(&store, seat_match.incarnation_id);
+
+        let obligation_holder = store
+            .declare_start(&intent("preexisting", "term-other", "obligation-holder"))
+            .expect("obligation holder");
+        mark_ready(&mut store, obligation_holder, "preexisting", "term-other");
+        mark_lost(&store, obligation_holder.incarnation_id);
+        let waiting = store
+            .declare_start(&intent("waiting", "term-w", "rank-waiting"))
+            .expect("waiting");
+        store
+            .create_ask(
+                waiting.logical_agent_id,
+                obligation_holder.logical_agent_id,
+                obligation_holder.incarnation_id,
+                "unrelated debt",
+                "rank-ask",
+            )
+            .expect("ask");
+
+        let mut continuation = adopt_intent("ranked-continuation");
+        continuation.logical_agent_id = Some(seat_match.logical_agent_id);
+        let error = store
+            .declare_adopt(&continuation, &ready_evidence())
+            .expect_err("foreign obligation still refuses reuse");
+        let message = error.to_string();
+        let remedies = message
+            .split_once("remedies")
+            .map(|(_, remedies)| remedies)
+            .expect("remedies section");
+        let seat_position = remedies
+            .find(&seat_match.logical_agent_id.to_string())
+            .expect("seat candidate named");
+        let obligation_position = remedies
+            .find(&obligation_holder.logical_agent_id.to_string())
+            .expect("obligation holder named");
+        assert!(
+            seat_position < obligation_position,
+            "the recorded seat candidate must be the first remedy: {message}"
+        );
+        assert!(
+            message.contains("matches this pane and terminal"),
+            "{message}"
         );
     }
 
@@ -12854,7 +12944,7 @@ mod tests {
                 last_activity_at_ms: 2,
             }],
         };
-        let message = Store::name_conflict_message(&info);
+        let message = Store::name_conflict_message(&info, None);
         assert!(message.contains("1 unresolved obligation(s)"), "{message}");
         assert!(
             message.contains("ask 01a008ed-ask (in_progress)"),
