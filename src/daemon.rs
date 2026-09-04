@@ -4711,20 +4711,17 @@ fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdenti
         };
     }
     let pane_id = params.pane_id.as_deref().unwrap_or_default();
-    kelpie
+    match kelpie
         .store()
-        .ready_identity_for_pane(pane_id)
-        .map(|identity| WhoIdentity::Incarnation(identity.incarnation_id))
-        .map_err(|error| {
-            SliceError::Store(match error {
-                StoreError::Conflict(_) => StoreError::Conflict(format!(
-                    "pane {pane_id} has no Ready Kelpie identity; if it has a live agent, run \
-                     kelpie who from that pane to adopt it, or use kelpie adopt with its exact \
-                     pane and terminal"
-                )),
-                other => other,
-            })
-        })
+        .find_ready_identity_for_pane(pane_id)
+        .map_err(SliceError::Store)?
+    {
+        Some(identity) => Ok(WhoIdentity::Incarnation(identity.incarnation_id)),
+        None => Err(SliceError::Store(StoreError::Conflict(format!(
+            "pane {pane_id} has no Ready Kelpie identity; if it has a live agent, run kelpie who \
+             from that pane to adopt it, or use kelpie adopt with its exact pane and terminal"
+        )))),
+    }
 }
 
 fn who_selector_count(params: &WhoParams) -> usize {
@@ -7360,6 +7357,90 @@ mod tests {
         }
         herdr.join().expect("Herdr");
         assert_eq!(snapshot_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unnamed_pane_who_refresh_renames_and_answers_after_confirmation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
+        let herdr = thread::spawn(move || {
+            for (method, result) in [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({
+                        "type":"session_snapshot",
+                        "snapshot":{
+                            "protocol":20,
+                            "panes":[{"pane_id":"w9:p9","terminal_id":"term-9","cwd":"/tmp/ghostwork"}],
+                            "agents":[{"pane_id":"w9:p9","terminal_id":"term-9","agent":"codex","interactive_ready":true,"launch_pending":false}]
+                        }
+                    }),
+                ),
+                (
+                    "agent.rename",
+                    serde_json::json!({
+                        "type":"agent_renamed",
+                        "agent":{"pane_id":"w9:p9","terminal_id":"term-9","name":"ghostwork","agent":"codex","interactive_ready":true,"launch_pending":false}
+                    }),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({
+                        "type":"session_snapshot",
+                        "snapshot":{
+                            "protocol":20,
+                            "panes":[{"pane_id":"w9:p9","terminal_id":"term-9","cwd":"/tmp/ghostwork"}],
+                            "agents":[{"pane_id":"w9:p9","terminal_id":"term-9","name":"ghostwork","agent":"codex","interactive_ready":true,"launch_pending":false}]
+                        }
+                    }),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request");
+                assert_eq!(request["method"], method);
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("finish");
+            }
+        });
+        let kelpie = Kelpie::new(
+            Store::in_memory().expect("store"),
+            HerdrClient::new(&herdr_socket, Duration::from_secs(2)),
+        );
+        let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
+        let client = thread::spawn(move || {
+            send_request(
+                &kelpie_socket,
+                &serde_json::json!({
+                    "id":"who-unnamed",
+                    "method":"who",
+                    "params":{"pane_id":"w9:p9","lazy_adopt_key":"adopt-unnamed","refresh":true}
+                }),
+            )
+        });
+        let started = Instant::now();
+        while !client.is_finished() {
+            daemon.poll().expect("poll");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        let response = client.join().expect("client");
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["public_name"], "ghostwork");
+        assert_eq!(response["result"]["addressable"], true);
+        herdr.join().expect("Herdr");
     }
 
     #[test]
