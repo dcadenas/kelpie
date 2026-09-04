@@ -7843,6 +7843,7 @@ mod tests {
         );
 
         let (stream, _peer) = UnixStream::pair().expect("report stream pair");
+        stream.set_nonblocking(true).expect("non-blocking report");
         let expired = AwaitingWrite {
             stream,
             bytes: vec![b'x'; 1024 * 1024],
