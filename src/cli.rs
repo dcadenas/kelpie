@@ -88,7 +88,7 @@ pub enum Command {
         target: Option<Caller>,
     },
     Who {
-        target: AttributionTarget,
+        target: Option<AttributionTarget>,
         adopt_caller: bool,
         history: bool,
         refresh: bool,
@@ -1017,9 +1017,9 @@ fn parse_who(args: &[String]) -> Result<Command, String> {
     let history = tokens.take_bool("--history")?;
     let refresh = tokens.take_bool("--refresh")?;
     let adopt_caller = args[1..].iter().all(|arg| arg == "--refresh");
-    let target = take_attribution_target(&mut tokens, "who")?;
+    let target = take_optional_attribution_target(&mut tokens, "who")?;
     tokens.finish("who")?;
-    if history && !matches!(target, AttributionTarget::Alias(_)) {
+    if history && !matches!(target, Some(AttributionTarget::Alias(_))) {
         return Err("who --history requires an alias".into());
     }
     if history && refresh {
@@ -1063,21 +1063,30 @@ fn take_attribution_target(
     tokens: &mut Tokens<'_>,
     command: &str,
 ) -> Result<AttributionTarget, String> {
+    take_optional_attribution_target(tokens, command)?
+        .or_else(|| {
+            std::env::var("HERDR_PANE_ID")
+                .ok()
+                .filter(|pane| !pane.is_empty())
+                .map(AttributionTarget::Pane)
+        })
+        .ok_or_else(|| "cannot resolve caller; set HERDR_PANE_ID or pass a target".into())
+}
+
+fn take_optional_attribution_target(
+    tokens: &mut Tokens<'_>,
+    command: &str,
+) -> Result<Option<AttributionTarget>, String> {
     let incarnation_id = tokens.take_value("--incarnation-id")?;
     let agent_id = tokens.take_value("--agent-id")?;
     let pane = tokens.take_value("--pane")?;
     let alias = tokens.take_positional();
     Ok(match (incarnation_id, agent_id, pane, alias) {
-        (Some(id), None, None, None) => AttributionTarget::Incarnation(id),
-        (None, Some(id), None, None) => AttributionTarget::Agent(id),
-        (None, None, Some(pane), None) => AttributionTarget::Pane(pane),
-        (None, None, None, Some(alias)) => AttributionTarget::Alias(alias),
-        (None, None, None, None) => AttributionTarget::Pane(
-            std::env::var("HERDR_PANE_ID")
-                .ok()
-                .filter(|pane| !pane.is_empty())
-                .ok_or("cannot resolve caller; set HERDR_PANE_ID or pass a target")?,
-        ),
+        (Some(id), None, None, None) => Some(AttributionTarget::Incarnation(id)),
+        (None, Some(id), None, None) => Some(AttributionTarget::Agent(id)),
+        (None, None, Some(pane), None) => Some(AttributionTarget::Pane(pane)),
+        (None, None, None, Some(alias)) => Some(AttributionTarget::Alias(alias)),
+        (None, None, None, None) => None,
         _ => {
             return Err(format!(
                 "{command} accepts exactly one target: a name, --pane, --agent-id, or \
@@ -2417,7 +2426,7 @@ mod tests {
             by_agent,
             Invocation::Typed {
                 command: Command::Who {
-                    target: AttributionTarget::Agent(ref id),
+                    target: Some(AttributionTarget::Agent(ref id)),
                     adopt_caller: false,
                     history: false,
                     refresh: false,
@@ -2431,7 +2440,7 @@ mod tests {
             history,
             Invocation::Typed {
                 command: Command::Who {
-                    target: AttributionTarget::Alias(ref alias),
+                    target: Some(AttributionTarget::Alias(ref alias)),
                     adopt_caller: false,
                     history: true,
                     ..
@@ -2441,6 +2450,18 @@ mod tests {
         ));
         assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--history"])).is_err());
         assert!(parse_invocation(&args(&["who", "botserver", "--history", "--refresh"])).is_err());
+        assert!(matches!(
+            parse_invocation(&args(&["who", "--refresh"])).expect("default self"),
+            Invocation::Typed {
+                command: Command::Who {
+                    target: None,
+                    adopt_caller: true,
+                    refresh: true,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -8,10 +8,10 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kelpie::cli::{
-    AdoptArgs, AgentTarget, BodySource, Caller, Command, Due, ExactRecipient, Invocation,
-    Recipient, StartCommand, StartParent, attribution_params, command_usage, env_caller,
-    format_receipt, generated_id, message_params, parse_invocation, read_body, read_raw_request,
-    typed_request, usage, whoami_params,
+    AdoptArgs, AgentTarget, AttributionTarget, BodySource, Caller, Command, Due, ExactRecipient,
+    Invocation, Recipient, StartCommand, StartParent, attribution_params, command_usage,
+    env_caller, format_receipt, generated_id, message_params, parse_invocation, read_body,
+    read_raw_request, typed_request, usage, whoami_params,
 };
 use kelpie::domain::Parent;
 use serde_json::{Value, json};
@@ -237,6 +237,17 @@ fn build_typed(
             history,
             refresh,
         } => {
+            let target = match target {
+                Some(target) => target,
+                None => match env_caller() {
+                    Some(Caller::Pane(pane)) => AttributionTarget::Pane(pane),
+                    _ => {
+                        return Err(
+                            "cannot resolve caller; set HERDR_PANE_ID or pass a target".into()
+                        );
+                    }
+                },
+            };
             let mut params = attribution_params(&target);
             params["history"] = json!(history);
             params["refresh"] = json!(refresh);
