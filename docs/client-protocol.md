@@ -53,7 +53,10 @@ Each `inbox.delivery` event's `params` carry `message_id`, `kind` (`tell`,
 `attempt_number`, `sender_agent_id`, and `sender_public_name`.
 `sender_agent_id` is the sending logical agent's id and `sender_public_name`
 is that agent's public name at delivery time, so a host can attribute a `tell`
-to a known occupant rather than correlating only replies by `reply_to`. Both
+to a known occupant rather than correlating only replies by `reply_to`.
+`sender_agent_id` is the `sender` the originating request claimed: Kelpie
+checks that the agent exists, not who sent the request, so both fields carry
+the local socket's same-user attribution and are not authentication. Both
 are `null` when the message has no agent sender: operator-attributed messages
 and host-generated cancellations. Neither field changes ordering, ACK
 semantics, or the fault-injection points.
