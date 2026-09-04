@@ -4221,6 +4221,8 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
                 "reply_to": delivery.reply_to,
                 "disposition": delivery.disposition,
                 "attempt_number": delivery.attempt_number,
+                "sender_agent_id": delivery.sender_agent_id,
+                "sender_public_name": delivery.sender_public_name,
             }
         });
         enqueue_json_line(&mut session.write_buf, &event)?;
@@ -7664,6 +7666,11 @@ mod tests {
         assert_eq!(delivery["method"], "inbox.delivery");
         assert_eq!(delivery["params"]["kind"], "tell");
         assert_eq!(delivery["params"]["body"], "unsolicited progress");
+        assert_eq!(
+            delivery["params"]["sender_agent_id"],
+            sender.logical_agent_id.to_string()
+        );
+        assert_eq!(delivery["params"]["sender_public_name"], "sender");
     }
 
     #[test]

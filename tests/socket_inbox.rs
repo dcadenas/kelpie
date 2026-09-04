@@ -547,6 +547,8 @@ fn cancel_reaches_socket_inbox_and_is_not_resolved() {
             .expect("body")
             .contains("obsolete")
     );
+    assert_eq!(delivery["params"]["sender_agent_id"], Value::Null);
+    assert_eq!(delivery["params"]["sender_public_name"], Value::Null);
     let attributed: i64 = Connection::open(&database)
         .expect("db")
         .query_row(
