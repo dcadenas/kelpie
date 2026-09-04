@@ -1,6 +1,7 @@
 //! Foreground local daemon for Kelpie's newline-delimited JSON protocol.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -483,8 +484,8 @@ impl Daemon {
     ///
     /// Returns for socket, request decoding, or response encoding failures.
     pub fn poll(&mut self) -> Result<bool, DaemonError> {
-        let pass_started = Instant::now();
-        let mut phase = Instant::now();
+        let pass_started = PollTimer::start();
+        let mut phase = PollTimer::start();
         self.drain_herdr_events();
         log_slow_phase("herdr_events", &mut phase);
         match self.kelpie.begin_due_deliveries() {
@@ -540,12 +541,19 @@ impl Daemon {
         log_slow_phase("accept", &mut phase);
         let reading_after_accept = self.pump_reading();
         log_slow_phase("reading_after_accept", &mut phase);
-        if pass_started.elapsed() >= SLOW_POLL {
+        let pass_elapsed = pass_started.elapsed();
+        if pass_elapsed.wall >= SLOW_POLL {
+            let opening_prompts = self
+                .awaiting_prompts
+                .values()
+                .filter(|prompt| prompt.lease.is_none())
+                .count();
             eprintln!(
-                "kelpied: slow poll {}ms starts={} clears={} reading={}",
-                pass_started.elapsed().as_millis(),
+                "kelpied: slow poll {pass_elapsed} starts={} clears={} prompts={} opening={} reading={}",
                 self.awaiting_starts.len(),
                 self.awaiting_clears.len(),
+                self.awaiting_prompts.len(),
+                opening_prompts,
                 self.reading.len(),
             );
         }
@@ -2399,7 +2407,12 @@ impl Daemon {
 
     fn drive_parked_opens(&mut self) {
         let deadline = Instant::now() + Duration::from_millis(50);
-        while Instant::now() < deadline {
+        while self
+            .awaiting_prompts
+            .values()
+            .any(|prompt| prompt.lease.is_none())
+            && Instant::now() < deadline
+        {
             self.drain_herdr_events();
             if self
                 .awaiting_prompts
@@ -3900,11 +3913,85 @@ struct PendingWaiterRetire {
     prepared: PreparedWaiterRetire,
 }
 
-fn log_slow_phase(name: &str, started: &mut Instant) {
-    let elapsed = started.elapsed();
-    *started = Instant::now();
-    if elapsed >= SLOW_POLL {
-        eprintln!("kelpied: slow poll phase {name} {}ms", elapsed.as_millis());
+#[derive(Clone, Copy, Debug)]
+struct PollTimer {
+    wall: Instant,
+    thread_cpu: Option<Duration>,
+}
+
+impl PollTimer {
+    fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            thread_cpu: thread_cpu_time(),
+        }
+    }
+
+    fn elapsed(self) -> PollElapsed {
+        PollElapsed::between(self, Self::start())
+    }
+
+    fn restart(&mut self) -> PollElapsed {
+        let end = Self::start();
+        let elapsed = PollElapsed::between(*self, end);
+        *self = end;
+        elapsed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PollElapsed {
+    wall: Duration,
+    thread_cpu: Option<Duration>,
+}
+
+impl PollElapsed {
+    fn between(start: PollTimer, end: PollTimer) -> Self {
+        Self {
+            wall: end.wall.duration_since(start.wall),
+            thread_cpu: start
+                .thread_cpu
+                .zip(end.thread_cpu)
+                .map(|(start, end)| end.saturating_sub(start)),
+        }
+    }
+}
+
+impl fmt::Display for PollElapsed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let wall_ms = self.wall.as_millis();
+        if let Some(cpu) = self.thread_cpu {
+            write!(
+                formatter,
+                "wall={wall_ms}ms cpu={}ms off_cpu={}ms",
+                cpu.as_millis(),
+                self.wall.saturating_sub(cpu).as_millis()
+            )
+        } else {
+            write!(formatter, "wall={wall_ms}ms cpu=unavailable")
+        }
+    }
+}
+
+fn thread_cpu_time() -> Option<Duration> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` points to writable storage for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) } != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(time.tv_sec).ok()?,
+        u32::try_from(time.tv_nsec).ok()?,
+    ))
+}
+
+fn log_slow_phase(name: &str, started: &mut PollTimer) {
+    let elapsed = started.restart();
+    if elapsed.wall >= SLOW_POLL {
+        eprintln!("kelpied: slow poll phase {name} {elapsed}");
     }
 }
 
@@ -6436,6 +6523,26 @@ mod tests {
     use crate::store::Store;
 
     use super::*;
+
+    #[test]
+    fn slow_poll_timing_separates_cpu_from_off_cpu_time() {
+        let elapsed = PollElapsed {
+            wall: Duration::from_millis(1_080),
+            thread_cpu: Some(Duration::from_millis(3)),
+        };
+
+        assert_eq!(elapsed.to_string(), "wall=1080ms cpu=3ms off_cpu=1077ms");
+    }
+
+    #[test]
+    fn slow_poll_timing_reports_an_unavailable_cpu_clock() {
+        let elapsed = PollElapsed {
+            wall: Duration::from_millis(1_080),
+            thread_cpu: None,
+        };
+
+        assert_eq!(elapsed.to_string(), "wall=1080ms cpu=unavailable");
+    }
 
     #[test]
     fn a_policy_waits_out_its_own_interval_before_its_first_cycle() {
