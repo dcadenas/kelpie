@@ -7782,6 +7782,7 @@ mod tests {
         let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
 
         let (report_sent, report_received) = std::sync::mpsc::channel();
+        let (read_report, start_reading) = std::sync::mpsc::channel();
         let report_socket = kelpie_socket.clone();
         let report_client = thread::spawn(move || {
             let mut stream = UnixStream::connect(&report_socket).expect("connect report");
@@ -7792,12 +7793,12 @@ mod tests {
             .expect("write report");
             stream.write_all(b"\n").expect("finish report");
             report_sent.send(()).expect("report sent");
-            thread::sleep(Duration::from_secs(2));
+            start_reading.recv().expect("start reading report");
             let mut line = String::new();
             BufReader::new(stream)
                 .read_line(&mut line)
                 .expect("read report");
-            line
+            serde_json::from_str::<Value>(&line).expect("complete report response")
         });
         report_received.recv().expect("report request ready");
 
@@ -7824,17 +7825,37 @@ mod tests {
             !daemon.awaiting_writes.is_empty(),
             "the report client is still not reading, so its response must remain parked"
         );
-        daemon.awaiting_writes[0].started_at = Instant::now()
+        read_report.send(()).expect("release report reader");
+        let drain_started = Instant::now();
+        while !daemon.awaiting_writes.is_empty() {
+            daemon.poll().expect("drain report response");
+            assert!(
+                drain_started.elapsed() < Duration::from_secs(2),
+                "parked report response did not finish"
+            );
+        }
+        assert_eq!(
+            report_client.join().expect("report client")["result"]["agents"]
+                .as_array()
+                .expect("report agents")
+                .len(),
+            1_508
+        );
+
+        let (stream, _peer) = UnixStream::pair().expect("report stream pair");
+        let mut expired = awaiting_write(
+            stream,
+            &respond("expired", Ok(serde_json::json!({"large":"response"}))),
+        )
+        .expect("expired response");
+        expired.started_at = Instant::now()
             .checked_sub(CLIENT_WRITE_TIMEOUT)
             .expect("write timeout fits before now");
+        daemon.awaiting_writes.push(expired);
         daemon.poll().expect("expire report response");
         assert!(
             daemon.awaiting_writes.is_empty(),
             "a non-reading report client is bounded by the write timeout"
-        );
-        assert!(
-            !report_client.join().expect("report client").ends_with('\n'),
-            "timed-out report responses must not appear complete"
         );
     }
 
