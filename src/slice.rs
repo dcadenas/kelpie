@@ -651,8 +651,26 @@ impl Kelpie {
     pub fn recover(&mut self) -> Result<RecoveryReport, SliceError> {
         self.store.reconcile_reminder_attempts()?;
         self.blocking_negotiate()?;
-        let snapshot = self.blocking_snapshot()?;
-        self.recover_with_snapshot(&snapshot)
+        let mut names_reprojected = 0;
+        loop {
+            let snapshot = self.blocking_snapshot()?;
+            let Some(work) = self.prepare_name_projection_repair(&snapshot)? else {
+                let mut report = self.recover_with_snapshot(&snapshot)?;
+                report.names_reprojected = names_reprojected;
+                return Ok(report);
+            };
+            crate::test_fault::pause("name_projection_after_intent_before_write");
+            self.herdr
+                .rename_agent(&work.request_id, &work.pane_id, &work.new_name)
+                .map_err(|source| {
+                    self.apply_rename_write_error(&work, source)
+                        .expect_err("name projection repair error must fail")
+                })?;
+            crate::test_fault::pause("name_projection_after_response_before_commit");
+            let confirmed = self.blocking_snapshot()?;
+            self.commit_rename_confirm(&work, &confirmed)?;
+            names_reprojected += 1;
+        }
     }
 
     /// Reconcile durable state against an already-fetched snapshot.
@@ -728,18 +746,39 @@ impl Kelpie {
                     intent.pane_id, intent.expected_terminal_id
                 ))
             })?;
+        let mut effective_intent = intent.clone();
+        if effective_intent.logical_agent_id.is_none()
+            && let Some(logical_agent_id) = self.store.continuable_logical_agent_for_binding(
+                &intent.pane_id,
+                &intent.expected_terminal_id,
+            )?
+        {
+            let recorded_name = self.store.agent_address(logical_agent_id)?;
+            if let Some(live_name) = agent.name.as_deref().filter(|name| !name.is_empty())
+                && live_name != recorded_name
+            {
+                return Err(SliceError::LiveConflict(format!(
+                    "pane {} terminal {} matches logical agent {logical_agent_id} by recorded \
+                     seat, but live name {live_name} conflicts with its desired name \
+                     {recorded_name}; use adopt --logical-id only after resolving the name conflict",
+                    intent.pane_id, intent.expected_terminal_id
+                )));
+            }
+            effective_intent.logical_agent_id = Some(logical_agent_id);
+            effective_intent.public_name = Some(recorded_name);
+        }
         let backend_kind = agent.agent.clone().unwrap_or_default();
         let working_directory = pane.cwd.clone().unwrap_or_default();
         let public_name = match agent.name.as_deref() {
             Some(name) if !name.is_empty() => name.to_string(),
-            _ if intent.logical_agent_id.is_some() => {
-                intent.public_name.clone().ok_or_else(|| {
+            _ if effective_intent.logical_agent_id.is_some() => {
+                effective_intent.public_name.clone().ok_or_else(|| {
                     SliceError::LiveConflict(
                         "continuing an unnamed occupant requires the recorded public name".into(),
                     )
                 })?
             }
-            _ => self.derived_claim_name(intent, snapshot, &working_directory)?,
+            _ => self.derived_claim_name(&effective_intent, snapshot, &working_directory)?,
         };
         let evidence = AdoptEvidence {
             pane_id: agent.pane_id.clone(),
@@ -768,7 +807,7 @@ impl Kelpie {
         if agent.name.as_deref() == Some(evidence.public_name.as_str()) {
             let declared = self
                 .store
-                .declare_adopt(intent, &evidence)
+                .declare_adopt(&effective_intent, &evidence)
                 .map_err(SliceError::Store)?;
             self.persist_observation(
                 declared.incarnation_id,
@@ -777,7 +816,9 @@ impl Kelpie {
             )?;
             return Ok(AdoptAfterSnapshot::Ready(declared));
         }
-        let declared = self.store.declare_adopt_pending(intent, &evidence)?;
+        let declared = self
+            .store
+            .declare_adopt_pending(&effective_intent, &evidence)?;
         Ok(AdoptAfterSnapshot::Rename(AdoptRename {
             declared,
             evidence,
@@ -3460,16 +3501,14 @@ impl Kelpie {
                 )));
             }
         };
-        let Some(backend_kind) = agent.agent.as_deref().filter(|kind| !kind.is_empty()) else {
+        let Some(_) = agent.agent.as_deref().filter(|kind| !kind.is_empty()) else {
             return Err(SliceError::LiveConflict(format!(
                 "pane {pane_id} live agent has no backend kind"
             )));
         };
-        let continuable = self.store.continuable_logical_agent_for_binding(
-            pane_id,
-            &agent.terminal_id,
-            backend_kind,
-        )?;
+        let continuable = self
+            .store
+            .continuable_logical_agent_for_binding(pane_id, &agent.terminal_id)?;
         let public_name = if let Some(logical_agent_id) = continuable {
             let recorded = self.store.agent_address(logical_agent_id)?;
             match agent.name.as_deref() {
@@ -3528,7 +3567,7 @@ impl Kelpie {
                     pane_id: work.pane_id.clone(),
                     expected_terminal_id: work.evidence.terminal_id.clone(),
                     public_name: Some(public_name.to_string()),
-                    logical_agent_id: None,
+                    logical_agent_id: Some(work.declared.logical_agent_id),
                     parent: crate::domain::Parent::Parentless,
                     herdr_session: "default".into(),
                     backend_kind: Some(work.evidence.backend_kind.clone()),
@@ -3576,11 +3615,30 @@ impl Kelpie {
                 candidates.len()
             )));
         };
+        let continuable = self
+            .store
+            .continuable_logical_agent_for_binding(&agent.pane_id, &agent.terminal_id)?;
+        if continuable.is_none() {
+            let claimants = self.store.name_info(public_name)?.claimants;
+            if !claimants.is_empty() {
+                let ids = claimants
+                    .iter()
+                    .map(|claimant| claimant.logical_agent_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(SliceError::LiveConflict(format!(
+                    "alias {public_name} has prior logical agents but none matches live seat {} \
+                     terminal {}; refusing to mint a replacement identity. Candidates: {ids}. \
+                     Use adopt --logical-id to continue the intended agent",
+                    agent.pane_id, agent.terminal_id
+                )));
+            }
+        }
         let intent = AdoptIntent {
             pane_id: agent.pane_id.clone(),
             expected_terminal_id: agent.terminal_id.clone(),
             public_name: Some(public_name.to_string()),
-            logical_agent_id: None,
+            logical_agent_id: continuable,
             parent: crate::domain::Parent::Parentless,
             herdr_session: "default".into(),
             backend_kind: agent.agent.clone(),
@@ -4419,6 +4477,28 @@ impl Kelpie {
             new_name: preflight.new_name.clone(),
             request_id: format!("kelpie:rename:{}", preflight.incarnation_id),
         })
+    }
+
+    pub(crate) fn prepare_name_projection_repair(
+        &mut self,
+        snapshot: &crate::herdr::Snapshot,
+    ) -> Result<Option<RenameWork>, SliceError> {
+        let Some(repair) = self.store.name_projection_repair(snapshot)? else {
+            return Ok(None);
+        };
+        if !repair.intent_already_pending {
+            self.store
+                .declare_rename(repair.incarnation_id, &repair.public_name)?;
+        }
+        Ok(Some(RenameWork {
+            logical_agent_id: repair.logical_agent_id,
+            incarnation_id: repair.incarnation_id,
+            pane_id: repair.pane_id,
+            terminal_id: repair.terminal_id,
+            backend_kind: repair.backend_kind,
+            new_name: repair.public_name,
+            request_id: format!("kelpie:name-projection:{}", repair.incarnation_id),
+        }))
     }
 
     pub(crate) fn abandon_rename_before_write(
@@ -5941,11 +6021,12 @@ mod tests {
         let listener = UnixListener::bind(&socket).expect("bind");
         let server = serve_lazy_pane_adopt(listener, foobar_pane_snapshot());
         let mut store = Store::in_memory().expect("store");
+        let mut prior_evidence = foobar_pane_evidence();
+        prior_evidence.backend_kind = "grok".into();
+        let mut prior_intent = foobar_pane_adopt_intent("prior-pane");
+        prior_intent.backend_kind = None;
         let prior = store
-            .declare_adopt(
-                &foobar_pane_adopt_intent("prior-pane"),
-                &foobar_pane_evidence(),
-            )
+            .declare_adopt(&prior_intent, &prior_evidence)
             .expect("prior");
         let waiting = store.declare_start(&e2e_intent()).expect("waiting");
         let ask = store
@@ -5979,6 +6060,119 @@ mod tests {
                 .expect("pending")[0]
                 .ask_message_id,
             ask.message_id
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn bare_adopt_continues_the_recorded_seat_across_a_backend_change() {
+        let mut store = Store::in_memory().expect("store");
+        let mut old_evidence = foobar_pane_evidence();
+        old_evidence.backend_kind = "grok".into();
+        let mut old_intent = foobar_pane_adopt_intent("old-backend");
+        old_intent.backend_kind = None;
+        let prior = store
+            .declare_adopt(&old_intent, &old_evidence)
+            .expect("prior");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose prior runtime");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+        let bare = foobar_pane_adopt_intent("new-backend");
+        let snapshot = crate::herdr::Snapshot {
+            protocol: 20,
+            panes: vec![crate::herdr::PaneObservation {
+                pane_id: "w1:p2".into(),
+                terminal_id: "term-2".into(),
+                cwd: Some("/tmp/other".into()),
+            }],
+            agents: vec![crate::herdr::AgentObservation {
+                terminal_id: "term-2".into(),
+                pane_id: "w1:p2".into(),
+                name: Some("foobar".into()),
+                agent: Some("opencode".into()),
+                interactive_ready: false,
+                launch_pending: false,
+                agent_session: None,
+            }],
+        };
+
+        let AdoptAfterSnapshot::Ready(continued) = kelpie
+            .adopt_after_snapshot(&bare, &snapshot)
+            .expect("continue recorded seat")
+        else {
+            panic!("a named replacement does not need a projection repair");
+        };
+        assert_eq!(continued.logical_agent_id, prior.logical_agent_id);
+        assert_ne!(continued.incarnation_id, prior.incarnation_id);
+    }
+
+    #[test]
+    fn recover_reprojects_a_missing_name_without_losing_identity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let unnamed = unnamed_foobar_snapshot();
+        let named = foobar_pane_snapshot();
+        let server = thread::spawn(move || {
+            serve_exchanges(
+                &listener,
+                vec![
+                    (
+                        "ping",
+                        serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                    ),
+                    ("session.snapshot", unnamed),
+                    (
+                        "agent.rename",
+                        serde_json::json!({
+                            "type":"agent_info",
+                            "agent":{"terminal_id":"term-2","pane_id":"w1:p2","name":"foobar","agent":"opencode"}
+                        }),
+                    ),
+                    ("session.snapshot", named.clone()),
+                    ("session.snapshot", named),
+                ],
+            );
+        });
+        let mut store = Store::in_memory().expect("store");
+        let prior = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("repair-prior"),
+                &foobar_pane_evidence(),
+            )
+            .expect("prior");
+        let ask = store
+            .create_ask(
+                prior.logical_agent_id,
+                prior.logical_agent_id,
+                prior.incarnation_id,
+                "still owed after projection repair",
+                "repair-obligation",
+            )
+            .expect("ask");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+
+        let report = kelpie.recover().expect("recover");
+        assert_eq!(report.names_reprojected, 1);
+        assert_eq!(report.incarnations_marked_lost, 0);
+        assert_eq!(
+            kelpie
+                .store()
+                .incarnation_state(prior.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Ready
+        );
+        assert_eq!(
+            kelpie
+                .store()
+                .obligation_state(ask.message_id)
+                .expect("obligation"),
+            crate::domain::ObligationState::Open
         );
         server.join().expect("server");
     }
@@ -6230,14 +6424,30 @@ mod tests {
                 stream.write_all(b"\n").expect("newline");
             }
         });
-        let mut kelpie = Kelpie::new(
-            Store::in_memory().expect("store"),
-            HerdrClient::new(&socket, Duration::from_secs(1)),
-        );
+        let mut store = Store::in_memory().expect("store");
+        let mut evidence = foobar_pane_evidence();
+        evidence.pane_id = "w1:p3".into();
+        evidence.terminal_id = "term-3".into();
+        evidence.public_name = "foobaz".into();
+        evidence.working_directory = "/tmp/foobaz".into();
+        let mut intent = foobar_pane_adopt_intent("prior-recipient");
+        intent.pane_id = "w1:p3".into();
+        intent.expected_terminal_id = "term-3".into();
+        intent.public_name = Some("foobaz".into());
+        let prior = store.declare_adopt(&intent, &evidence).expect("prior");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose prior");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
 
         let resolved = kelpie
             .resolve_or_adopt_alias("foobaz", "lazy-recipient")
             .expect("lazy recipient adopt");
+        assert_eq!(resolved.0, prior.logical_agent_id);
         assert_eq!(
             kelpie.resolve_ready_alias("foobaz").expect("alias"),
             resolved

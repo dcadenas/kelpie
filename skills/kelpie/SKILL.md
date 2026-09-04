@@ -5,10 +5,11 @@ description: "Default Herdr transport for inter-agent send, message, tell, ask, 
 
 # Kelpie
 
-Kelpie owns durable logical identity, operation intent, messages, deliveries,
-reply obligations, and recovery records. Herdr remains the authority for live
-runtime and topology facts such as panes, terminals, names, backend kind, and
-interactive readiness.
+Kelpie owns durable logical identity, desired public names, operation intent,
+messages, deliveries, reply obligations, and recovery records. Herdr remains
+the authority for live runtime and topology facts such as panes, terminals,
+backend kind, and interactive readiness. A Herdr name is Kelpie's repairable
+projection, not identity proof.
 
 ## Transport policy
 
@@ -33,11 +34,13 @@ Kelpie `reply` and that ask's durable `reply_to` ID.
 - Requested model, provider, and effort are launch configuration. Observed
   attribution is append-only and comes only from named session adapters.
   Requested is never proof of observed.
-- A public agent name is a reusable live alias, never a primary key. Resolving
+- A public agent name is a reusable live alias owned durably by Kelpie, never a
+  primary key. Resolving
   an alias at send time binds the message to the exact logical agent and
   incarnation then Ready under that name. Later reuse of the same name does not
-  retarget stored messages, deliveries, or obligations. Every Ready alias MUST
-  equal the live Herdr public name.
+  retarget stored messages, deliveries, or obligations. Kelpie re-projects a
+  missing live Herdr name from the Ready binding; a different live name fails
+  closed.
 - Continuing one logical agent in a new incarnation preserves its obligations
   and history. Creating a new logical agent that reuses the same public name
   does not inherit them.
@@ -338,13 +341,14 @@ Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Use exactly
 one recipient form: a live name, or both `--recipient-id` and
 `--recipient-incarnation`. Exact addressing does not take a fake alias.
 When the calling pane has no Ready binding, Kelpie lazily adopts its exact live
-agent. If that pane, terminal, and backend already have a unique lost, unknown,
+agent. If that pane and terminal already have a unique lost, unknown,
 declared, or failed incarnation, the adoption continues that logical agent and
 keeps its recorded alias. An unnamed occupant is renamed back to that alias. A
-different live name, a backend mismatch, or several continuable agents fail
-closed: continue with `adopt --logical-id`, or bind the live occupant as a new
-agent. A missing recipient alias may likewise adopt one unique unnamed live
-agent whose cwd basename derives to that alias. Ambiguity fails closed.
+different live name or several continuable agents fail closed. Backend kind is
+runtime evidence, not an identity precondition. A missing recipient alias may
+likewise continue one unique unnamed live agent on a previously recorded seat;
+cwd-derived adoption creates a new identity only when the name has no prior
+claimant. Ambiguity fails closed.
 
 `no ready agent for alias X` means Kelpie has no Ready binding under that name.
 It does not mean the agent is gone, and it is not grounds for starting a
@@ -369,9 +373,10 @@ with its exact pane and terminal — and check for a recorded logical id first:
 kelpie adopt --pane w7:p2B --terminal term_6592f21297a941 --logical-id <id>
 ```
 
-Omitting `--logical-id` mints a NEW logical agent that reuses the public name and
-inherits none of the old one's history, obligations, or messages, so search your
-artifacts and `kelpie report` for a prior id before adopting bare.
+Omitting `--logical-id` continues a unique recoverable logical agent already
+recorded on that pane and terminal. It mints a NEW logical agent only when the
+seat has no recoverable identity; that new identity inherits none of another
+agent's history, obligations, or messages.
 
 Kelpie refuses that bare adopt outright when a prior agent under the same name
 has an `open` or `in_progress` obligation, naming the id to continue. A dead pane
@@ -620,9 +625,11 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   the pane in the same step; it ends that process but keeps the worktree,
   transcripts, messages, obligations, and durable records. Kelpie re-proves the
   exact binding first and refuses to close a pane another agent now holds.
-- `recover`: obtain a fresh Herdr snapshot and reconcile durable records. Exact
-  pane, terminal, backend, public name, and recorded native session decide
-  whether a Ready binding is still live. Exact absence is required to complete
+- `recover`: obtain a fresh Herdr snapshot and reconcile durable records. A
+  missing name on the recorded pane and terminal is projection drift: Kelpie
+  records repair intent, restores the desired name, and confirms it. A present
+  different name fails closed. Backend and native session are runtime evidence,
+  not identity preconditions. Exact seat absence is required to complete
   retirement.
 - `notice.create` and `notice.list`: write and inspect durable operator notices.
 

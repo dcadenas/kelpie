@@ -289,6 +289,18 @@ pub struct ReadyBinding {
     pub terminal_id: String,
 }
 
+/// One Ready binding whose Herdr name projection is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameProjectionRepair {
+    pub logical_agent_id: LogicalAgentId,
+    pub incarnation_id: IncarnationId,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub backend_kind: String,
+    pub public_name: String,
+    pub intent_already_pending: bool,
+}
+
 /// Ready logical identity for CLI caller/recipient resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyIdentity {
@@ -297,7 +309,7 @@ pub struct ReadyIdentity {
     pub public_name: String,
 }
 
-/// Summary of one side-effect-free recovery reconciliation pass.
+/// Summary of one recovery reconciliation pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecoveryReport {
     pub starts_recovered: usize,
@@ -310,6 +322,8 @@ pub struct RecoveryReport {
     /// Ready bindings whose recorded conversation reference was stale and
     /// replaced with the live one. A rotation, not a loss.
     pub native_sessions_refreshed: usize,
+    /// Missing Herdr name projections restored from Kelpie's durable identity.
+    pub names_reprojected: usize,
 }
 
 #[derive(Debug)]
@@ -4181,8 +4195,9 @@ impl Store {
     ///
     /// `ready` is already bound. `retiring`, `retired`, and `superseded` left
     /// the runtime on purpose. `lost` and `unknown` on this exact pane,
-    /// terminal, and backend are the prior occupant that lazy create-new would
-    /// fork. `declared` or `failed` of that same backend is retried so a
+    /// and terminal are the prior occupant that lazy create-new would fork.
+    /// Backend kind is runtime evidence, not durable identity. `declared` or
+    /// `failed` in that same seat is retried so a
     /// rejected name claim does not wedge the pane. `starting` on the same pane
     /// and terminal fails closed.
     ///
@@ -4190,27 +4205,22 @@ impl Store {
     ///
     /// Returns a conflict when more than one logical agent still occupies the
     /// pane and terminal, or when the unique occupant is not a lost, unknown,
-    /// declared, or failed incarnation of the live backend.
+    /// declared, or failed incarnation.
     pub fn continuable_logical_agent_for_binding(
         &self,
         pane_id: &str,
         terminal_id: &str,
-        backend_kind: &str,
     ) -> Result<Option<LogicalAgentId>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT logical_agent_id, state, backend_kind
+            "SELECT logical_agent_id, state
              FROM incarnations
              WHERE observed_pane_id = ?1
                AND observed_terminal_id = ?2
                AND state NOT IN ('ready', 'retiring', 'retired', 'superseded')
-             ORDER BY logical_agent_id ASC",
+              ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = statement.query_map(params![pane_id, terminal_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut occupants = Vec::new();
         for row in rows {
@@ -4220,7 +4230,7 @@ impl Store {
             return Ok(None);
         }
         let mut ids = Vec::new();
-        for (id, _, _) in &occupants {
+        for (id, _) in &occupants {
             if !ids.iter().any(|existing| existing == id) {
                 ids.push(id.clone());
             }
@@ -4228,7 +4238,8 @@ impl Store {
         if ids.len() != 1 {
             return Err(StoreError::Conflict(format!(
                 "pane {pane_id} terminal {terminal_id} has {} continuable logical agents; \
-                 adopt --logical-id to continue one of {}",
+                 candidates ranked by recorded seat evidence: {}; adopt --logical-id to \
+                 continue the intended one",
                 ids.len(),
                 ids.join(", ")
             )));
@@ -4236,19 +4247,74 @@ impl Store {
         let id = LogicalAgentId::parse(&ids[0]).ok_or_else(|| {
             StoreError::InvalidRecord(format!("invalid logical agent id {}", ids[0]))
         })?;
-        let matches_live = occupants.iter().any(|(_, state, backend)| {
-            matches!(state.as_str(), "lost" | "unknown" | "declared" | "failed")
-                && backend == backend_kind
-        });
+        let matches_live = occupants
+            .iter()
+            .any(|(_, state)| matches!(state.as_str(), "lost" | "unknown" | "declared" | "failed"));
         if matches_live {
             Ok(Some(id))
         } else {
             Err(StoreError::Conflict(format!(
                 "pane {pane_id} terminal {terminal_id} has agent {id} but not a lost, unknown, \
-                 declared, or failed {backend_kind} incarnation; adopt --logical-id to continue \
+                 declared, or failed incarnation; adopt --logical-id to continue \
                  it, or adopt the live occupant as a new agent"
             )))
         }
+    }
+
+    /// Find one missing Herdr name projection on an otherwise exact Ready seat.
+    ///
+    /// A missing name is not negative identity evidence. A present different
+    /// name is, and is deliberately excluded so recovery never renames a
+    /// foreign occupant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a durable binding is malformed.
+    pub fn name_projection_repair(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Option<NameProjectionRepair>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT l.id, i.id, i.observed_pane_id, i.observed_terminal_id,
+                    i.backend_kind, l.public_name, i.pending_rename_to
+             FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state = 'ready'
+               AND (i.pending_rename_to IS NULL OR i.pending_rename_to = l.public_name)
+             ORDER BY i.created_at_ms, i.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (logical, incarnation, pane, terminal, backend, name, pending) = row?;
+            if snapshot.agents.iter().any(|agent| {
+                agent.pane_id == pane
+                    && agent.terminal_id == terminal
+                    && agent.agent.as_deref() == Some(backend.as_str())
+                    && agent.name.as_deref().is_none_or(str::is_empty)
+                    && !agent.launch_pending
+            }) {
+                return Ok(Some(NameProjectionRepair {
+                    logical_agent_id: parse_logical_agent_id(&logical)?,
+                    incarnation_id: parse_incarnation_id(&incarnation)?,
+                    pane_id: pane,
+                    terminal_id: terminal,
+                    backend_kind: backend,
+                    public_name: name,
+                    intent_already_pending: pending.is_some(),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Read a logical agent's current human-readable address.
@@ -7238,6 +7304,10 @@ impl Store {
                     &row.public_name,
                 )
             });
+            let unnamed_live = snapshot.agents.iter().find(|agent| {
+                live_seat_and_backend(agent, &row.pane_id, &row.terminal_id, &row.backend_kind)
+                    && agent.name.as_deref().is_none_or(str::is_empty)
+            });
             // A rename that reached Herdr but not the commit leaves the live
             // agent answering to the target name. That binding is exact, not
             // absent, so recovery finishes the rename instead of losing it.
@@ -7252,7 +7322,7 @@ impl Store {
                     )
                 })
             });
-            let bound = renamed_live.or(exact_live);
+            let bound = renamed_live.or(exact_live).or(unnamed_live);
             // Herdr owns the backend-native conversation reference; Kelpie owns
             // only its association with this incarnation. A live runtime
             // rotates that reference on its own — clear, resume, compaction,
@@ -7306,7 +7376,7 @@ impl Store {
                         [&row.id],
                     )?;
                 }
-            } else {
+            } else if unnamed_live.is_none() {
                 marked_lost += tx.execute(
                     "UPDATE incarnations SET state = 'lost', terminal_at_ms = ?1,
                      terminal_reason = 'authoritative_binding_absence'
@@ -7451,8 +7521,9 @@ impl Store {
     ///
     /// This method never causes an external effect. An attempted start succeeds
     /// only from exact terminal, pane, public-name, and readiness evidence.
-    /// Ready incarnations stay live only on exact pane, terminal, backend,
-    /// public name, and recorded native session.
+    /// Ready incarnations remain bound to their recorded seat. A missing name is
+    /// projection drift for the caller to repair; a present different name or
+    /// incompatible runtime observation marks the binding lost.
     /// Attempted prompts become `unknown` because a snapshot cannot prove
     /// terminal-input delivery. Intents with no attempt remain pending.
     ///
@@ -8202,10 +8273,19 @@ fn exact_live_binding(
     backend_kind: &str,
     public_name: &str,
 ) -> bool {
+    live_seat_and_backend(agent, pane_id, terminal_id, backend_kind)
+        && agent.name.as_deref() == Some(public_name)
+}
+
+fn live_seat_and_backend(
+    agent: &crate::herdr::AgentObservation,
+    pane_id: &str,
+    terminal_id: &str,
+    backend_kind: &str,
+) -> bool {
     agent.pane_id == pane_id
         && agent.terminal_id == terminal_id
         && agent.agent.as_deref() == Some(backend_kind)
-        && agent.name.as_deref() == Some(public_name)
 }
 
 fn backfill_name_authority(connection: &Connection) -> Result<(), StoreError> {
@@ -11663,6 +11743,7 @@ mod tests {
                 retirements_still_live: 0,
                 incarnations_marked_lost: 0,
                 native_sessions_refreshed: 0,
+                names_reprojected: 0,
             }
         );
         assert_eq!(
@@ -12480,23 +12561,22 @@ mod tests {
             .expect("adopt");
         assert_eq!(
             store
-                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
                 .expect("ready is not continuable"),
             None
         );
         mark_lost(&store, first.incarnation_id);
         assert_eq!(
             store
-                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
                 .expect("lost"),
             Some(first.logical_agent_id)
         );
-        let backend_mismatch = store
-            .continuable_logical_agent_for_binding("w1:p9", "term-live", "claude")
-            .expect_err("wrong backend");
-        assert!(
-            backend_mismatch.to_string().contains("adopt --logical-id"),
-            "{backend_mismatch}"
+        assert_eq!(
+            store
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
+                .expect("backend is observation, not identity"),
+            Some(first.logical_agent_id)
         );
         store
             .connection
@@ -12507,7 +12587,7 @@ mod tests {
             .expect("retire");
         assert_eq!(
             store
-                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
                 .expect("retired is not continuable"),
             None
         );
@@ -12525,7 +12605,7 @@ mod tests {
             .expect("second");
         mark_lost(&store, second.incarnation_id);
         let error = store
-            .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+            .continuable_logical_agent_for_binding("w1:p9", "term-live")
             .expect_err("ambiguous");
         let message = error.to_string();
         assert!(
@@ -12533,6 +12613,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("adopt --logical-id"), "{message}");
+        assert!(
+            message.contains("ranked by recorded seat evidence"),
+            "{message}"
+        );
         assert!(
             message.contains(&first.logical_agent_id.to_string()),
             "{message}"
@@ -12551,7 +12635,7 @@ mod tests {
             .expect("pending");
         assert_eq!(
             store
-                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
                 .expect("declared retries"),
             Some(pending.logical_agent_id)
         );
@@ -12564,7 +12648,7 @@ mod tests {
             .expect("fail");
         assert_eq!(
             store
-                .continuable_logical_agent_for_binding("w1:p9", "term-live", "grok")
+                .continuable_logical_agent_for_binding("w1:p9", "term-live")
                 .expect("failed retries"),
             Some(pending.logical_agent_id)
         );
@@ -13653,7 +13737,7 @@ mod tests {
     }
 
     #[test]
-    fn adopt_named_occupant_still_requires_live_name() {
+    fn missing_live_name_is_projection_drift_not_identity_loss() {
         let mut store = Store::in_memory().expect("store");
         let adopted = store
             .declare_adopt(&adopt_intent("adopt-named"), &ready_evidence())
@@ -13674,12 +13758,12 @@ mod tests {
                 agents: vec![unnamed.clone()],
             })
             .expect("recover missing name");
-        assert_eq!(report.incarnations_marked_lost, 1);
+        assert_eq!(report.incarnations_marked_lost, 0);
         assert_eq!(
             store
                 .incarnation_state(adopted.incarnation_id)
                 .expect("state"),
-            crate::domain::IncarnationState::Lost
+            crate::domain::IncarnationState::Ready
         );
 
         let mut store = Store::in_memory().expect("store");
@@ -13797,11 +13881,11 @@ mod tests {
                 panes: vec![],
                 agents: vec![unnamed_live_agent()],
             })
-            .expect("recover requires live name");
-        assert_eq!(report.incarnations_marked_lost, 1);
+            .expect("recover treats the missing name as projection drift");
+        assert_eq!(report.incarnations_marked_lost, 0);
         assert_eq!(
             store.incarnation_state(incarnation_id).expect("state"),
-            crate::domain::IncarnationState::Lost
+            crate::domain::IncarnationState::Ready
         );
     }
 

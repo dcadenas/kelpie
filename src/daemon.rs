@@ -329,7 +329,9 @@ struct AwaitingAdopt {
 
 #[derive(Clone, Debug)]
 enum ClientReadKind {
-    Recover,
+    Recover {
+        names_reprojected: usize,
+    },
     Report {
         active: bool,
     },
@@ -366,14 +368,22 @@ struct AwaitingRead {
 enum RenameParkState {
     Snapshot(RenamePreflight),
     Opening(RenamePreflight),
+    ProjectionOpening(RenameWork),
     Sending(RenameWork),
     Confirm(RenameWork),
+}
+
+#[derive(Debug)]
+enum RenameReply {
+    Rpc,
+    Recover { names_reprojected: usize },
 }
 
 #[derive(Debug)]
 struct AwaitingRename {
     request_id: String,
     stream: UnixStream,
+    reply: RenameReply,
     state: RenameParkState,
     herdr_job: Option<u64>,
     lease: Option<std::sync::mpsc::Sender<LeaseCmd>>,
@@ -750,7 +760,7 @@ impl Daemon {
         let job_id = self.alloc_job();
         let job = match &read.kind {
             ClientReadKind::Report { .. } => HerdrJob::LifecycleSnapshot { job_id },
-            ClientReadKind::Recover
+            ClientReadKind::Recover { .. }
             | ClientReadKind::Whoami { .. }
             | ClientReadKind::Alias { .. }
             | ClientReadKind::Attribution { .. }
@@ -958,17 +968,34 @@ impl Daemon {
             let _ = lease.send(LeaseCmd::Drop);
             return;
         };
-        let RenameParkState::Opening(preflight) = self.awaiting_renames[index].state.clone() else {
-            let _ = lease.send(LeaseCmd::Drop);
-            return;
+        let work = match self.awaiting_renames[index].state.clone() {
+            RenameParkState::Opening(preflight) => self.kelpie.commit_rename_intent(&preflight),
+            RenameParkState::ProjectionOpening(work) => Ok(work),
+            _ => {
+                let _ = lease.send(LeaseCmd::Drop);
+                return;
+            }
         };
-        match self.kelpie.commit_rename_intent(&preflight) {
+        match work {
             Ok(work) => {
+                if matches!(
+                    self.awaiting_renames[index].reply,
+                    RenameReply::Recover { .. }
+                ) {
+                    crate::test_fault::pause("name_projection_after_intent_before_write");
+                }
                 let send = LeaseCmd::Send {
                     request_id: work.request_id.clone(),
                     method: "agent.rename".into(),
                     params: serde_json::json!({"target": work.pane_id, "name": work.new_name}),
-                    after_write_pause: "",
+                    after_write_pause: if matches!(
+                        self.awaiting_renames[index].reply,
+                        RenameReply::Recover { .. }
+                    ) {
+                        "name_projection_after_write_before_response"
+                    } else {
+                        ""
+                    },
                 };
                 if lease.send(send).is_err() {
                     let source = HerdrError::Unexpected("herdr lease closed before rename".into());
@@ -1030,10 +1057,24 @@ impl Daemon {
                     "rename lease completed before send".into(),
                 )),
             ),
+            RenameParkState::ProjectionOpening(_) => self.fail_rename_at(
+                index,
+                SliceError::Herdr(HerdrError::Unexpected(
+                    "name projection lease completed before send".into(),
+                )),
+            ),
             RenameParkState::Sending(work) => {
                 drop_lease(self.awaiting_renames[index].lease.take());
                 match result {
                     Ok(HerdrJobResult::Agent(_)) => {
+                        if matches!(
+                            self.awaiting_renames[index].reply,
+                            RenameReply::Recover { .. }
+                        ) {
+                            crate::test_fault::pause(
+                                "name_projection_after_response_before_commit",
+                            );
+                        }
                         let next = self.alloc_job();
                         self.submit_owned(
                             HerdrJob::Snapshot {
@@ -1093,6 +1134,7 @@ impl Daemon {
                 .expect_err("rename pre-write error must fail"),
             RenameParkState::Snapshot(_)
             | RenameParkState::Opening(_)
+            | RenameParkState::ProjectionOpening(_)
             | RenameParkState::Confirm(_) => SliceError::Herdr(source),
         };
         self.fail_rename_at(index, error);
@@ -1105,6 +1147,26 @@ impl Daemon {
     ) {
         let mut rename = self.awaiting_renames.remove(index);
         drop_lease(rename.lease.take());
+        if let RenameReply::Recover { names_reprojected } = rename.reply {
+            match result {
+                Ok(_) => {
+                    self.park_read(AwaitingRead {
+                        request_id: rename.request_id,
+                        stream: rename.stream,
+                        kind: ClientReadKind::Recover {
+                            names_reprojected: names_reprojected + 1,
+                        },
+                    });
+                }
+                Err(error) => {
+                    let response = respond(&rename.request_id, Err(error));
+                    if let Err(error) = write_response(&mut rename.stream, &response) {
+                        eprintln!("kelpied: parked recovery response failed: {error}");
+                    }
+                }
+            }
+            return;
+        }
         let result = result.map(|identity| {
             serde_json::json!({
                 "logical_agent_id": identity.logical_agent_id,
@@ -1446,17 +1508,10 @@ impl Daemon {
             return;
         };
         match (read.kind.clone(), result) {
-            (ClientReadKind::Recover, Ok(HerdrJobResult::Snapshot(snapshot))) => {
-                let response = respond(
-                    &read.request_id,
-                    self.kelpie
-                        .recover_with_snapshot(&snapshot)
-                        .map(recover_result),
-                );
-                if let Err(error) = write_response(&mut read.stream, &response) {
-                    eprintln!("kelpied: parked read response failed: {error}");
-                }
-            }
+            (
+                ClientReadKind::Recover { names_reprojected },
+                Ok(HerdrJobResult::Snapshot(snapshot)),
+            ) => self.finish_recover_snapshot(read, names_reprojected, &snapshot),
             (ClientReadKind::Report { active }, Ok(HerdrJobResult::Lifecycle(observations))) => {
                 let live = LiveStatus::from_observations(observations);
                 let response = respond(
@@ -1534,6 +1589,55 @@ impl Daemon {
                     eprintln!("kelpied: parked read response failed: {error}");
                 }
             }
+        }
+    }
+
+    fn finish_recover_snapshot(
+        &mut self,
+        mut read: AwaitingRead,
+        names_reprojected: usize,
+        snapshot: &crate::herdr::Snapshot,
+    ) {
+        match self.kelpie.prepare_name_projection_repair(snapshot) {
+            Ok(Some(work)) => {
+                let next = self.alloc_job();
+                self.submit_owned(
+                    HerdrJob::Open {
+                        job_id: next,
+                        pane_id: work.pane_id.clone(),
+                        negotiate: false,
+                    },
+                    HerdrOwner::Rename,
+                );
+                self.awaiting_renames.push(AwaitingRename {
+                    request_id: read.request_id,
+                    stream: read.stream,
+                    reply: RenameReply::Recover { names_reprojected },
+                    state: RenameParkState::ProjectionOpening(work),
+                    herdr_job: Some(next),
+                    lease: None,
+                });
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let response = respond(&read.request_id, Err(error));
+                if let Err(error) = write_response(&mut read.stream, &response) {
+                    eprintln!("kelpied: parked recovery response failed: {error}");
+                }
+                return;
+            }
+        }
+        let result = self
+            .kelpie
+            .recover_with_snapshot(snapshot)
+            .map(|mut report| {
+                report.names_reprojected = names_reprojected;
+                recover_result(report)
+            });
+        let response = respond(&read.request_id, result);
+        if let Err(error) = write_response(&mut read.stream, &response) {
+            eprintln!("kelpied: parked read response failed: {error}");
         }
     }
 
@@ -4198,7 +4302,9 @@ fn serve_parsed_line(
             return Ok(Served::AwaitingRead(Box::new(AwaitingRead {
                 request_id: request.id,
                 stream,
-                kind: ClientReadKind::Recover,
+                kind: ClientReadKind::Recover {
+                    names_reprojected: 0,
+                },
             })));
         }
         Ok(request) if request.method == "attribution" => {
@@ -4316,6 +4422,7 @@ fn serve_parsed_line(
                     return Ok(Served::AwaitingRename(Box::new(AwaitingRename {
                         request_id: request.id,
                         stream,
+                        reply: RenameReply::Rpc,
                         state: RenameParkState::Snapshot(preflight),
                         herdr_job: None,
                         lease: None,
@@ -5394,7 +5501,8 @@ fn recover_result(report: crate::store::RecoveryReport) -> Value {
         "retirements_completed": report.retirements_completed,
         "retirements_still_live": report.retirements_still_live,
         "incarnations_marked_lost": report.incarnations_marked_lost,
-        "native_sessions_refreshed": report.native_sessions_refreshed
+        "native_sessions_refreshed": report.native_sessions_refreshed,
+        "names_reprojected": report.names_reprojected
     })
 }
 
@@ -5404,7 +5512,7 @@ fn dispatch_recover(kelpie: &mut Kelpie) -> Result<Value, SliceError> {
 
 fn finish_client_read(kelpie: &mut Kelpie, kind: &ClientReadKind) -> Result<Value, SliceError> {
     match kind {
-        ClientReadKind::Recover => dispatch_recover(kelpie),
+        ClientReadKind::Recover { .. } => dispatch_recover(kelpie),
         ClientReadKind::Report { active } => {
             let live = kelpie.live_agent_status()?;
             render_report(kelpie, *active, Some(&live))
@@ -7276,6 +7384,107 @@ mod tests {
                 .expect("obligation"),
             crate::domain::ObligationState::Open
         );
+    }
+
+    #[test]
+    fn local_socket_recovery_reprojects_a_missing_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
+        let named = serde_json::json!({
+            "type":"session_snapshot",
+            "snapshot":{"protocol":20,"panes":[],"agents":[{
+                "terminal_id":"term-1","pane_id":"w1:p1","name":"worker",
+                "agent":"codex","interactive_ready":true,"launch_pending":false
+            }]}
+        });
+        let herdr = thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({
+                        "type":"session_snapshot",
+                        "snapshot":{"protocol":20,"panes":[],"agents":[{
+                            "terminal_id":"term-1","pane_id":"w1:p1",
+                            "agent":"codex","interactive_ready":true,"launch_pending":false
+                        }]}
+                    }),
+                ),
+                (
+                    "agent.rename",
+                    serde_json::json!({
+                        "type":"agent_info","agent":{
+                            "terminal_id":"term-1","pane_id":"w1:p1","name":"worker",
+                            "agent":"codex"
+                        }
+                    }),
+                ),
+                ("session.snapshot", named.clone()),
+                ("session.snapshot", named),
+            ];
+            for (method, result) in exchanges {
+                let (mut stream, _) = listener.accept().expect("accept Herdr request");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut line)
+                    .expect("read Herdr request");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                assert_eq!(request["method"], method);
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write response");
+                stream.write_all(b"\n").expect("finish response");
+            }
+        });
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&test_intent("worker", "term-1", "repair-start"))
+            .expect("intent");
+        store
+            .begin_attempt(
+                declared.operation_id,
+                declared.incarnation_id,
+                "start-request",
+            )
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                declared.operation_id,
+                declared.incarnation_id,
+                &crate::herdr::AgentObservation {
+                    terminal_id: "term-1".into(),
+                    pane_id: "w1:p1".into(),
+                    name: Some("worker".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        let kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
+        );
+        let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
+        let server = thread::spawn(move || daemon.serve_one().expect("serve recovery"));
+
+        let response = send_request(
+            &kelpie_socket,
+            &serde_json::json!({"id":"recover-repair","method":"recover","params":{}}),
+        );
+        assert_eq!(response["result"]["names_reprojected"], 1);
+        assert_eq!(response["result"]["incarnations_marked_lost"], 0);
+        server.join().expect("daemon thread");
+        herdr.join().expect("Herdr thread");
     }
 
     #[test]
