@@ -7,7 +7,7 @@ PRAGMA foreign_keys=OFF;
 
 BEGIN;
 
-CREATE TABLE operations_v26 (
+CREATE TABLE operations_v27 (
     id TEXT PRIMARY KEY,
     idempotency_key TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('start','prompt','resume','retire','notification','adopt','clear')),
@@ -18,7 +18,7 @@ CREATE TABLE operations_v26 (
     outcome TEXT NOT NULL CHECK (outcome IN ('pending','accepted','succeeded','failed','superseded','unknown'))
 );
 
-INSERT INTO operations_v26 (
+INSERT INTO operations_v27 (
     id, idempotency_key, kind, target_incarnation_id, intent_json,
     created_at_ms, resolved_at_ms, outcome
 )
@@ -28,7 +28,7 @@ SELECT
 FROM operations;
 
 DROP TABLE operations;
-ALTER TABLE operations_v26 RENAME TO operations;
+ALTER TABLE operations_v27 RENAME TO operations;
 
 CREATE UNIQUE INDEX operations_live_idempotency_key
     ON operations(idempotency_key)
@@ -36,7 +36,7 @@ CREATE UNIQUE INDEX operations_live_idempotency_key
 CREATE INDEX operations_target_kind_outcome
     ON operations(target_incarnation_id, kind, outcome);
 
-PRAGMA user_version = 26;
+PRAGMA user_version = 27;
 COMMIT;
 
 PRAGMA foreign_keys=ON;
