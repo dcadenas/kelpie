@@ -1,5 +1,6 @@
--- Keep failed operation history while allowing the caller's key to name a new
--- attempt. Every other outcome continues to reserve the key.
+-- Keep failed prompt history while allowing the caller's key to name a new
+-- prompt attempt. Non-prompt operations and every other prompt outcome
+-- continue to reserve the key globally.
 -- foreign_keys must be OFF outside the transaction so DROP of `operations`
 -- succeeds while operation_attempts/deliveries still reference it by name.
 PRAGMA foreign_keys=OFF;
@@ -31,7 +32,7 @@ ALTER TABLE operations_v26 RENAME TO operations;
 
 CREATE UNIQUE INDEX operations_live_idempotency_key
     ON operations(idempotency_key)
-    WHERE outcome != 'failed';
+    WHERE kind != 'prompt' OR outcome != 'failed';
 CREATE INDEX operations_target_kind_outcome
     ON operations(target_incarnation_id, kind, outcome);
 

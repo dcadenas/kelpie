@@ -279,6 +279,11 @@ MUST remain intact. `pending`, `accepted`, `superseded`, and `unknown` MUST
 refuse a fresh operation. Every refusal MUST name the prior outcome so the caller
 can reconcile it.
 
+Non-prompt operations retain their key for every outcome. Operation-specific
+replay MAY return a recorded result, but reuse MUST NOT mint a second logical
+identity or repeat another non-prompt effect. When reuse is refused, the error
+MUST name the prior operation and outcome.
+
 ### Message
 
 A `Message` MUST contain:

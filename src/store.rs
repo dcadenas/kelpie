@@ -689,6 +689,7 @@ impl Store {
         let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
+        refuse_reused_non_prompt_idempotency_key(&tx, &intent.idempotency_key)?;
         refuse_name_held_by_socket_waiter(&tx, &intent.public_name)?;
         let logical_agent_id = if let Some(existing) = intent.logical_agent_id {
             let found: Option<String> = tx
@@ -863,6 +864,7 @@ impl Store {
         let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
+        refuse_reused_non_prompt_idempotency_key(&tx, &intent.idempotency_key)?;
         let conflict: Option<String> = tx
             .query_row(
                 "SELECT id FROM incarnations
@@ -1157,7 +1159,7 @@ impl Store {
                 "SELECT o.id, o.target_incarnation_id, i.logical_agent_id
                  FROM operations o
                  JOIN incarnations i ON i.id = o.target_incarnation_id
-                 WHERE o.idempotency_key = ?1",
+                 WHERE o.idempotency_key = ?1 AND o.kind IN ('start', 'adopt')",
                 [idempotency_key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -3559,6 +3561,7 @@ impl Store {
         let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
+        refuse_reused_non_prompt_idempotency_key(&tx, idempotency_key)?;
         let owner: Option<String> = tx
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1 AND state = 'ready'",
@@ -3896,6 +3899,7 @@ impl Store {
         let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
+        refuse_reused_non_prompt_idempotency_key(&tx, idempotency_key)?;
         let changed = tx.execute(
             "UPDATE incarnations SET state = 'retiring' WHERE id = ?1 AND state = 'ready'",
             [incarnation_id.to_string()],
@@ -8803,6 +8807,29 @@ fn operation_outcome_name(value: OperationOutcome) -> &'static str {
     }
 }
 
+fn refuse_reused_non_prompt_idempotency_key(
+    connection: &Connection,
+    idempotency_key: &str,
+) -> Result<(), StoreError> {
+    let prior: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id, outcome FROM operations WHERE idempotency_key = ?1
+             ORDER BY (kind != 'prompt' OR outcome != 'failed') DESC, created_at_ms DESC, id DESC
+             LIMIT 1",
+            [idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((operation_id, outcome)) = prior {
+        return Err(idempotency_conflict(
+            idempotency_key,
+            &operation_id,
+            parse_operation_outcome(&outcome)?,
+        ));
+    }
+    Ok(())
+}
+
 fn idempotency_conflict(
     idempotency_key: &str,
     operation_id: &str,
@@ -9543,6 +9570,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_start_still_reserves_its_idempotency_key() {
+        let mut store = Store::in_memory().expect("store");
+        let start_intent = intent("worker", "term-1", "failed-start-key");
+        let prior = store.declare_start(&start_intent).expect("declare");
+        store
+            .begin_attempt(prior.operation_id, prior.incarnation_id, "start-request")
+            .expect("attempt");
+        store
+            .mark_submitted(prior.operation_id, 1, "start-request")
+            .expect("submitted");
+        store
+            .mark_rejected(
+                prior.operation_id,
+                prior.incarnation_id,
+                "rejected",
+                DeliveryOutcome::Rejected,
+            )
+            .expect("failed");
+
+        let error = store
+            .declare_start(&start_intent)
+            .expect_err("non-prompt key remains reserved");
+        let message = error.to_string();
+        assert!(message.contains("outcome failed"), "{message}");
+        assert!(
+            message.contains(&prior.operation_id.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn durable_store_rejects_repository_paths() {
         let result = Store::open("kelpie-state.sqlite3");
         assert!(matches!(result, Err(StoreError::UnsafeLocation(_))));
@@ -9655,6 +9713,128 @@ mod tests {
                 },
             )
             .expect("adopt works after migrate");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn version_twenty_five_store_migrates_prompt_idempotency_constraint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("v25.sqlite3");
+        let agent_id = LogicalAgentId::new();
+        let incarnation_id = IncarnationId::new();
+        let prompt_id = OperationId::new();
+        {
+            let connection = Connection::open(&path).expect("db");
+            for migration in [
+                include_str!("../migrations/001_initial.sql"),
+                include_str!("../migrations/002_operator_notices.sql"),
+                include_str!("../migrations/003_operator_message_sender.sql"),
+                include_str!("../migrations/004_obligation_creation_sequence.sql"),
+                include_str!("../migrations/005_obligation_cancellation.sql"),
+                include_str!("../migrations/006_adopt_operation.sql"),
+                include_str!("../migrations/007_name_authority.sql"),
+                include_str!("../migrations/008_scheduled_delivery.sql"),
+                include_str!("../migrations/009_observed_attribution.sql"),
+                include_str!("../migrations/010_obligation_reminders.sql"),
+                include_str!("../migrations/011_pending_rename.sql"),
+                include_str!("../migrations/012_renew.sql"),
+                include_str!("../migrations/013_conversation_age.sql"),
+                include_str!("../migrations/014_renew_clear_stall.sql"),
+                include_str!("../migrations/015_lazy_rotation.sql"),
+                include_str!("../migrations/016_clear_operation.sql"),
+                include_str!("../migrations/017_settle_stranded_prepare_asks.sql"),
+                include_str!("../migrations/018_cancellation_message.sql"),
+                include_str!("../migrations/019_cancellation_response_link.sql"),
+                include_str!("../migrations/020_socket_waiter.sql"),
+                include_str!("../migrations/021_socket_inbox_keys.sql"),
+                include_str!("../migrations/022_owing_cancellation.sql"),
+                include_str!("../migrations/023_renew_active_clock.sql"),
+                include_str!("../migrations/024_reminder_scan_indexes.sql"),
+                include_str!("../migrations/025_inflight_final_indexes.sql"),
+            ] {
+                connection.execute_batch(migration).expect("migrate step");
+            }
+            connection
+                .execute(
+                    "INSERT INTO logical_agents
+                     (id, public_name, explicitly_parentless, created_at_ms)
+                     VALUES (?1, 'worker', 1, 1)",
+                    [agent_id.to_string()],
+                )
+                .expect("agent");
+            connection
+                .execute(
+                    "INSERT INTO incarnations (
+                        id, logical_agent_id, herdr_session, intended_pane_id,
+                        expected_terminal_id, backend_kind, backend_args_json,
+                        working_directory, created_at_ms, state
+                     ) VALUES (?1, ?2, 's', 'w1:p1', 't1', 'codex', '[]', '/tmp', 1, 'ready')",
+                    params![incarnation_id.to_string(), agent_id.to_string()],
+                )
+                .expect("incarnation");
+            connection
+                .execute(
+                    "INSERT INTO operations (
+                        id, idempotency_key, kind, target_incarnation_id, intent_json,
+                        created_at_ms, resolved_at_ms, outcome
+                     ) VALUES (?1, 'failed-prompt', 'prompt', ?2, '{}', 1, 2, 'failed')",
+                    params![prompt_id.to_string(), incarnation_id.to_string()],
+                )
+                .expect("operation");
+            connection
+                .execute(
+                    "INSERT INTO operation_attempts (
+                        operation_id, attempt_number, request_id, started_at_ms, phase
+                     ) VALUES (?1, 1, 'req', 1, 'rejected')",
+                    [prompt_id.to_string()],
+                )
+                .expect("attempt");
+        }
+
+        let store = Store::open(&path).expect("open migrates to v26");
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let foreign_key_errors: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign key check");
+        assert_eq!(foreign_key_errors, 0);
+        store
+            .connection
+            .execute(
+                "INSERT INTO operations (
+                    id, idempotency_key, kind, target_incarnation_id, intent_json,
+                    created_at_ms, outcome
+                 ) VALUES (?1, 'failed-prompt', 'prompt', ?2, '{}', 3, 'pending')",
+                params![OperationId::new().to_string(), incarnation_id.to_string()],
+            )
+            .expect("failed prompt frees key");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operations (
+                    id, idempotency_key, kind, target_incarnation_id, intent_json,
+                    created_at_ms, resolved_at_ms, outcome
+                 ) VALUES (?1, 'failed-start', 'start', ?2, '{}', 4, 5, 'failed')",
+                params![OperationId::new().to_string(), incarnation_id.to_string()],
+            )
+            .expect("first failed start");
+        let duplicate_start = store.connection.execute(
+            "INSERT INTO operations (
+                id, idempotency_key, kind, target_incarnation_id, intent_json,
+                created_at_ms, outcome
+             ) VALUES (?1, 'failed-start', 'start', ?2, '{}', 6, 'pending')",
+            params![OperationId::new().to_string(), incarnation_id.to_string()],
+        );
+        assert!(
+            duplicate_start.is_err(),
+            "failed start must keep key reserved"
+        );
     }
 
     #[test]

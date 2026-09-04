@@ -191,6 +191,10 @@ another Herdr write. A terminally failed prompt permits a fresh operation under
 the same caller key while retaining the failed history. Pending, accepted,
 superseded, and unknown operations refuse the retry and name the prior operation
 and outcome; callers must reconcile rather than vary the key.
+This failure-retry exception is prompt-only. Start, adopt, clear, and retire
+keys remain reserved after every outcome: an operation-specific replay may
+return a recorded result, but a refusal reports the prior operation and outcome
+rather than creating another identity or effect.
 
 On a `tell`, optional `due_at_ms` (Unix epoch milliseconds, same store
 `SystemTime` clock as other timestamps) persists the delivery as `queued` and
