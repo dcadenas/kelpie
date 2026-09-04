@@ -549,12 +549,14 @@ impl Daemon {
                 .filter(|prompt| prompt.lease.is_none())
                 .count();
             eprintln!(
-                "kelpied: slow poll {pass_elapsed} starts={} clears={} prompts={} opening={} reading={}",
+                "kelpied: slow poll {pass_elapsed} starts={} clears={} prompts={} opening={} reading={} writes={} reads={}",
                 self.awaiting_starts.len(),
                 self.awaiting_clears.len(),
                 self.awaiting_prompts.len(),
                 opening_prompts,
                 self.reading.len(),
+                self.awaiting_writes.len(),
+                self.awaiting_reads.len(),
             );
         }
         let advanced = start_advanced
