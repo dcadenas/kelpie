@@ -120,7 +120,7 @@ pub struct NameObligation {
 }
 
 /// Everything known about who holds a public name. Read-only: this is the data
-/// behind create-new refusals and `name-info`.
+/// behind create-new refusals and `who --history`.
 #[derive(Debug, Clone)]
 pub struct NameInfo {
     pub public_name: String,
@@ -293,9 +293,28 @@ pub struct PendingObligation {
     pub state: ObligationState,
 }
 
-/// One ask's durable content and parties — the amnesia-recovery read: a
-/// renewed or restarted agent re-reads what it was asked through the id its
-/// reminder carries. Read-only.
+/// Current durable delivery state for one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageDeliveryInfo {
+    pub transport: DeliveryTransport,
+    pub outcome: DeliveryOutcome,
+    pub attempt_number: i64,
+    pub scheduled_at_ms: i64,
+    pub attempted_at_ms: Option<i64>,
+    pub resolved_at_ms: Option<i64>,
+}
+
+/// One reply sent against an ask, including its current delivery state.
+#[derive(Debug, Clone)]
+pub struct AskReplyInfo {
+    pub message_id: String,
+    pub body: String,
+    pub disposition: ReplyDisposition,
+    pub created_at_ms: i64,
+    pub delivery: MessageDeliveryInfo,
+}
+
+/// One ask's durable content, parties, delivery, replies, and obligation.
 #[derive(Debug, Clone)]
 pub struct AskInfo {
     pub ask_message_id: String,
@@ -308,7 +327,23 @@ pub struct AskInfo {
     pub created_at_ms: i64,
     pub last_activity_at_ms: i64,
     pub cancellation_reason: Option<String>,
+    pub delivery: MessageDeliveryInfo,
+    pub replies: Vec<AskReplyInfo>,
 }
+
+type DeliveryRow = (String, String, i64, i64, Option<i64>, Option<i64>);
+type AskReplyRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// One of the agent's waits that was cancelled while it had no Ready
 /// incarnation.
@@ -754,9 +789,11 @@ impl Store {
         if let Some(expected_name) = intent.public_name.as_deref()
             && evidence.public_name != expected_name
         {
-            return Err(StoreError::Conflict(
-                "live agent name does not match the requested public name".into(),
-            ));
+            return Err(StoreError::Conflict(format!(
+                "live agent name {} does not match requested {}; rename the live Herdr agent to \
+                 {expected_name} first, then adopt it",
+                evidence.public_name, expected_name
+            )));
         }
         if let Some(expected_kind) = intent.backend_kind.as_deref()
             && evidence.backend_kind != expected_kind
@@ -2314,6 +2351,30 @@ impl Store {
         parse_delivery_transport(&value)
     }
 
+    /// Report whether one logical agent is currently a delivery target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent is missing.
+    pub fn agent_is_addressable(
+        &self,
+        logical_agent_id: LogicalAgentId,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT CASE
+                    WHEN l.delivery_transport = 'socket_inbox'
+                        THEN l.targeting_ended_at_ms IS NULL
+                    ELSE EXISTS (SELECT 1 FROM incarnations i
+                                  WHERE i.logical_agent_id = l.id AND i.state = 'ready')
+                 END
+                 FROM logical_agents l WHERE l.id = ?1",
+                [logical_agent_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     /// Atomically persist an ask, delivery, operation, and reply obligation.
     ///
     /// # Errors
@@ -2929,7 +2990,7 @@ impl Store {
     /// obligation touching them, with both parties resolved to names and
     /// liveness.
     ///
-    /// Read-only. This is the data behind create-new refusals and `name-info`.
+    /// Read-only. This is the data behind create-new refusals and `who --history`.
     ///
     /// # Errors
     ///
@@ -3090,7 +3151,7 @@ impl Store {
              --terminal <terminal> --logical-id {}\n  - cancel each ask, e.g.: \
              kelpie cancel {} --reason \"<why>\" --sender-id {}\n  - or take a \
              different name: rename this agent in herdr, then run kelpie adopt\
-             \nkelpie name-info {} shows the full picture any time",
+             \nkelpie who {} --history shows the full picture any time",
             prior.logical_agent_id,
             example.ask_message_id,
             example.asker_agent_id,
@@ -3124,7 +3185,7 @@ impl Store {
     }
 
     /// Compose the no-Ready-alias conflict: when the name has claimants, name
-    /// them, count what they are owed, and point at `name-info`; when it has
+    /// them, count what they are owed, and point at `who --history`; when it has
     /// none, keep the live-but-unadopted hint.
     fn alias_unready_message(&self, public_name: &str) -> String {
         let Ok(info) = Self::name_info_on(&self.connection, public_name) else {
@@ -3141,7 +3202,7 @@ impl Store {
         format!(
             "no ready agent for alias {public_name}; {} logical agent(s) already hold \
              this name, none of them live, {} unresolved obligation(s) — \
-             kelpie name-info {public_name} shows who, and kelpie adopt \
+              kelpie who {public_name} --history shows who, and kelpie adopt \
              --logical-id <id> or kelpie cancel settles it",
             info.claimants.len(),
             owed,
@@ -4330,8 +4391,8 @@ impl Store {
         Ok((ask_id, reason.to_string(), audience))
     }
 
-    /// Re-read one ask's durable content and parties by its message id — the
-    /// amnesia-recovery read behind a reminder's reply-to id. Read-only.
+    /// Re-read one ask's durable content, delivery, replies, and parties by its
+    /// message id. Read-only.
     ///
     /// # Errors
     ///
@@ -4391,6 +4452,8 @@ impl Store {
                 "ask message does not name an obligation".into(),
             ));
         };
+        let delivery = self.message_delivery_info(ask_message_id)?;
+        let replies = self.ask_replies(ask_message_id)?;
         Ok(AskInfo {
             ask_message_id: ask_message_id.to_string(),
             body,
@@ -4402,6 +4465,108 @@ impl Store {
             created_at_ms: created,
             last_activity_at_ms: last_activity,
             cancellation_reason: reason,
+            delivery,
+            replies,
+        })
+    }
+
+    fn ask_replies(&self, ask_message_id: MessageId) -> Result<Vec<AskReplyInfo>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.body, m.disposition, m.created_at_ms,
+                    d.delivery_transport, d.outcome, d.attempt_number,
+                    d.scheduled_at_ms, d.attempted_at_ms, d.resolved_at_ms
+               FROM messages m
+               JOIN deliveries d ON d.message_id = m.id
+                AND d.attempt_number = (SELECT MAX(latest.attempt_number)
+                                          FROM deliveries latest
+                                         WHERE latest.message_id = m.id)
+              WHERE m.kind = 'reply' AND m.reply_to_message_id = ?1
+              ORDER BY m.created_at_ms, m.id",
+        )?;
+        let rows = statement.query_map([ask_message_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })?;
+        let mut replies = Vec::new();
+        for row in rows {
+            let (
+                message_id,
+                reply_body,
+                disposition,
+                reply_created_at_ms,
+                transport,
+                outcome,
+                attempt_number,
+                scheduled_at_ms,
+                attempted_at_ms,
+                resolved_at_ms,
+            ): AskReplyRow = row?;
+            replies.push(AskReplyInfo {
+                message_id,
+                body: reply_body,
+                disposition: parse_reply_disposition(&disposition)?,
+                created_at_ms: reply_created_at_ms,
+                delivery: MessageDeliveryInfo {
+                    transport: parse_delivery_transport(&transport)?,
+                    outcome: parse_delivery_outcome(&outcome)?,
+                    attempt_number,
+                    scheduled_at_ms,
+                    attempted_at_ms,
+                    resolved_at_ms,
+                },
+            });
+        }
+        Ok(replies)
+    }
+
+    fn message_delivery_info(
+        &self,
+        message_id: MessageId,
+    ) -> Result<MessageDeliveryInfo, StoreError> {
+        let row: Option<DeliveryRow> = self
+            .connection
+            .query_row(
+                "SELECT delivery_transport, outcome, attempt_number, scheduled_at_ms,
+                        attempted_at_ms, resolved_at_ms
+                   FROM deliveries
+                  WHERE message_id = ?1
+                  ORDER BY attempt_number DESC
+                  LIMIT 1",
+                [message_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((transport, outcome, attempt_number, scheduled, attempted, resolved)) = row else {
+            return Err(StoreError::InvalidRecord(format!(
+                "message {message_id} has no delivery"
+            )));
+        };
+        Ok(MessageDeliveryInfo {
+            transport: parse_delivery_transport(&transport)?,
+            outcome: parse_delivery_outcome(&outcome)?,
+            attempt_number,
+            scheduled_at_ms: scheduled,
+            attempted_at_ms: attempted,
+            resolved_at_ms: resolved,
         })
     }
 
@@ -11971,7 +12136,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("1 unresolved obligation(s)"), "{message}");
-        assert!(message.contains("kelpie name-info dead-name"), "{message}");
+        assert!(
+            message.contains("kelpie who dead-name --history"),
+            "{message}"
+        );
 
         // A name with no claimants keeps the live-but-unadopted hint.
         let fresh = store
@@ -13548,6 +13716,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn socket_inbox_final_resolves_only_on_ack() {
         let mut store = Store::in_memory().expect("store");
         let waiter = store
@@ -13640,6 +13809,16 @@ mod tests {
                 .expect("idempotent"),
             DeliveryOutcome::Accepted
         );
+        let info = store.ask_info(ask.message_id).expect("full ask info");
+        assert_eq!(info.state, "resolved");
+        assert_eq!(info.delivery.outcome, DeliveryOutcome::Pending);
+        assert_eq!(info.replies.len(), 2);
+        assert_eq!(info.replies[0].body, "working");
+        assert_eq!(info.replies[0].disposition, ReplyDisposition::Progress);
+        assert_eq!(info.replies[0].delivery.outcome, DeliveryOutcome::Accepted);
+        assert_eq!(info.replies[1].body, "done");
+        assert_eq!(info.replies[1].disposition, ReplyDisposition::Final);
+        assert_eq!(info.replies[1].delivery.outcome, DeliveryOutcome::Accepted);
         let second = store.create_reply(
             ask.message_id,
             owing.logical_agent_id,

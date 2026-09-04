@@ -306,6 +306,64 @@ fn typed_whoami_from_pane_and_alias_ambiguity() {
     server.join().expect("server");
 }
 
+#[test]
+fn typed_who_defaults_to_the_calling_pane_and_finds_a_waiter_by_name() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(directory.path().join("db.sqlite3")).expect("store");
+    let mut store = store_ready(store, "alice", "w1:p1", "term-a");
+    let waiter = store
+        .register_socket_waiter("botserver", Parent::Parentless, "cli-waiter")
+        .expect("waiter");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let kelpie = Kelpie::new(
+        store,
+        HerdrClient::new(directory.path().join("unused.sock"), Duration::from_secs(1)),
+    );
+    let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind");
+    let server = thread::spawn(move || {
+        daemon.serve_one().expect("who self");
+        daemon.serve_one().expect("who waiter");
+    });
+
+    let self_output = Command::new(env!("CARGO_BIN_EXE_kelpie"))
+        .args([
+            "--socket",
+            kelpie_socket.to_str().expect("socket"),
+            "--json",
+            "who",
+        ])
+        .env("HERDR_PANE_ID", "w1:p1")
+        .output()
+        .expect("who self");
+    assert!(self_output.status.success());
+    let self_response: Value = serde_json::from_slice(&self_output.stdout).expect("self JSON");
+    assert_eq!(self_response["result"]["public_name"], "alice");
+    assert_eq!(
+        self_response["result"]["delivery_transport"],
+        "herdr_prompt"
+    );
+
+    let waiter_output = run_cli(&[
+        "--socket",
+        kelpie_socket.to_str().expect("socket"),
+        "--json",
+        "who",
+        "botserver",
+    ]);
+    assert!(waiter_output.status.success());
+    let waiter_response: Value =
+        serde_json::from_slice(&waiter_output.stdout).expect("waiter JSON");
+    assert_eq!(
+        waiter_response["result"]["logical_agent_id"],
+        waiter.logical_agent_id.to_string()
+    );
+    assert_eq!(
+        waiter_response["result"]["delivery_transport"],
+        "socket_inbox"
+    );
+    server.join().expect("server");
+}
+
 fn store_ready(mut store: Store, name: &str, pane: &str, terminal: &str) -> Store {
     store
         .declare_adopt(

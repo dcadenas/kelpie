@@ -719,7 +719,8 @@ Kelpie MUST expose semantic operations equivalent to:
 - `reply(message_id, payload, progress|final)`;
 - `pending(agent)`;
 - `ask-info(message_id)` — read-only re-read of one ask's durable body,
-  parties, and state, through the id its reminder carries;
+  parties, delivery outcome, replies with their delivery outcomes, and
+  obligation state, through the id its reminder carries;
 - `cancel(message_id, reason)`.
 
 A cancel MUST settle an `open` or `in_progress` ask for any same-user
@@ -769,6 +770,18 @@ potentially ambiguous.
 Command RPCs (`tell`, `ask`, `reply`, `waiter.register`, `waiter.retire`, and
 the other methods) MAY use one
 newline-delimited JSON request per connection.
+
+Kelpie MUST expose one `who` identity read accepting exactly one live alias,
+pane ID, logical agent ID, or incarnation ID selector. With no selector the
+typed client MUST default to its calling pane. The result MUST identify the
+logical agent, its public name, its delivery transport, whether it is currently
+addressable, and its incarnation and attribution when it has an incarnation.
+An alias history read MUST return every claimant and unresolved obligation for
+that name. The legacy `whoami`, `name.info`, and `attribution` methods MUST
+remain available with their existing result shapes during this migration.
+
+Administration of a socket waiter MUST accept either its logical agent ID or
+its unique active public alias. Alias ambiguity MUST fail closed.
 
 That one-shot RPC MUST NOT be the receive path for `socket_inbox` deliveries.
 `pending` lists what an agent owes. `ask-info` re-reads one ask by id. Those

@@ -113,7 +113,7 @@ Default paths, all overridable by flag:
 Open a pane in Herdr, start your coding agent in it, and have it run:
 
 ```sh
-kelpie whoami
+kelpie who
 ```
 
 The client reads the pane id Herdr exports, the daemon adopts that pane as a

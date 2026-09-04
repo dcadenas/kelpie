@@ -333,6 +333,14 @@ enum ClientReadKind {
     Attribution {
         incarnation_id: IncarnationId,
     },
+    WhoAttribution {
+        incarnation_id: IncarnationId,
+    },
+    WhoPane {
+        pane_id: String,
+        lazy_key: String,
+        refresh: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -682,7 +690,9 @@ impl Daemon {
             ClientReadKind::Recover
             | ClientReadKind::Whoami { .. }
             | ClientReadKind::Alias { .. }
-            | ClientReadKind::Attribution { .. } => HerdrJob::Snapshot {
+            | ClientReadKind::Attribution { .. }
+            | ClientReadKind::WhoAttribution { .. }
+            | ClientReadKind::WhoPane { .. } => HerdrJob::Snapshot {
                 job_id,
                 negotiate: true,
             },
@@ -3943,6 +3953,25 @@ fn serve_parsed_line(
                 }
             }
         }
+        Ok(request) if request.method == "who" => match prepare_who_read(&request, kelpie) {
+            Ok(Some(kind)) => {
+                return Ok(Served::AwaitingRead(Box::new(AwaitingRead {
+                    request_id: request.id,
+                    stream,
+                    kind,
+                })));
+            }
+            Ok(None) => {
+                let response = respond(&request.id, dispatch_who(request.params, kelpie));
+                write_response(&mut stream, &response)?;
+                return Ok(Served::Answered);
+            }
+            Err(error) => {
+                let response = respond(&request.id, Err(error));
+                write_response(&mut stream, &response)?;
+                return Ok(Served::Answered);
+            }
+        },
         Ok(request) if request.method == "report" => {
             let params = serde_json::from_value::<ReportParams>(request.params.clone()).map_err(
                 |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
@@ -4056,13 +4085,21 @@ fn serve_parsed_line(
                 .map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
                 })?;
-            match kelpie.prepare_retire_waiter(params.logical_agent_id) {
+            let logical_agent_id = match resolve_waiter_retire_target(&params, kelpie) {
+                Ok(id) => id,
+                Err(error) => {
+                    let response = respond(&request.id, Err(error));
+                    write_response(&mut stream, &response)?;
+                    return Ok(Served::Answered);
+                }
+            };
+            match kelpie.prepare_retire_waiter(logical_agent_id) {
                 Ok(prepared) => {
                     return Ok(Served::AwaitingWaiterRetire(Box::new(
                         PendingWaiterRetire {
                             request_id: request.id,
                             stream,
-                            logical_agent_id: params.logical_agent_id,
+                            logical_agent_id,
                             prepared,
                         },
                     )));
@@ -4355,6 +4392,7 @@ fn launch_result(created: crate::slice::LaunchResult) -> Value {
 fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
     let result = match request.method.as_str() {
         "whoami" => dispatch_whoami(request.params, kelpie, &request.id),
+        "who" => dispatch_who(request.params, kelpie),
         "recover" => dispatch_recover(kelpie),
         "start" | "handoff" => dispatch_start(request.params, kelpie),
         "adopt" => dispatch_adopt(request.params, kelpie),
@@ -4506,6 +4544,118 @@ fn dispatch_whoami(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WhoIdentity {
+    Incarnation(IncarnationId),
+    SocketWaiter(LogicalAgentId),
+}
+
+fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdentity, SliceError> {
+    let selectors = usize::from(params.incarnation_id.is_some())
+        + usize::from(params.agent_id.is_some())
+        + usize::from(params.alias.is_some())
+        + usize::from(params.pane_id.is_some());
+    if selectors != 1 {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "provide exactly one of incarnation_id, agent_id, alias, or pane_id".into(),
+        )));
+    }
+    if let Some(incarnation_id) = params.incarnation_id {
+        return Ok(WhoIdentity::Incarnation(incarnation_id));
+    }
+    if let Some(agent_id) = params.agent_id {
+        return match kelpie.store().delivery_transport(agent_id)? {
+            crate::domain::DeliveryTransport::HerdrPrompt => kelpie
+                .store()
+                .newest_incarnation_for_agent(agent_id)
+                .map(WhoIdentity::Incarnation)
+                .map_err(SliceError::Store),
+            crate::domain::DeliveryTransport::SocketInbox => {
+                Ok(WhoIdentity::SocketWaiter(agent_id))
+            }
+        };
+    }
+    if let Some(alias) = params.alias.as_deref() {
+        let ready = kelpie.store().find_ready_alias(alias)?;
+        let waiter = kelpie.store().active_socket_waiter_for_alias(alias)?;
+        return match (ready, waiter) {
+            (Some(_), Some(_)) => Err(SliceError::Store(StoreError::Conflict(format!(
+                "alias {alias} is simultaneously held by a Ready incarnation and an active socket waiter"
+            )))),
+            (Some((_, incarnation)), None) => Ok(WhoIdentity::Incarnation(incarnation)),
+            (None, Some(agent)) => Ok(WhoIdentity::SocketWaiter(agent)),
+            (None, None) => Err(SliceError::Store(StoreError::Conflict(format!(
+                "no addressable agent for alias {alias}"
+            )))),
+        };
+    }
+    kelpie
+        .store()
+        .ready_identity_for_pane(params.pane_id.as_deref().unwrap_or_default())
+        .map(|identity| WhoIdentity::Incarnation(identity.incarnation_id))
+        .map_err(SliceError::Store)
+}
+
+fn who_identity_response(
+    kelpie: &Kelpie,
+    identity: WhoIdentity,
+    reason: Option<String>,
+) -> Result<Value, SliceError> {
+    match identity {
+        WhoIdentity::Incarnation(incarnation_id) => {
+            let mut result = attribution_response(kelpie, incarnation_id, reason)?;
+            result["delivery_transport"] = serde_json::json!("herdr_prompt");
+            result["addressable"] =
+                serde_json::json!(result["incarnation_state"].as_str() == Some("ready"));
+            Ok(result)
+        }
+        WhoIdentity::SocketWaiter(logical_agent_id) => Ok(serde_json::json!({
+            "logical_agent_id": logical_agent_id,
+            "incarnation_id": null,
+            "public_name": kelpie.store().agent_address(logical_agent_id)?,
+            "delivery_transport": "socket_inbox",
+            "addressable": kelpie.store().agent_is_addressable(logical_agent_id)?,
+            "backend_kind": null,
+            "incarnation_state": null,
+            "requested": null,
+            "observed": null,
+            "observations": [],
+        })),
+    }
+}
+
+fn dispatch_who(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<WhoParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if params.history {
+        let (Some(alias), None, None, None, false) = (
+            params.alias.as_deref(),
+            params.agent_id,
+            params.incarnation_id,
+            params.pane_id.as_deref(),
+            params.refresh,
+        ) else {
+            return Err(SliceError::Store(StoreError::InvalidRecord(
+                "who history requires exactly one alias and does not accept refresh".into(),
+            )));
+        };
+        return dispatch_name_info(serde_json::json!({"name": alias}), kelpie);
+    }
+    let identity = resolve_who_identity(&params, kelpie)?;
+    if params.refresh && matches!(identity, WhoIdentity::SocketWaiter(_)) {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "who --refresh requires an incarnation; socket waiters have no attribution".into(),
+        )));
+    }
+    let reason = match identity {
+        WhoIdentity::Incarnation(incarnation_id) if params.refresh => {
+            kelpie.refresh_attribution(incarnation_id)?
+        }
+        _ => None,
+    };
+    who_identity_response(kelpie, identity, reason)
+}
+
 /// Re-read one ask's durable content and parties by its message id — the
 /// amnesia-recovery read behind a reminder's reply-to id. Read-only.
 fn dispatch_ask_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
@@ -4527,6 +4677,28 @@ fn dispatch_ask_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceE
         "created_at_ms": info.created_at_ms,
         "last_activity_at_ms": info.last_activity_at_ms,
         "cancellation_reason": info.cancellation_reason,
+        "delivery": {
+            "transport": info.delivery.transport,
+            "outcome": info.delivery.outcome,
+            "attempt_number": info.delivery.attempt_number,
+            "scheduled_at_ms": info.delivery.scheduled_at_ms,
+            "attempted_at_ms": info.delivery.attempted_at_ms,
+            "resolved_at_ms": info.delivery.resolved_at_ms,
+        },
+        "replies": info.replies.iter().map(|reply| serde_json::json!({
+            "message_id": reply.message_id,
+            "body": reply.body,
+            "disposition": reply.disposition,
+            "created_at_ms": reply.created_at_ms,
+            "delivery": {
+                "transport": reply.delivery.transport,
+                "outcome": reply.delivery.outcome,
+                "attempt_number": reply.delivery.attempt_number,
+                "scheduled_at_ms": reply.delivery.scheduled_at_ms,
+                "attempted_at_ms": reply.delivery.attempted_at_ms,
+                "resolved_at_ms": reply.delivery.resolved_at_ms,
+            }
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -4586,7 +4758,7 @@ fn dispatch_name_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, Slice
 /// separate keys and are never merged, so requested values can never be read as
 /// proof of what served a turn.
 fn dispatch_attribution(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
-    let params = serde_json::from_value::<AttributionParams>(params)
+    let params = serde_json::from_value::<WhoParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let incarnation_id = resolve_attribution_incarnation(&params, kelpie)?;
     let reason = if params.refresh {
@@ -4598,7 +4770,7 @@ fn dispatch_attribution(params: Value, kelpie: &mut Kelpie) -> Result<Value, Sli
 }
 
 fn resolve_attribution_incarnation(
-    params: &AttributionParams,
+    params: &WhoParams,
     kelpie: &Kelpie,
 ) -> Result<IncarnationId, SliceError> {
     let selectors = usize::from(params.incarnation_id.is_some())
@@ -4647,7 +4819,7 @@ fn prepare_attribution_read(
     request: &ClientRequest,
     kelpie: &Kelpie,
 ) -> Result<Option<ClientReadKind>, SliceError> {
-    let params = serde_json::from_value::<AttributionParams>(request.params.clone())
+    let params = serde_json::from_value::<WhoParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let incarnation_id = resolve_attribution_incarnation(&params, kelpie)?;
     if params.refresh && kelpie.attribution_refresh_needs_snapshot(incarnation_id)? {
@@ -4991,7 +5163,72 @@ fn finish_client_read(kelpie: &mut Kelpie, kind: &ClientReadKind) -> Result<Valu
             let reason = kelpie.refresh_attribution(*incarnation_id)?;
             attribution_response(kelpie, *incarnation_id, reason)
         }
+        ClientReadKind::WhoAttribution { incarnation_id } => {
+            let reason = kelpie.refresh_attribution(*incarnation_id)?;
+            who_identity_response(kelpie, WhoIdentity::Incarnation(*incarnation_id), reason)
+        }
+        ClientReadKind::WhoPane {
+            pane_id,
+            lazy_key,
+            refresh,
+        } => {
+            let identity = kelpie.resolve_or_adopt_pane(pane_id, lazy_key)?;
+            let reason = if *refresh {
+                kelpie.refresh_attribution(identity.incarnation_id)?
+            } else {
+                None
+            };
+            who_identity_response(
+                kelpie,
+                WhoIdentity::Incarnation(identity.incarnation_id),
+                reason,
+            )
+        }
     }
+}
+
+fn prepare_who_read(
+    request: &ClientRequest,
+    kelpie: &Kelpie,
+) -> Result<Option<ClientReadKind>, SliceError> {
+    let params = serde_json::from_value::<WhoParams>(request.params.clone())
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if params.history {
+        if params.alias.is_none()
+            || params.agent_id.is_some()
+            || params.incarnation_id.is_some()
+            || params.pane_id.is_some()
+            || params.refresh
+        {
+            return Err(SliceError::Store(StoreError::InvalidRecord(
+                "who history requires exactly one alias and does not accept refresh".into(),
+            )));
+        }
+        return Ok(None);
+    }
+    if let Some(pane_id) = params.pane_id.as_deref()
+        && kelpie
+            .store()
+            .find_ready_identity_for_pane(pane_id)?
+            .is_none()
+    {
+        return Ok(Some(ClientReadKind::WhoPane {
+            pane_id: pane_id.to_string(),
+            lazy_key: params
+                .lazy_adopt_key
+                .clone()
+                .unwrap_or_else(|| request.id.clone()),
+            refresh: params.refresh,
+        }));
+    }
+    let identity = resolve_who_identity(&params, kelpie)?;
+    if let WhoIdentity::Incarnation(incarnation_id) = identity
+        && params.refresh
+        && kelpie.attribution_refresh_needs_snapshot(incarnation_id)?
+    {
+        return Ok(Some(ClientReadKind::WhoAttribution { incarnation_id }));
+    }
+    Ok(None)
 }
 
 fn prepare_whoami_read(
@@ -5042,8 +5279,34 @@ fn dispatch_waiter_register(params: Value, kelpie: &mut Kelpie) -> Result<Value,
 fn dispatch_waiter_retire(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<WaiterRetireParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-    let ended = kelpie.retire_waiter(params.logical_agent_id)?;
-    Ok(waiter_retire_result(params.logical_agent_id, &ended))
+    let logical_agent_id = resolve_waiter_retire_target(&params, kelpie)?;
+    let ended = kelpie.retire_waiter(logical_agent_id)?;
+    Ok(waiter_retire_result(logical_agent_id, &ended))
+}
+
+fn resolve_waiter_retire_target(
+    params: &WaiterRetireParams,
+    kelpie: &Kelpie,
+) -> Result<LogicalAgentId, SliceError> {
+    match (params.logical_agent_id, params.alias.as_deref()) {
+        (Some(id), None) => Ok(id),
+        (None, Some(alias)) => {
+            let ready = kelpie.store().find_ready_alias(alias)?;
+            let waiter = kelpie.store().active_socket_waiter_for_alias(alias)?;
+            match (ready, waiter) {
+                (None, Some(waiter)) => Ok(waiter),
+                (Some(_), Some(_)) => Err(SliceError::Store(StoreError::Conflict(format!(
+                    "alias {alias} is simultaneously held by a Ready incarnation and an active socket waiter"
+                )))),
+                _ => Err(SliceError::Store(StoreError::Conflict(format!(
+                    "no unique active socket waiter for alias {alias}"
+                )))),
+            }
+        }
+        _ => Err(SliceError::Store(StoreError::InvalidRecord(
+            "provide exactly one of logical_agent_id or alias".into(),
+        ))),
+    }
 }
 
 fn waiter_retire_result(logical_agent_id: LogicalAgentId, ended: &WaiterRetireOutcome) -> Value {
@@ -5790,7 +6053,10 @@ struct WaiterRegisterParams {
 
 #[derive(Debug, Deserialize)]
 struct WaiterRetireParams {
-    logical_agent_id: LogicalAgentId,
+    #[serde(default)]
+    logical_agent_id: Option<LogicalAgentId>,
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5931,9 +6197,9 @@ struct NameInfoParams {
     name: String,
 }
 
-/// Exactly one selector. More than one is ambiguous and fails closed.
+/// Unified identity selector used by `who`.
 #[derive(Debug, Deserialize)]
-struct AttributionParams {
+struct WhoParams {
     #[serde(default)]
     incarnation_id: Option<IncarnationId>,
     #[serde(default)]
@@ -5942,9 +6208,12 @@ struct AttributionParams {
     alias: Option<String>,
     #[serde(default)]
     pane_id: Option<String>,
-    /// Observe again before reporting, appending a new observation.
+    #[serde(default)]
+    history: bool,
     #[serde(default)]
     refresh: bool,
+    #[serde(default)]
+    lazy_adopt_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6191,6 +6460,57 @@ mod tests {
         assert!(absent["result"].is_null());
         assert_eq!(absent["error"]["class"], "conflict");
         server.join().expect("daemon thread");
+    }
+
+    #[test]
+    fn who_resolves_a_live_pane_agent_or_socket_waiter_and_keeps_name_history() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let pane = seed_ready(&mut store, "reviewer", "w1:p1", "term-a", "who-pane");
+        let waiter = store
+            .register_socket_waiter("botserver", Parent::Parentless, "who-waiter")
+            .expect("waiter");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+
+        let by_agent = dispatch_who(
+            serde_json::json!({"agent_id": pane.logical_agent_id}),
+            &mut kelpie,
+        )
+        .expect("pane agent");
+        assert_eq!(by_agent["incarnation_id"], pane.incarnation_id.to_string());
+        assert_eq!(by_agent["delivery_transport"], "herdr_prompt");
+
+        let by_name = dispatch_who(serde_json::json!({"alias": "botserver"}), &mut kelpie)
+            .expect("socket waiter");
+        assert_eq!(
+            by_name["logical_agent_id"],
+            waiter.logical_agent_id.to_string()
+        );
+        assert!(by_name["incarnation_id"].is_null());
+        assert_eq!(by_name["delivery_transport"], "socket_inbox");
+        assert!(
+            dispatch_who(
+                serde_json::json!({"alias": "botserver", "refresh": true}),
+                &mut kelpie,
+            )
+            .expect_err("waiters have no attribution")
+            .to_string()
+            .contains("no attribution")
+        );
+
+        let history = dispatch_who(
+            serde_json::json!({"alias": "botserver", "history": true}),
+            &mut kelpie,
+        )
+        .expect("history");
+        assert_eq!(history["name"], "botserver");
+        assert_eq!(history["claimants"].as_array().expect("claimants").len(), 1);
     }
 
     #[test]

@@ -28,7 +28,7 @@ contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
 `reply`, `clear`, `renew`, `renew.cancel`, `pending`, `cancel`, `retire`,
 `waiter.register`, `waiter.retire`, `inbox.claim`, `inbox.ack`,
-`notice.create`, `notice.list`, `name.info`, `ask.info`,
+`notice.create`, `notice.list`, `who`, `name.info`, `ask.info`, `attribution`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
 
 A client must finish its request line within 10 seconds of connecting. The
@@ -99,6 +99,16 @@ authentication boundary.
   waiter logical-agent ID and needs no incarnation. The resolved IDs and
   transport are what durable records store; later alias reuse does not retarget
   them. Results echo the resolved recipient IDs and delivery transport.
+- `who` accepts exactly one identity selector: `incarnation_id` (exact),
+  `agent_id` (that agent's newest incarnation, or its active socket waiter),
+  `alias` (the unique addressable Ready agent or active socket waiter), or
+  `pane_id`. With no CLI selector it defaults to `$HERDR_PANE_ID` and lazily
+  adopts that pane. The normal result carries `logical_agent_id`, nullable
+  `incarnation_id`, `public_name`, `delivery_transport`, and `addressable`;
+  Herdr-bound identities also carry `backend_kind`, `incarnation_state`,
+  `requested`, `observed`, and `observations`. `--refresh` refreshes attribution.
+  `who <alias> --history` instead returns every claimant and unresolved ask for
+  that name.
 - `waiter.register` creates a pane-less LogicalAgent with
   `delivery_transport=socket_inbox`. It mints no incarnation. `waiter.retire`
   ends that targeting and releases the name. Open or in-progress asks waiting
@@ -110,6 +120,8 @@ authentication boundary.
   the waiter do not remain queued. `ask` `from_operator` attributes
   the stored sender as the operator; `waiting_agent_id` stays the waiter, and
   occupant envelopes still use `from=` equal to the waiter's public name.
+  `waiter.retire` accepts either `logical_agent_id` or the unique active waiter
+  `alias`, so ending a waiter never requires reading Kelpie's database.
 - `inbox.claim` holds a reconnectable inbox for that waiter id. Deliveries
   arrive as `inbox.delivery` on that socket. `inbox.ack` marks the named
   delivery `accepted`. Persist is not acceptance.
@@ -365,7 +377,7 @@ notice. Each injection attempt is journaled under its own request ID.
 
 Completion replaces the recorded observed backend-native session reference,
 because the clear is what makes the prior reference false; leaving it would
-point `attribution` at a transcript that will never grow again. Recovery does
+point recorded attribution at a transcript that will never grow again. Recovery does
 not read that change as a replaced runtime: a session reference is not part of
 the exact live binding at all, for any agent. Over the
 clear window, deliveries addressed to that incarnation stay `queued` with their
@@ -385,7 +397,7 @@ kelpie renew [--recipient-id ID --recipient-incarnation ID] \
   [--due-in 45m | --due-at RFC3339 | --due-at-ms MS | --every 45m]
 ```
 
-With no recipient the client resolves the caller through `whoami` and arms the
+With no recipient the client resolves the caller through `who` and arms the
 policy on that incarnation. A caller identified only by agent id cannot
 self-target, because an agent id does not name an incarnation; those callers
 pass both exact IDs.
@@ -420,7 +432,7 @@ asks this agent was answering whose stop-notice no pane has received (`audience`
 `owing`, same other fields). A failure reading cancellations fails the whole
 request. It does not infer anything from current Herdr runtime state.
 
-`name.info` takes one public `name` and returns, read-only, every logical agent
+`who <name> --history` takes one public name and returns, read-only, every logical agent
 holding that name (`logical_agent_id`, `created_at_ms`, `delivery_transport`,
 Herdr-pane `live`, transport-level `addressable`, `unresolved_count`) and every
 unresolved ask touching them, each with both
@@ -430,10 +442,14 @@ a create-new refusal in one command: a refusal under this name lists the same
 asks, parties, and three remedies — continue the claimant with `--logical-id`,
 cancel each ask (`kelpie cancel <ask-id> --reason <why>`),
 or take a different name by renaming the agent in Herdr and adopting under it.
+The legacy `name.info` method and `name-info` command return exactly their
+previous result and stdout shapes.
 
 `ask.info` takes one ask `message_id` and returns, read-only, the ask's durable
 body, both parties (`asker` is the waiter, `responder` is the agent that owes
-the final reply, with agent ids and names), state, and timestamps. It is the
+the final reply, with agent ids and names), obligation state, timestamps, the
+ask delivery's current transport and outcome, and every progress or final reply
+with its body, disposition, timestamp, and current delivery state. It is the
 amnesia-recovery read: a renewed or restarted agent re-reads what it was asked
 through the id its reminder carries, instead of asking the sender to repeat
 itself.
@@ -514,19 +530,18 @@ continuity is `every_ms` plus a rising `cycle`, not a stable id.
 The report never interprets. No state is labelled healthy, stuck, or missing,
 because whether a state warrants attention is the consumer's policy. Requested
 model, provider, effort, and `backend_args` appear under `requested` on each
-incarnation and are launch intent; observed attribution stays behind
-`attribution`, and neither is presented as the other.
+incarnation and are launch intent; observed attribution is available through
+`who`, and neither is presented as the other.
 
 `live` (client `--live`) attaches Herdr's current agent status to each incarnation
 under `live`, matched by exact observed pane and terminal so a replaced runtime
 cannot lend its status to an older incarnation, and sets `live_snapshot_at_ms`.
 That status is Herdr's fact taken at report time, not durable Kelpie state, which
 is why it is opt-in and timestamped. The client command is `kelpie report
-[--live]`, printing a parentage tree; `--json` returns the graph. Params take
-exactly one selector: `incarnation_id` (exact), `agent_id` (that agent's newest
-incarnation by creation order), `alias` (requires a live Ready binding), or
-`pane_id` (read-only; unlike `whoami` it never lazily adopts). Two selectors are
-`invalid_request`; an absent target is `conflict`.
+[--live]`, printing a parentage tree; `--json` returns the graph.
+
+`who` takes exactly one selector as described under Identity and addressing.
+Two selectors are `invalid_request`; an absent target is `conflict`.
 
 The result carries `logical_agent_id`, `incarnation_id`, `public_name`,
 `backend_kind`, `incarnation_state`, a `requested` object, the latest
@@ -539,8 +554,9 @@ a verifier must not conflate them — `observed` is `null` with an empty
 it is `{"status":"reported","value":…}` when it did. Adapters exist for
 `claude`, `codex`, and `opencode`; every other backend kind records
 `undetermined`. The client command is
-`kelpie attribution [alias] | --pane ID | --agent-id ID | --incarnation-id ID`,
-defaulting to `$HERDR_PANE_ID`.
+`kelpie who [alias] | --pane ID | --agent-id ID | --incarnation-id ID`,
+defaulting to `$HERDR_PANE_ID`. The legacy `attribution` and `whoami` commands
+remain available with exactly their previous result and stdout shapes.
 
 Binding-time observation only sees what a backend has already written, and a
 backend may record its serving model only after its first turn. `--refresh`

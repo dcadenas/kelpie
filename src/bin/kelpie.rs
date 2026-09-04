@@ -8,10 +8,10 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kelpie::cli::{
-    AdoptArgs, BodySource, Caller, Command, Due, ExactRecipient, Invocation, Recipient,
-    StartCommand, StartParent, attribution_params, env_caller, format_receipt, generated_id,
-    message_params, parse_invocation, read_body, read_raw_request, typed_request, usage,
-    whoami_params,
+    AdoptArgs, AgentTarget, BodySource, Caller, Command, Due, ExactRecipient, Invocation,
+    Recipient, StartCommand, StartParent, attribution_params, command_usage, env_caller,
+    format_receipt, generated_id, message_params, parse_invocation, read_body, read_raw_request,
+    typed_request, usage, whoami_params,
 };
 use kelpie::domain::Parent;
 use serde_json::{Value, json};
@@ -53,8 +53,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("kelpie {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Invocation::Help => {
-            println!("{}", usage());
+        Invocation::Help { command } => {
+            println!(
+                "{}",
+                command
+                    .as_deref()
+                    .and_then(command_usage)
+                    .unwrap_or_else(|| usage().to_string())
+            );
             Ok(())
         }
         Invocation::Raw { socket } => exchange(&socket, &read_raw_request(&mut io::stdin())?, true),
@@ -224,6 +230,17 @@ fn build_typed(
             let mut params = whoami_params(&caller);
             params["lazy_adopt_key"] = json!(format!("{request_id}:lazy-adopt:self"));
             Ok(("whoami".into(), params))
+        }
+        Command::Who {
+            target,
+            history,
+            refresh,
+        } => {
+            let mut params = attribution_params(&target);
+            params["history"] = json!(history);
+            params["refresh"] = json!(refresh);
+            params["lazy_adopt_key"] = json!(format!("{request_id}:lazy-adopt:self"));
+            Ok(("who".into(), params))
         }
         Command::Rename { target, name } => {
             let mut params = json!({"name": name});
@@ -443,9 +460,12 @@ fn build_typed(
                 "idempotency_key": idempotency_key.unwrap_or_else(generated_id),
             }),
         )),
-        Command::WaiterRetire { logical_agent_id } => Ok((
+        Command::WaiterRetire { target } => Ok((
             "waiter.retire".into(),
-            json!({ "logical_agent_id": logical_agent_id }),
+            match target {
+                AgentTarget::Id(id) => json!({ "logical_agent_id": id }),
+                AgentTarget::Alias(alias) => json!({ "alias": alias }),
+            },
         )),
     }
 }

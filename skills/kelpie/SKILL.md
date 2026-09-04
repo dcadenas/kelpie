@@ -300,8 +300,8 @@ kelpie pending
 kelpie reminder-snooze <ask-id> --until-ms 1770000000000
 kelpie reminder-disable <ask-id>
 kelpie recover
-kelpie whoami
-kelpie attribution reviewer
+kelpie who
+kelpie who reviewer
 kelpie report
 kelpie report --live
 kelpie rename reviewer --name divine-context-pr75-sj2
@@ -312,7 +312,7 @@ kelpie start --name worker --pane w1:p1 --terminal term-1 --backend grok \
   --cwd /tmp/work --timeout-ms 5000 --keep-open --parentless --tell --stdin
 kelpie waiter-register --name inbox --parentless
 kelpie ask worker --sender-id <waiter-id> --from operator --stdin
-kelpie waiter-retire --logical-id <waiter-id>
+kelpie waiter-retire inbox
 ```
 
 Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Use exactly
@@ -438,7 +438,7 @@ Each request has `id`, `method`, and `params`. The daemon supports:
 
   These are a claim about intent, never evidence. Adoption observes a runtime
   Kelpie did not start, so requested configuration is never reported as observed;
-  use `kelpie attribution --refresh` for what actually served the turn.
+  use `kelpie who --refresh` for what actually served the turn.
 - `tell`: deliver a structured one-way message. Provide either exact
   `recipient` + `recipient_incarnation`, or `recipient_alias`. An alias resolves
   once to the unique active logical agent and then follows its fixed transport:
@@ -466,7 +466,8 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   clear is never resent automatically.
 - `waiter.register`: create a pane-less LogicalAgent with socket-inbox delivery.
   No incarnation, no pane occupant. `waiter.retire` ends that targeting and
-  releases the public name.   Open or in-progress asks that waiter is waiting on
+  releases the public name; it accepts the active waiter's name or
+  `--logical-id`. Open or in-progress asks that waiter is waiting on
   are cancelled in the same step, reason `waiter retired`; the owing occupant
   is notified when addressable unless that ask never left the queue, and a later
   final is refused as not an open obligation rather than as an undeliverable
@@ -483,6 +484,9 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   exception. The first working-to-idle/done boundary can trigger an earlier
   reminder when no progress or final reply was sent. Keep the returned message
   ID; it identifies the durable reply obligation.
+- `ask-info`: re-read an ask by message ID, including its original body,
+  parties, obligation state, current delivery outcome, and every progress or
+  final reply with its current delivery outcome.
 - `reply`: provide `reply_to` (the ask message ID), `body`, `progress` or
   `final` disposition, and `idempotency_key`. Kelpie resolves the exact owing
   and waiting logical agents from the durable obligation and binds the waiter's
@@ -545,14 +549,17 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   naming the policy, the target, whoever ended it, and the reason.
 - `pending`: list the recipient's durable `open` and `in_progress` obligations
   in creation order. It does not infer task state from Herdr.
-- `attribution`: report recorded attribution for one exact incarnation. Name it
+- `who`: report one identity and its recorded attribution. Name it
   with a live name, `--pane`, `--agent-id`, or `--incarnation-id`; the default
-  is your own pane. `requested` is what a launch asked for and is never proof of
+  is your own pane. It also resolves an active socket waiter by name, where
+  `incarnation_id` and attribution are absent. Add `--history` to a name to see
+  every claimant and unresolved obligation. `requested` is what a launch asked
+  for and is never proof of
   what served a turn; `observed` is adapter evidence. `observed none` means
   nothing was observed, which is not the same as an observed `undetermined`
   field. Adapters exist for `claude`, `codex`, and `opencode`; other kinds are
   `undetermined`. Do not report your own model as observed attribution.
-- `attribution --refresh`: observe again and append the result. A backend may
+- `who --refresh`: observe again and append the result. A backend may
   record its serving model only after its first turn, so an agent that was
   `undetermined` at startup becomes knowable later. Refreshing never rewrites an
   earlier observation and never guesses; when it still cannot tell,
