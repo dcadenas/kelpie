@@ -228,6 +228,15 @@ struct ReadingClient {
     accepted_at: Instant,
 }
 
+/// A report response draining without holding the accept loop.
+#[derive(Debug)]
+struct AwaitingWrite {
+    stream: UnixStream,
+    bytes: Vec<u8>,
+    written: usize,
+    started_at: Instant,
+}
+
 /// A bound foreground daemon. Dropping it removes only the socket it created.
 #[derive(Debug)]
 pub struct Daemon {
@@ -238,6 +247,7 @@ pub struct Daemon {
     awaiting_clears: Vec<AwaitingClearRequest>,
     inboxes: Vec<InboxSession>,
     reading: Vec<ReadingClient>,
+    awaiting_writes: Vec<AwaitingWrite>,
     herdr_exec: HerdrExec,
     awaiting_prompts: HashMap<u64, AwaitingPrompt>,
     awaiting_cancels: HashMap<u64, AwaitingCancel>,
@@ -428,6 +438,7 @@ impl Daemon {
             awaiting_clears: Vec::new(),
             inboxes: Vec::new(),
             reading: Vec::new(),
+            awaiting_writes: Vec::new(),
             herdr_exec,
             awaiting_prompts: HashMap::new(),
             awaiting_cancels: HashMap::new(),
@@ -521,6 +532,8 @@ impl Daemon {
         log_slow_phase("clear_herdr", &mut phase);
         let inbox_advanced = self.advance_inboxes();
         log_slow_phase("inboxes", &mut phase);
+        let write_advanced = self.advance_writes();
+        log_slow_phase("writes", &mut phase);
         let reading_advanced = self.pump_reading();
         log_slow_phase("reading", &mut phase);
         let accepted = self.accept_waiting()?;
@@ -539,6 +552,7 @@ impl Daemon {
         let advanced = start_advanced
             || clear_advanced
             || inbox_advanced
+            || write_advanced
             || reading_advanced
             || reading_after_accept
             || renewed
@@ -642,6 +656,7 @@ impl Daemon {
                 self.park_waiter_retire(*pending);
             }
             Ok(Served::AwaitingRead(read)) => self.park_read(*read),
+            Ok(Served::AwaitingWrite(write)) => self.awaiting_writes.push(*write),
             Ok(Served::AwaitingAdopt(adopt)) => self.park_adopt(*adopt),
             Ok(Served::AwaitingRename(rename)) => self.park_rename(*rename),
             Ok(Served::AwaitingRetire(retire)) => self.park_retire(*retire),
@@ -649,6 +664,43 @@ impl Daemon {
                 eprintln!("kelpied: client connection failed: {error}");
             }
         }
+    }
+
+    fn park_response(&mut self, stream: UnixStream, response: &ClientResponse) {
+        match awaiting_write(stream, response) {
+            Ok(mut write) => match advance_write(&mut write) {
+                Ok((true, _)) => {}
+                Ok((false, _)) => self.awaiting_writes.push(write),
+                Err(error) => eprintln!("kelpied: report response failed: {error}"),
+            },
+            Err(error) => eprintln!("kelpied: report response encoding failed: {error}"),
+        }
+    }
+
+    fn advance_writes(&mut self) -> bool {
+        let mut progressed = false;
+        let mut pending = Vec::with_capacity(self.awaiting_writes.len());
+        for mut write in std::mem::take(&mut self.awaiting_writes) {
+            if write.started_at.elapsed() >= CLIENT_WRITE_TIMEOUT {
+                eprintln!("kelpied: report response timed out while the client was not reading");
+                progressed = true;
+                continue;
+            }
+            match advance_write(&mut write) {
+                Ok((complete, advanced)) => {
+                    progressed |= advanced;
+                    if !complete {
+                        pending.push(write);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("kelpied: report response failed: {error}");
+                    progressed = true;
+                }
+            }
+        }
+        self.awaiting_writes = pending;
+        progressed
     }
 
     fn park_start(&mut self, mut awaiting: AwaitingStart) {
@@ -1401,9 +1453,7 @@ impl Daemon {
                     &read.request_id,
                     render_report(&self.kelpie, active, Some(&live)),
                 );
-                if let Err(error) = write_response(&mut read.stream, &response) {
-                    eprintln!("kelpied: parked read response failed: {error}");
-                }
+                self.park_response(read.stream, &response);
             }
             (
                 ClientReadKind::Whoami { pane_id, lazy_key },
@@ -3759,6 +3809,12 @@ impl Daemon {
                 let mut stream = read.stream;
                 write_response(&mut stream, &respond(&read.request_id, result))
             }
+            Served::AwaitingWrite(mut write) => {
+                write.stream.set_nonblocking(false)?;
+                write.stream.write_all(&write.bytes[write.written..])?;
+                let _ = write.stream.shutdown(Shutdown::Write);
+                Ok(())
+            }
             Served::AwaitingAdopt(adopt) => {
                 let result = match &adopt.state {
                     AdoptParkState::Snapshot(intent) => self.kelpie.adopt(intent).map(|created| {
@@ -3821,6 +3877,8 @@ enum Served {
     AwaitingCancel(Box<PendingCancel>),
     AwaitingWaiterRetire(Box<PendingWaiterRetire>),
     AwaitingRead(Box<AwaitingRead>),
+    /// A potentially large report response draining non-blockingly.
+    AwaitingWrite(Box<AwaitingWrite>),
     AwaitingAdopt(Box<AwaitingAdopt>),
     AwaitingRename(Box<AwaitingRename>),
     AwaitingRetire(Box<AwaitingRetireClose>),
@@ -4109,8 +4167,12 @@ fn serve_parsed_line(
                 })));
             }
             let response = respond(&request.id, dispatch_report(request.params, kelpie));
-            write_response(&mut stream, &response)?;
-            return Ok(Served::Answered);
+            let mut write = awaiting_write(stream, &response)?;
+            return if advance_write(&mut write)?.0 {
+                Ok(Served::Answered)
+            } else {
+                Ok(Served::AwaitingWrite(Box::new(write)))
+            };
         }
         Ok(request) if request.method == "whoami" => match prepare_whoami_read(&request, kelpie) {
             Ok(None) => {
@@ -4276,6 +4338,42 @@ fn write_response(stream: &mut UnixStream, response: &ClientResponse) -> Result<
     // even if they still wait for EOF after the NDJSON line.
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
+}
+
+fn awaiting_write(
+    stream: UnixStream,
+    response: &ClientResponse,
+) -> Result<AwaitingWrite, DaemonError> {
+    stream.set_nonblocking(true)?;
+    let mut bytes = Vec::new();
+    enqueue_json_line(&mut bytes, response)?;
+    Ok(AwaitingWrite {
+        stream,
+        bytes,
+        written: 0,
+        started_at: Instant::now(),
+    })
+}
+
+fn advance_write(write: &mut AwaitingWrite) -> Result<(bool, bool), DaemonError> {
+    match write.stream.write(&write.bytes[write.written..]) {
+        Ok(0) => Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+        Ok(written) => {
+            write.written += written;
+            let complete = write.written == write.bytes.len();
+            if complete {
+                let _ = write.stream.shutdown(Shutdown::Write);
+            }
+            Ok((complete, true))
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            Ok((false, false))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn write_json_line(
@@ -5037,53 +5135,6 @@ struct ReportParams {
     active: bool,
 }
 
-/// Report every durable node and edge, optionally beside a Herdr snapshot.
-///
-/// Agents that still exist, plus the lineage that explains them.
-///
-/// "Exists" means the newest incarnation is ready, starting, or unknown.
-/// Ancestors of a kept agent are kept too: a child with no parent line loses
-/// the lineage that says who started it.
-fn active_agents(report: &crate::store::FleetReport) -> Vec<&crate::store::ReportAgent> {
-    let mut wanted: Vec<String> = report
-        .agents
-        .iter()
-        .filter(|agent| {
-            agent.incarnations.first().is_some_and(|incarnation| {
-                matches!(
-                    incarnation.state,
-                    crate::domain::IncarnationState::Ready
-                        | crate::domain::IncarnationState::Starting
-                        | crate::domain::IncarnationState::Unknown
-                )
-            })
-        })
-        .map(|agent| agent.id.to_string())
-        .collect();
-    // Walk parents until the set stops growing. Parentage is data and can cycle,
-    // so the walk is bounded by the agent count rather than trusting the shape.
-    for _ in 0..report.agents.len() {
-        let mut added = false;
-        for agent in &report.agents {
-            let Some(parent) = agent.parent_agent_id.as_ref().map(ToString::to_string) else {
-                continue;
-            };
-            if wanted.contains(&agent.id.to_string()) && !wanted.contains(&parent) {
-                wanted.push(parent);
-                added = true;
-            }
-        }
-        if !added {
-            break;
-        }
-    }
-    report
-        .agents
-        .iter()
-        .filter(|agent| wanted.contains(&agent.id.to_string()))
-        .collect()
-}
-
 fn cycle_due_at_ms(renew: &crate::store::ReportRenew) -> i64 {
     if renew.phase == crate::domain::RenewPhase::Scheduled
         && let Some(remaining) = renew.active_remaining_ms
@@ -5175,15 +5226,15 @@ fn render_report(
     active: bool,
     live: Option<&LiveStatus>,
 ) -> Result<Value, SliceError> {
-    let report = kelpie.store().report().map_err(SliceError::Store)?;
-
-    let keep = if active {
-        active_agents(&report)
+    let report = if active {
+        kelpie.store().active_report()
     } else {
-        report.agents.iter().collect()
-    };
+        kelpie.store().report()
+    }
+    .map_err(SliceError::Store)?;
 
-    let agents: Vec<Value> = keep
+    let agents: Vec<Value> = report
+        .agents
         .iter()
         .map(|agent| {
             let incarnations: Vec<Value> = agent
@@ -5204,27 +5255,22 @@ fn render_report(
 
     // Names shared by more than one agent. Counting identical strings is
     // arithmetic, not a verdict; whether a collision matters is caller policy.
-    let mut alias_collisions = serde_json::Map::new();
-    for agent in &keep {
-        let shared: Vec<Value> = keep
-            .iter()
-            .filter(|other| other.public_name == agent.public_name)
-            .map(|other| serde_json::json!(other.id))
-            .collect();
-        if shared.len() > 1 {
-            alias_collisions.insert(agent.public_name.clone(), Value::Array(shared));
-        }
+    let mut aliases: HashMap<&str, Vec<Value>> = HashMap::new();
+    for agent in &report.agents {
+        aliases
+            .entry(&agent.public_name)
+            .or_default()
+            .push(serde_json::json!(agent.id));
     }
+    let alias_collisions = aliases
+        .into_iter()
+        .filter(|(_, agents)| agents.len() > 1)
+        .map(|(alias, agents)| (alias.to_owned(), Value::Array(agents)))
+        .collect();
 
     let obligations: Vec<Value> = report
         .obligations
         .iter()
-        .filter(|obligation| {
-            !active
-                || keep
-                    .iter()
-                    .any(|agent| agent.id == obligation.owing_agent_id)
-        })
         .map(|obligation| {
             serde_json::json!({
                 "ask_message_id": obligation.ask_message_id,
@@ -7712,6 +7758,106 @@ mod tests {
         assert_eq!(daemon.reading.len(), 1, "stalled client is still parked");
         drop(daemon);
         let _ = stalled.join();
+    }
+
+    #[test]
+    fn a_large_report_response_does_not_delay_an_unrelated_request() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let mut store = Store::in_memory().expect("store");
+        for index in 0..1_508 {
+            store
+                .declare_start(&test_intent(
+                    &format!("agent-{index}"),
+                    &format!("term-{index}"),
+                    &format!("report-seed-{index}"),
+                ))
+                .expect("seed agent");
+        }
+        let kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
+        );
+        let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
+
+        let (report_sent, report_received) = std::sync::mpsc::channel();
+        let (read_report, start_reading) = std::sync::mpsc::channel();
+        let report_socket = kelpie_socket.clone();
+        let report_client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(&report_socket).expect("connect report");
+            serde_json::to_writer(
+                &mut stream,
+                &serde_json::json!({"id":"report","method":"report","params":{}}),
+            )
+            .expect("write report");
+            stream.write_all(b"\n").expect("finish report");
+            report_sent.send(()).expect("report sent");
+            start_reading.recv().expect("start reading report");
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .expect("read report");
+            serde_json::from_str::<Value>(&line).expect("complete report response")
+        });
+        report_received.recv().expect("report request ready");
+
+        let notice_socket = kelpie_socket.clone();
+        let unrelated = thread::spawn(move || {
+            send_request(
+                &notice_socket,
+                &serde_json::json!({
+                    "id":"unrelated","method":"notice.create",
+                    "params":{"body":"served while report drains"}
+                }),
+            )
+        });
+        let asked_at = Instant::now();
+        while !unrelated.is_finished() {
+            daemon.poll().expect("poll");
+            assert!(
+                asked_at.elapsed() < Duration::from_millis(400),
+                "unrelated request waited for the report response"
+            );
+        }
+        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_string());
+        assert!(
+            !daemon.awaiting_writes.is_empty(),
+            "the report client is still not reading, so its response must remain parked"
+        );
+        read_report.send(()).expect("release report reader");
+        let drain_started = Instant::now();
+        while !daemon.awaiting_writes.is_empty() {
+            daemon.poll().expect("drain report response");
+            assert!(
+                drain_started.elapsed() < Duration::from_secs(2),
+                "parked report response did not finish"
+            );
+        }
+        assert_eq!(
+            report_client.join().expect("report client")["result"]["agents"]
+                .as_array()
+                .expect("report agents")
+                .len(),
+            1_508
+        );
+
+        let (stream, _peer) = UnixStream::pair().expect("report stream pair");
+        stream.set_nonblocking(true).expect("non-blocking report");
+        let expired = AwaitingWrite {
+            stream,
+            bytes: vec![b'x'; 1024 * 1024],
+            written: 0,
+            started_at: Instant::now()
+                .checked_sub(CLIENT_WRITE_TIMEOUT)
+                .expect("write timeout fits before now"),
+        };
+        daemon.awaiting_writes.push(expired);
+        daemon.poll().expect("expire report response");
+        assert!(
+            daemon.awaiting_writes.is_empty(),
+            "a non-reading report client is bounded by the write timeout"
+        );
     }
 
     #[test]
