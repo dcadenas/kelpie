@@ -34,8 +34,8 @@ pub enum Invocation {
     Skill,
     /// Print the package version.
     Version,
-    /// Print usage.
-    Help,
+    /// Print general or one-command usage.
+    Help { command: Option<String> },
     /// Legacy one-JSON-request mode against an explicit socket.
     Raw { socket: PathBuf },
     /// Schema-aware command that builds the NDJSON request.
@@ -86,6 +86,12 @@ pub enum Command {
     Recover,
     Whoami {
         target: Option<Caller>,
+    },
+    Who {
+        target: Option<AttributionTarget>,
+        adopt_caller: bool,
+        history: bool,
+        refresh: bool,
     },
     Attribution {
         target: AttributionTarget,
@@ -143,7 +149,7 @@ pub enum Command {
         idempotency_key: Option<String>,
     },
     WaiterRetire {
-        logical_agent_id: String,
+        target: AgentTarget,
     },
 }
 
@@ -190,14 +196,21 @@ pub enum Caller {
 /// Which identity an attribution lookup names.
 ///
 /// `Incarnation` is the exact form. `Agent` resolves to that agent's newest
-/// incarnation. `Alias` requires a live Ready binding. `Pane` defaults to the
-/// calling pane and never adopts.
+/// incarnation. `Alias` requires a live Ready binding. An explicit `Pane` is
+/// read-only; the no-selector `who` default may adopt the calling pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributionTarget {
     Incarnation(String),
     Agent(String),
     Alias(String),
     Pane(String),
+}
+
+/// One logical agent selected by durable ID or current public name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentTarget {
+    Id(String),
+    Alias(String),
 }
 
 /// Exact recipient IDs for recovery use.
@@ -255,7 +268,7 @@ pub enum BodySource {
 /// Returns a usage string when flags conflict or a required value is missing.
 pub fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     if args.is_empty() {
-        return Ok(Invocation::Help);
+        return Ok(Invocation::Help { command: None });
     }
     if args.len() == 1 && (args[0] == "--skill") {
         return Ok(Invocation::Skill);
@@ -264,7 +277,11 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         return Ok(Invocation::Version);
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        return Ok(Invocation::Help);
+        let command = args
+            .iter()
+            .find(|arg| command_usage(arg).is_some())
+            .cloned();
+        return Ok(Invocation::Help { command });
     }
 
     let mut socket = None;
@@ -297,7 +314,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
         }
     }
     if rest.is_empty() {
-        return Ok(Invocation::Help);
+        return Ok(Invocation::Help { command: None });
     }
     if is_raw_socket_token(&rest[0]) && rest.len() == 1 {
         return Ok(Invocation::Raw {
@@ -408,6 +425,7 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "logical_agent_id"),
             field(&result, "incarnation_id")
         ),
+        "who" => render_who(&result),
         "start" => format!(
             "start agent={} incarnation={} runtime={} message={} delivery={}\n",
             field(&result, "logical_agent_id"),
@@ -517,6 +535,8 @@ Commands:
   renew-cancel <renew-id> --reason TEXT
   pending [alias]
   recover
+  who [alias] | --pane ID | --agent-id ID | --incarnation-id ID
+       [--history] [--refresh]
   whoami [alias]
   name-info <alias>
   ask-info <ask-id>
@@ -540,7 +560,7 @@ Commands:
   reminder-disable <ask-id>
   retire --incarnation ID [--close-pane]
   waiter-register --name NAME (--parentless | --parent-id ID)
-  waiter-retire --logical-id ID
+  waiter-retire <alias> | --logical-id ID
 
 Unknown, duplicate, conflicting, or extra arguments fail closed. Ordinary
 bodies should use --stdin or --file. --body is only for short trusted text.
@@ -550,6 +570,34 @@ no alias, and with no recipient it renews the caller. Only renew-cancel ends
 a policy, and only its requester or its target may call it. Caller defaults to the Ready
 binding for $HERDR_PANE_ID. Default receipts show accepted, rejected,
 target-unavailable, and unknown outcomes; any non-success exits nonzero."
+}
+
+/// Extract the canonical syntax block for one typed command.
+#[must_use]
+pub fn command_usage(command: &str) -> Option<String> {
+    let prefix = format!("  {command}");
+    let mut lines = usage()
+        .lines()
+        .skip_while(|line| !line.starts_with(&prefix));
+    let first = lines.next()?;
+    let suffix = first.strip_prefix("  ")?;
+    if suffix
+        .strip_prefix(command)
+        .is_none_or(|rest| !rest.is_empty() && !rest.starts_with(' '))
+    {
+        return None;
+    }
+    let mut selected = vec![suffix.to_string()];
+    for line in lines {
+        if line.starts_with("  ") && !line.starts_with("       ") {
+            break;
+        }
+        if line.is_empty() {
+            break;
+        }
+        selected.push(line.trim_start().to_string());
+    }
+    Some(format!("Usage: kelpie {}", selected.join("\n       ")))
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
@@ -566,6 +614,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             Ok(Command::Recover)
         }
         "whoami" => parse_whoami(args),
+        "who" => parse_who(args),
         "name-info" => parse_name_info(args),
         "ask-info" => parse_ask_info(args),
         "attribution" => parse_attribution(args),
@@ -623,11 +672,15 @@ fn parse_waiter_register(args: &[String]) -> Result<Command, String> {
 
 fn parse_waiter_retire(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(args);
-    let logical_agent_id = tokens
-        .take_value("--logical-id")?
-        .ok_or("waiter-retire requires --logical-id")?;
+    let logical_agent_id = tokens.take_value("--logical-id")?;
+    let alias = tokens.take_positional();
     tokens.finish("waiter-retire")?;
-    Ok(Command::WaiterRetire { logical_agent_id })
+    let target = match (logical_agent_id, alias) {
+        (Some(id), None) => AgentTarget::Id(id),
+        (None, Some(alias)) => AgentTarget::Alias(alias),
+        _ => return Err("waiter-retire requires exactly one of <alias> or --logical-id".into()),
+    };
+    Ok(Command::WaiterRetire { target })
 }
 
 fn parse_clear(args: &[String]) -> Result<Command, String> {
@@ -959,6 +1012,27 @@ fn parse_whoami(args: &[String]) -> Result<Command, String> {
     Ok(Command::Whoami { target })
 }
 
+fn parse_who(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let history = tokens.take_bool("--history")?;
+    let refresh = tokens.take_bool("--refresh")?;
+    let adopt_caller = args[1..].iter().all(|arg| arg == "--refresh");
+    let target = take_optional_attribution_target(&mut tokens, "who")?;
+    tokens.finish("who")?;
+    if history && !matches!(target, Some(AttributionTarget::Alias(_))) {
+        return Err("who --history requires an alias".into());
+    }
+    if history && refresh {
+        return Err("who --history does not accept --refresh".into());
+    }
+    Ok(Command::Who {
+        target,
+        adopt_caller,
+        history,
+        refresh,
+    })
+}
+
 fn parse_ask_info(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(&args[1..]);
     let ask_id = tokens
@@ -979,32 +1053,47 @@ fn parse_name_info(args: &[String]) -> Result<Command, String> {
 
 fn parse_attribution(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(&args[1..]);
-    let incarnation_id = tokens.take_value("--incarnation-id")?;
-    let agent_id = tokens.take_value("--agent-id")?;
-    let pane = tokens.take_value("--pane")?;
     let refresh = tokens.take_bool("--refresh")?;
-    let alias = tokens.take_positional();
+    let target = take_attribution_target(&mut tokens, "attribution")?;
     tokens.finish("attribution")?;
-    let target = match (incarnation_id, agent_id, pane, alias) {
-        (Some(id), None, None, None) => AttributionTarget::Incarnation(id),
-        (None, Some(id), None, None) => AttributionTarget::Agent(id),
-        (None, None, Some(pane), None) => AttributionTarget::Pane(pane),
-        (None, None, None, Some(alias)) => AttributionTarget::Alias(alias),
-        (None, None, None, None) => AttributionTarget::Pane(
+    Ok(Command::Attribution { target, refresh })
+}
+
+fn take_attribution_target(
+    tokens: &mut Tokens<'_>,
+    command: &str,
+) -> Result<AttributionTarget, String> {
+    take_optional_attribution_target(tokens, command)?
+        .or_else(|| {
             std::env::var("HERDR_PANE_ID")
                 .ok()
                 .filter(|pane| !pane.is_empty())
-                .ok_or("cannot resolve caller; set HERDR_PANE_ID or pass a target")?,
-        ),
+                .map(AttributionTarget::Pane)
+        })
+        .ok_or_else(|| "cannot resolve caller; set HERDR_PANE_ID or pass a target".into())
+}
+
+fn take_optional_attribution_target(
+    tokens: &mut Tokens<'_>,
+    command: &str,
+) -> Result<Option<AttributionTarget>, String> {
+    let incarnation_id = tokens.take_value("--incarnation-id")?;
+    let agent_id = tokens.take_value("--agent-id")?;
+    let pane = tokens.take_value("--pane")?;
+    let alias = tokens.take_positional();
+    Ok(match (incarnation_id, agent_id, pane, alias) {
+        (Some(id), None, None, None) => Some(AttributionTarget::Incarnation(id)),
+        (None, Some(id), None, None) => Some(AttributionTarget::Agent(id)),
+        (None, None, Some(pane), None) => Some(AttributionTarget::Pane(pane)),
+        (None, None, None, Some(alias)) => Some(AttributionTarget::Alias(alias)),
+        (None, None, None, None) => None,
         _ => {
-            return Err(
-                "attribution accepts exactly one target: a name, --pane, --agent-id, or \
+            return Err(format!(
+                "{command} accepts exactly one target: a name, --pane, --agent-id, or \
                  --incarnation-id"
-                    .into(),
-            );
+            ));
         }
-    };
-    Ok(Command::Attribution { target, refresh })
+    })
 }
 
 /// Read the `--keep-open` / `--no-keep-open` pair, noting a bad combination.
@@ -1896,6 +1985,30 @@ fn render_ask_info(result: &Value) -> String {
     if let Some(reason) = result["cancellation_reason"].as_str() {
         let _ = write!(text, "\n  cancellation-reason {reason}");
     }
+    let delivery = &result["delivery"];
+    let _ = write!(
+        text,
+        "\n  delivery={} transport={} attempt={}",
+        field(delivery, "outcome"),
+        field(delivery, "transport"),
+        field(delivery, "attempt_number"),
+    );
+    let empty = Vec::new();
+    let replies = result["replies"].as_array().unwrap_or(&empty);
+    let _ = write!(text, "\n  replies={}", replies.len());
+    for reply in replies {
+        let _ = write!(
+            text,
+            "\n    {} {} delivery={} created={}\n      {}",
+            field(reply, "disposition"),
+            field(reply, "message_id"),
+            field(&reply["delivery"], "outcome"),
+            reply["created_at_ms"]
+                .as_i64()
+                .map_or("?".into(), format_utc_ms),
+            field(reply, "body"),
+        );
+    }
     let _ = write!(text, "\n\n{}\n", field(result, "body"));
     text
 }
@@ -2168,6 +2281,32 @@ fn render_attribution(result: &Value) -> String {
     )
 }
 
+fn render_who(result: &Value) -> String {
+    if result.get("claimants").is_some() {
+        return render_name_info(result).replacen("name-info ", "who ", 1);
+    }
+    let transport = field(result, "delivery_transport");
+    let mut rendered = render_attribution(result).replacen("attribution ", "who ", 1);
+    if transport == "socket_inbox" {
+        rendered = format!(
+            "who name={} agent={} incarnation=- transport=socket_inbox addressable={}\n",
+            field(result, "public_name"),
+            field(result, "logical_agent_id"),
+            field(result, "addressable")
+        );
+    } else {
+        rendered = rendered.replacen(
+            "\nrequested ",
+            &format!(
+                " transport={transport} addressable={}\nrequested ",
+                field(result, "addressable")
+            ),
+            1,
+        );
+    }
+    rendered
+}
+
 /// Default caller from the Herdr pane environment.
 #[must_use]
 pub fn env_caller() -> Option<Caller> {
@@ -2219,6 +2358,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn subcommand_help_is_narrower_than_general_help() {
+        let invocation = parse_invocation(&args(&["reply", "--help"])).expect("help");
+        assert_eq!(
+            invocation,
+            Invocation::Help {
+                command: Some("reply".into())
+            }
+        );
+        let reply = command_usage("reply").expect("reply usage");
+        assert!(reply.starts_with("Usage: kelpie reply <ask-id>"), "{reply}");
+        assert!(!reply.contains("waiter-register"), "{reply}");
+    }
+
     /// The mistake this refusal exists for: one suffix short of the intended
     /// name armed a live policy on a maintainer session.
     ///
@@ -2263,6 +2416,84 @@ mod tests {
             } => assert_eq!(name, "divine-work"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn who_shares_all_identity_selectors_and_history_is_name_only() {
+        let by_agent =
+            parse_invocation(&args(&["who", "--agent-id", "agent-1"])).expect("agent selector");
+        assert!(matches!(
+            by_agent,
+            Invocation::Typed {
+                command: Command::Who {
+                    target: Some(AttributionTarget::Agent(ref id)),
+                    adopt_caller: false,
+                    history: false,
+                    refresh: false,
+                },
+                ..
+            } if id == "agent-1"
+        ));
+        let history =
+            parse_invocation(&args(&["who", "botserver", "--history"])).expect("name history");
+        assert!(matches!(
+            history,
+            Invocation::Typed {
+                command: Command::Who {
+                    target: Some(AttributionTarget::Alias(ref alias)),
+                    adopt_caller: false,
+                    history: true,
+                    ..
+                },
+                ..
+            } if alias == "botserver"
+        ));
+        assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--history"])).is_err());
+        assert!(parse_invocation(&args(&["who", "botserver", "--history", "--refresh"])).is_err());
+        assert!(matches!(
+            parse_invocation(&args(&["who", "--refresh"])).expect("default self"),
+            Invocation::Typed {
+                command: Command::Who {
+                    target: None,
+                    adopt_caller: true,
+                    refresh: true,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn waiter_retire_accepts_a_name_or_logical_id() {
+        for (argv, expected) in [
+            (
+                vec!["waiter-retire", "botserver"],
+                AgentTarget::Alias("botserver".into()),
+            ),
+            (
+                vec!["waiter-retire", "--logical-id", "agent-1"],
+                AgentTarget::Id("agent-1".into()),
+            ),
+        ] {
+            let invocation = parse_invocation(&args(&argv)).expect("waiter-retire target");
+            assert!(matches!(
+                invocation,
+                Invocation::Typed {
+                    command: Command::WaiterRetire { target },
+                    ..
+                } if target == expected
+            ));
+        }
+        assert!(
+            parse_invocation(&args(&[
+                "waiter-retire",
+                "botserver",
+                "--logical-id",
+                "agent-1"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -3014,6 +3245,48 @@ mod tests {
             none.contains("requested model=- provider=- effort=-"),
             "{none}"
         );
+    }
+
+    #[test]
+    fn who_renders_pane_identity_and_socket_waiter_without_fake_attribution() {
+        let pane = format_receipt(
+            "who",
+            &json!({"result": {
+                "public_name": "reviewer",
+                "logical_agent_id": "agent-1",
+                "incarnation_id": "inc-1",
+                "delivery_transport": "herdr_prompt",
+                "addressable": true,
+                "backend_kind": "codex",
+                "incarnation_state": "ready",
+                "requested": {},
+                "observed": null,
+                "observations": []
+            }}),
+        );
+        assert!(
+            pane.starts_with("who name=reviewer agent=agent-1 incarnation=inc-1"),
+            "{pane}"
+        );
+        assert!(pane.contains("transport=herdr_prompt"), "{pane}");
+        assert!(pane.contains("addressable=true"), "{pane}");
+        assert!(pane.contains("observed none"), "{pane}");
+
+        let waiter = format_receipt(
+            "who",
+            &json!({"result": {
+                "public_name": "botserver",
+                "logical_agent_id": "waiter-1",
+                "incarnation_id": null,
+                "delivery_transport": "socket_inbox",
+                "addressable": true
+            }}),
+        );
+        assert_eq!(
+            waiter,
+            "who name=botserver agent=waiter-1 incarnation=- transport=socket_inbox addressable=true\n"
+        );
+        assert!(!waiter.contains("observed"));
     }
 
     #[test]

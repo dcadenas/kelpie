@@ -806,7 +806,8 @@ impl Kelpie {
             && expected != derived
         {
             return Err(SliceError::LiveConflict(format!(
-                "derived live name {derived} does not match requested {expected}"
+                "derived live name {derived} does not match requested {expected}; rename the \
+                 live Herdr agent to {expected} first, then adopt it"
             )));
         }
         Ok(derived)
@@ -3395,11 +3396,20 @@ impl Kelpie {
             .iter()
             .filter(|agent| agent.pane_id == pane_id)
             .collect();
-        let [agent] = matches.as_slice() else {
-            return Err(SliceError::LiveConflict(format!(
-                "pane {pane_id} has {} live agents; expected exactly one",
-                matches.len()
-            )));
+        let agent = match matches.as_slice() {
+            [agent] => *agent,
+            [] => {
+                return Err(SliceError::LiveConflict(format!(
+                    "pane {pane_id} has no live agent to identify; start an agent there, then run \
+                     kelpie who again"
+                )));
+            }
+            _ => {
+                return Err(SliceError::LiveConflict(format!(
+                    "pane {pane_id} has {} live agents; expected exactly one",
+                    matches.len()
+                )));
+            }
         };
         let Some(backend_kind) = agent.agent.as_deref().filter(|kind| !kind.is_empty()) else {
             return Err(SliceError::LiveConflict(format!(

@@ -659,10 +659,14 @@ fn waiter_retire_cancels_open_ask_and_refuses_later_final_as_not_open() {
         &serde_json::json!({
             "id": "retire-1",
             "method": "waiter.retire",
-            "params": {"logical_agent_id": waiter.logical_agent_id}
+            "params": {"alias": "inbox"}
         }),
     );
     assert!(retired["error"].is_null(), "{retired}");
+    assert_eq!(
+        retired["result"]["logical_agent_id"],
+        waiter.logical_agent_id.to_string()
+    );
     assert_eq!(retired["result"]["targeting_ended"], true);
     assert_eq!(
         retired["result"]["cancelled_ask_ids"],

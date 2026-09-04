@@ -105,7 +105,7 @@ Verify all four, and do not report success on fewer:
 systemctl --user status kelpied | rg Active
 sqlite3 -readonly <database> "PRAGMA user_version;"          # matches the newest migration
 sqlite3 -readonly <database> ".schema <table>" | rg <column>  # new columns are present
-kelpie whoami                                                 # the socket answers
+kelpie who                                                    # the socket answers
 kelpie report | tail -3                                       # the fleet survived
 ```
 

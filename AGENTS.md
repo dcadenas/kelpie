@@ -65,7 +65,7 @@ explicitly. Do not rename them to match the package.
   connection (`recover`, `start`, `adopt`, `tell`, `ask`, `reply`, `clear`, `renew`,
   `renew.cancel`, `pending`, `cancel`, `retire`, `waiter.register`, `waiter.retire`,
   `reminder.snooze`, `reminder.disable`,
-  `notice.create`, `notice.list`, `whoami`). `inbox.claim` is the exception: it
+  `notice.create`, `notice.list`, `who`, and the legacy identity aliases). `inbox.claim` is the exception: it
   keeps the connection and drains `inbox.delivery` events for that waiter;
   `inbox.ack` is valid only on that claimed connection. Uses a non-blocking accept timeout
   so scheduled deliveries, reminders, and renew phases run with no client
