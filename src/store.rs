@@ -3521,14 +3521,12 @@ impl Store {
                  outcome succeeded, but not to a matching {expected_kind:?} prompt; refusing replay"
             )));
         }
-        let actual_sender =
-            parse_logical_agent_id(sender_agent_id.as_deref().ok_or_else(|| {
-                StoreError::InvalidRecord(format!(
-                    "succeeded prompt operation {operation_id} has no sender"
-                ))
-            })?)?;
+        let actual_sender = sender_agent_id
+            .as_deref()
+            .map(parse_logical_agent_id)
+            .transpose()?;
         let actual_reply_to = reply_to.as_deref().map(parse_message_id).transpose()?;
-        if actual_sender != expected_sender || actual_reply_to != expected_reply_to {
+        if actual_sender != Some(expected_sender) || actual_reply_to != expected_reply_to {
             return Err(StoreError::Conflict(format!(
                 "idempotency key {idempotency_key} belongs to prior operation {operation_id} with \
                  outcome succeeded, but to a different sender or reply correlation; refusing \
@@ -9656,6 +9654,110 @@ mod tests {
             );
             assert!(!message.contains("durable record is invalid"), "{message}");
         }
+    }
+
+    #[test]
+    fn operator_attributed_ask_replays_for_its_waiting_agent() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("waiter", Parent::Parentless, "waiter-key")
+            .expect("waiter");
+        let recipient = store
+            .declare_start(&intent("recipient", "term-1", "recipient-key"))
+            .expect("recipient declaration");
+        mark_ready(&mut store, recipient, "recipient", "term-1");
+        let first = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "question",
+                "operator-ask-key",
+                None,
+                None,
+                true,
+            )
+            .expect("operator ask");
+        store
+            .begin_attempt(first.operation_id, recipient.incarnation_id, "ask-request")
+            .expect("attempt");
+        store
+            .mark_submitted(first.operation_id, 1, "ask-request")
+            .expect("submitted");
+        store
+            .accept_delivery(
+                first.operation_id,
+                recipient.incarnation_id,
+                "w1:p1",
+                "term-1",
+            )
+            .expect("accepted");
+
+        let replay = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "question",
+                "operator-ask-key",
+                None,
+                None,
+                true,
+            )
+            .expect("replay");
+        assert_eq!(replay, first);
+    }
+
+    #[test]
+    fn senderless_prompt_collision_is_a_conflict_not_corruption() {
+        let mut store = Store::in_memory().expect("store");
+        let recipient = store
+            .declare_start(&intent("recipient", "term-1", "recipient-key"))
+            .expect("recipient declaration");
+        mark_ready(&mut store, recipient, "recipient", "term-1");
+        let tell = store
+            .create_tell(
+                recipient.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "operator notice",
+                "senderless-key",
+            )
+            .expect("tell");
+        store
+            .connection
+            .execute(
+                "UPDATE messages SET sender_agent_id = NULL WHERE id = ?1",
+                [tell.message_id.to_string()],
+            )
+            .expect("operator attribution");
+        store
+            .begin_attempt(tell.operation_id, recipient.incarnation_id, "tell-request")
+            .expect("attempt");
+        store
+            .mark_submitted(tell.operation_id, 1, "tell-request")
+            .expect("submitted");
+        store
+            .accept_delivery(
+                tell.operation_id,
+                recipient.incarnation_id,
+                "w1:p1",
+                "term-1",
+            )
+            .expect("accepted");
+
+        let error = store
+            .create_tell(
+                recipient.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "operator notice",
+                "senderless-key",
+            )
+            .expect_err("concrete sender cannot replay an operator prompt");
+        let message = error.to_string();
+        assert!(message.contains("different sender"), "{message}");
+        assert!(!message.contains("durable record is invalid"), "{message}");
     }
 
     #[test]
