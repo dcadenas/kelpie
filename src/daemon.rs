@@ -5717,10 +5717,12 @@ fn prepare_client_prompt(
             )));
         }
         let reminder_interval = ask_reminder_interval(&params)?;
-        if let Some(replay) = kelpie
-            .store()
-            .replay_prompt_by_idempotency_key(&params.idempotency_key, MessageKind::Ask)?
-        {
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Ask,
+            params.sender,
+            None,
+        )? {
             return Ok((prompt_replay_result(&replay)?, None, None));
         }
         let (recipient, recipient_incarnation) = resolve_recipient(
@@ -5760,10 +5762,12 @@ fn prepare_client_prompt(
     } else if request.method == "tell" {
         let params = serde_json::from_value::<TellParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-        if let Some(replay) = kelpie
-            .store()
-            .replay_prompt_by_idempotency_key(&params.idempotency_key, MessageKind::Tell)?
-        {
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Tell,
+            params.sender,
+            None,
+        )? {
             return Ok((prompt_replay_result(&replay)?, None, None));
         }
         match resolve_tell_recipient(
@@ -5826,10 +5830,12 @@ fn prepare_client_prompt(
     } else {
         let params = serde_json::from_value::<ReplyParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-        if let Some(replay) = kelpie
-            .store()
-            .replay_prompt_by_idempotency_key(&params.idempotency_key, MessageKind::Reply)?
-        {
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Reply,
+            params.requester_agent_id,
+            Some(params.reply_to),
+        )? {
             return Ok((prompt_replay_result(&replay)?, None, replay.reply_to));
         }
         let (created, prepared) = kelpie.record_reply(
@@ -8386,7 +8392,7 @@ mod tests {
                 "sender": sender.logical_agent_id,
                 "recipient": LogicalAgentId::new(),
                 "recipient_incarnation": IncarnationId::new(),
-                "body": "changed",
+                "body": "notice",
                 "idempotency_key": "completed-tell",
             }),
         };
@@ -8438,10 +8444,10 @@ mod tests {
             id: "replay-reply".into(),
             method: "reply".into(),
             params: serde_json::json!({
-                "reply_to": MessageId::new(),
-                "requester_agent_id": LogicalAgentId::new(),
-                "body": "changed",
-                "disposition": "progress",
+                "reply_to": ask.message_id,
+                "requester_agent_id": owing.logical_agent_id,
+                "body": "done",
+                "disposition": "final",
                 "idempotency_key": "completed-reply",
             }),
         };
@@ -8454,6 +8460,21 @@ mod tests {
         assert_eq!(result["obligation_state"], "resolved");
         assert_eq!(reply_to, Some(ask.message_id));
         assert!(prepared.is_none(), "replay must not prepare another write");
+
+        let wrong_requester = ClientRequest {
+            id: "wrong-replay-reply".into(),
+            method: "reply".into(),
+            params: serde_json::json!({
+                "reply_to": ask.message_id,
+                "requester_agent_id": LogicalAgentId::new(),
+                "body": "done",
+                "disposition": "final",
+                "idempotency_key": "completed-reply",
+            }),
+        };
+        let error = prepare_client_prompt(&wrong_requester, &mut kelpie)
+            .expect_err("another sender cannot read the receipt");
+        assert!(error.to_string().contains("different sender"), "{error}");
     }
 
     #[test]

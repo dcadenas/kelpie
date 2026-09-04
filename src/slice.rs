@@ -1496,10 +1496,12 @@ impl Kelpie {
         remind_after_ms: Option<i64>,
         operator_attributed: bool,
     ) -> Result<(CreatedAsk, Option<PreparedPrompt>), SliceError> {
-        if let Some(replay) = self
-            .store
-            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask)?
-        {
+        if let Some(replay) = self.store.replay_prompt_by_idempotency_key(
+            idempotency_key,
+            MessageKind::Ask,
+            sender,
+            None,
+        )? {
             return Ok((
                 CreatedAsk {
                     message_id: replay.message_id,
@@ -1586,10 +1588,12 @@ impl Kelpie {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<(CreatedTell, Option<PreparedPrompt>), SliceError> {
-        if let Some(replay) = self
-            .store
-            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Tell)?
-        {
+        if let Some(replay) = self.store.replay_prompt_by_idempotency_key(
+            idempotency_key,
+            MessageKind::Tell,
+            sender,
+            None,
+        )? {
             return Ok((
                 CreatedTell {
                     message_id: replay.message_id,
@@ -3271,10 +3275,12 @@ impl Kelpie {
         disposition: ReplyDisposition,
         idempotency_key: &str,
     ) -> Result<(CreatedReply, Option<PreparedPrompt>), SliceError> {
-        if let Some(replay) = self
-            .store
-            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Reply)?
-        {
+        if let Some(replay) = self.store.replay_prompt_by_idempotency_key(
+            idempotency_key,
+            MessageKind::Reply,
+            requester_agent_id,
+            Some(reply_to),
+        )? {
             return Ok((
                 CreatedReply {
                     message_id: replay.message_id,

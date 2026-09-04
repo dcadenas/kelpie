@@ -2498,7 +2498,7 @@ impl Store {
             ));
         }
         if let Some(replay) =
-            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask)?
+            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask, sender, None)?
         {
             return Ok(CreatedAsk {
                 message_id: replay.message_id,
@@ -2626,7 +2626,7 @@ impl Store {
         due_at_ms: Option<i64>,
     ) -> Result<CreatedTell, StoreError> {
         if let Some(replay) =
-            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Tell)?
+            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Tell, sender, None)?
         {
             return Ok(CreatedTell {
                 message_id: replay.message_id,
@@ -2812,9 +2812,12 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<CreatedReply, StoreError> {
-        if let Some(replay) =
-            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Reply)?
-        {
+        if let Some(replay) = self.replay_prompt_by_idempotency_key(
+            idempotency_key,
+            MessageKind::Reply,
+            requester_agent_id,
+            Some(reply_to),
+        )? {
             return Ok(CreatedReply {
                 message_id: replay.message_id,
                 operation_id: Some(replay.operation_id),
@@ -3404,6 +3407,8 @@ impl Store {
         &self,
         idempotency_key: &str,
         expected_kind: MessageKind,
+        expected_sender: LogicalAgentId,
+        expected_reply_to: Option<MessageId>,
     ) -> Result<Option<PromptOperationReplay>, StoreError> {
         type ReplayRow = (
             String,
@@ -3418,6 +3423,7 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
             Option<i64>,
             Option<String>,
         );
@@ -3425,7 +3431,11 @@ impl Store {
             .connection
             .query_row(
                 "SELECT o.id, o.kind, o.outcome, o.intent_json, o.target_incarnation_id,
-                        m.id, m.kind, m.recipient_agent_id, m.reply_to_message_id,
+                        m.id, m.kind,
+                        CASE WHEN m.kind = 'ask'
+                             THEN COALESCE(m.sender_agent_id, ob.waiting_agent_id)
+                             ELSE m.sender_agent_id END,
+                        m.recipient_agent_id, m.reply_to_message_id,
                         m.disposition, d.outcome, ob.waiting_agent_id, r.interval_ms, ob.state
                  FROM operations o
                  LEFT JOIN deliveries d ON d.operation_id = o.id
@@ -3453,6 +3463,7 @@ impl Store {
                         row.get(11)?,
                         row.get(12)?,
                         row.get(13)?,
+                        row.get(14)?,
                     ))
                 },
             )
@@ -3465,6 +3476,7 @@ impl Store {
             recipient_incarnation_id,
             message_id,
             message_kind,
+            sender_agent_id,
             recipient_agent_id,
             reply_to,
             disposition,
@@ -3477,6 +3489,13 @@ impl Store {
             return Ok(None);
         };
         let outcome = parse_operation_outcome(&outcome)?;
+        if operation_kind != "prompt" {
+            return Err(idempotency_conflict(
+                idempotency_key,
+                &operation_id,
+                outcome,
+            ));
+        }
         if outcome == OperationOutcome::Failed {
             return Ok(None);
         }
@@ -3496,10 +3515,24 @@ impl Store {
                     "succeeded prompt operation {operation_id} has no message kind"
                 ))
             })?;
-        if operation_kind != "prompt" || actual_kind != expected_kind {
+        if actual_kind != expected_kind {
             return Err(StoreError::Conflict(format!(
                 "idempotency key {idempotency_key} belongs to prior operation {operation_id} with \
                  outcome succeeded, but not to a matching {expected_kind:?} prompt; refusing replay"
+            )));
+        }
+        let actual_sender =
+            parse_logical_agent_id(sender_agent_id.as_deref().ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "succeeded prompt operation {operation_id} has no sender"
+                ))
+            })?)?;
+        let actual_reply_to = reply_to.as_deref().map(parse_message_id).transpose()?;
+        if actual_sender != expected_sender || actual_reply_to != expected_reply_to {
+            return Err(StoreError::Conflict(format!(
+                "idempotency key {idempotency_key} belongs to prior operation {operation_id} with \
+                 outcome succeeded, but to a different sender or reply correlation; refusing \
+                 replay"
             )));
         }
         Ok(Some(PromptOperationReplay {
@@ -3529,7 +3562,7 @@ impl Store {
                 .as_deref()
                 .map(parse_logical_agent_id)
                 .transpose()?,
-            reply_to: reply_to.as_deref().map(parse_message_id).transpose()?,
+            reply_to: actual_reply_to,
             disposition: disposition
                 .as_deref()
                 .map(parse_reply_disposition)
@@ -9598,6 +9631,31 @@ mod tests {
             message.contains(&prior.operation_id.to_string()),
             "{message}"
         );
+
+        let ready = store
+            .declare_start(&intent("ready", "term-2", "ready-start-key"))
+            .expect("ready declaration");
+        mark_ready(&mut store, ready, "ready", "term-2");
+        for (key, expected_outcome) in [
+            ("failed-start-key", "failed"),
+            ("ready-start-key", "succeeded"),
+        ] {
+            let error = store
+                .create_ask(
+                    ready.logical_agent_id,
+                    ready.logical_agent_id,
+                    ready.incarnation_id,
+                    "question",
+                    key,
+                )
+                .expect_err("a non-prompt key cannot become a prompt key");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("outcome {expected_outcome}")),
+                "{message}"
+            );
+            assert!(!message.contains("durable record is invalid"), "{message}");
+        }
     }
 
     #[test]

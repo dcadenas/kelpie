@@ -187,8 +187,9 @@ pane, which reads to every observer as an ask that went unanswered. Reminders
 
 Repeating a prompt's idempotency key is outcome-aware. A succeeded prompt
 returns its recorded message, operation, recipient, and delivery receipt without
-another Herdr write. A terminally failed prompt permits a fresh operation under
-the same caller key while retaining the failed history. Pending, accepted,
+another Herdr write when its message kind, sender, and reply correlation match;
+a mismatch is refused. A terminally failed prompt permits a fresh operation
+under the same caller key while retaining the failed history. Pending, accepted,
 superseded, and unknown operations refuse the retry and name the prior operation
 and outcome; callers must reconcile rather than vary the key.
 This failure-retry exception is prompt-only. Start, adopt, clear, and retire

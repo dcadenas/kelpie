@@ -273,7 +273,9 @@ operation MUST follow operation-specific idempotency rules.
 A repeated caller idempotency key for a prompt operation MUST be resolved from
 the prior operation's outcome, not from an undifferentiated uniqueness
 violation. `succeeded` MUST return the recorded result without creating another
-effect. `failed` MAY create a fresh operation under the same caller key because
+effect only when the message kind, sender, and reply correlation match the
+recorded request; a mismatch MUST refuse replay. `failed` MAY create a fresh
+operation under the same caller key because
 terminal failure proves no effect landed; the failed operation and its evidence
 MUST remain intact. `pending`, `accepted`, `superseded`, and `unknown` MUST
 refuse a fresh operation. Every refusal MUST name the prior outcome so the caller
