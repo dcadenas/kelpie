@@ -1251,8 +1251,37 @@ impl Daemon {
             return;
         };
         match self.kelpie.accept_adopt_confirm(&work, &snapshot) {
-            Ok(created) => self.answer_adopt_at(index, Ok(created)),
+            Ok(created) => {
+                if let AdoptReply::Who { refresh } = self.awaiting_adopts[index].reply {
+                    let reason = if refresh {
+                        self.kelpie
+                            .refresh_attribution_after_snapshot(created.incarnation_id, &snapshot)
+                    } else {
+                        Ok(None)
+                    };
+                    let result = reason.and_then(|reason| {
+                        who_identity_response(
+                            &self.kelpie,
+                            WhoIdentity::Incarnation(created.incarnation_id),
+                            reason,
+                        )
+                    });
+                    self.answer_who_adopt_at(index, result);
+                } else {
+                    self.answer_adopt_at(index, Ok(created));
+                }
+            }
             Err(error) => self.fail_adopt_at(index, error),
+        }
+    }
+
+    fn answer_who_adopt_at(&mut self, index: usize, result: Result<Value, SliceError>) {
+        let mut adopt = self.awaiting_adopts.remove(index);
+        drop_lease(adopt.lease.take());
+        debug_assert!(adopt.resume.is_none());
+        let response = respond(&adopt.request_id, result);
+        if let Err(error) = write_response(&mut adopt.stream, &response) {
+            eprintln!("kelpied: parked who response failed: {error}");
         }
     }
 
@@ -1309,20 +1338,9 @@ impl Daemon {
                         },
                     ))
             }
-            (AdoptReply::Who { refresh }, Ok(created)) => {
-                let reason = if refresh {
-                    self.kelpie.refresh_attribution(created.incarnation_id)
-                } else {
-                    Ok(None)
-                };
-                reason.and_then(|reason| {
-                    who_identity_response(
-                        &self.kelpie,
-                        WhoIdentity::Incarnation(created.incarnation_id),
-                        reason,
-                    )
-                })
-            }
+            (AdoptReply::Who { .. }, Ok(_)) => Err(SliceError::Herdr(HerdrError::Unexpected(
+                "who adoption completed without its confirming snapshot".into(),
+            ))),
             (_, Err(error)) => Err(error),
         };
         let response = respond(&adopt.request_id, result);
@@ -1534,7 +1552,8 @@ impl Daemon {
         {
             Ok(AdoptAfterSnapshot::Ready(created)) => {
                 let reason = if refresh {
-                    self.kelpie.refresh_attribution(created.incarnation_id)
+                    self.kelpie
+                        .refresh_attribution_after_snapshot(created.incarnation_id, snapshot)
                 } else {
                     Ok(None)
                 };
@@ -4691,11 +4710,21 @@ fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdenti
                 .map_err(SliceError::Store),
         };
     }
+    let pane_id = params.pane_id.as_deref().unwrap_or_default();
     kelpie
         .store()
-        .ready_identity_for_pane(params.pane_id.as_deref().unwrap_or_default())
+        .ready_identity_for_pane(pane_id)
         .map(|identity| WhoIdentity::Incarnation(identity.incarnation_id))
-        .map_err(SliceError::Store)
+        .map_err(|error| {
+            SliceError::Store(match error {
+                StoreError::Conflict(_) => StoreError::Conflict(format!(
+                    "pane {pane_id} has no Ready Kelpie identity; if it has a live agent, run \
+                     kelpie who from that pane to adopt it, or use kelpie adopt with its exact \
+                     pane and terminal"
+                )),
+                other => other,
+            })
+        })
 }
 
 fn who_selector_count(params: &WhoParams) -> usize {
@@ -7249,7 +7278,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_unknown_pane_who_calls_share_only_the_queued_snapshot() {
+    fn concurrent_unknown_pane_who_refresh_calls_share_only_the_queued_snapshot() {
         let directory = tempfile::tempdir().expect("tempdir");
         let kelpie_socket = directory.path().join("kelpie.sock");
         let herdr_socket = directory.path().join("herdr.sock");
@@ -7312,7 +7341,7 @@ mod tests {
                         &socket,
                         &serde_json::json!({
                             "id":format!("who-{index}"),"method":"who",
-                            "params":{"pane_id":format!("w1:p{index}"),"lazy_adopt_key":format!("adopt-{index}")}
+                            "params":{"pane_id":format!("w1:p{index}"),"lazy_adopt_key":format!("adopt-{index}"),"refresh":true}
                         }),
                     )
                 })

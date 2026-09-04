@@ -102,9 +102,10 @@ authentication boundary.
 - `who` accepts exactly one identity selector: `incarnation_id` (exact),
   `agent_id` (that agent's newest incarnation, or its active socket waiter),
   `alias` (the unique addressable Ready agent or active socket waiter), or
-  `pane_id`. An explicit pane selector is read-only. With no CLI selector it
-  defaults to `$HERDR_PANE_ID` and lazily adopts that calling pane. The normal
-  result carries `logical_agent_id`, nullable
+  `pane_id`. An explicit CLI pane selector is read-only. With no CLI selector it
+  defaults to `$HERDR_PANE_ID` and lazily adopts that calling pane; protocol
+  clients implementing the same default include a unique `lazy_adopt_key` with
+  the caller's pane id. The normal result carries `logical_agent_id`, nullable
   `incarnation_id`, `public_name`, `delivery_transport`, and `addressable`;
   Herdr-bound identities also carry `backend_kind`, `incarnation_state`,
   `requested`, `observed`, and `observations`. `--refresh` refreshes attribution.
