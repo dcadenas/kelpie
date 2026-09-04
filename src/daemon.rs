@@ -292,6 +292,7 @@ struct AwaitingRenew {
 enum AdoptReply {
     Rpc,
     Whoami,
+    Who { refresh: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1308,6 +1309,20 @@ impl Daemon {
                         },
                     ))
             }
+            (AdoptReply::Who { refresh }, Ok(created)) => {
+                let reason = if refresh {
+                    self.kelpie.refresh_attribution(created.incarnation_id)
+                } else {
+                    Ok(None)
+                };
+                reason.and_then(|reason| {
+                    who_identity_response(
+                        &self.kelpie,
+                        WhoIdentity::Incarnation(created.incarnation_id),
+                        reason,
+                    )
+                })
+            }
             (_, Err(error)) => Err(error),
         };
         let response = respond(&adopt.request_id, result);
@@ -1397,6 +1412,33 @@ impl Daemon {
                     eprintln!("kelpied: parked attribution response failed: {error}");
                 }
             }
+            (
+                ClientReadKind::WhoAttribution { incarnation_id },
+                Ok(HerdrJobResult::Snapshot(snapshot)),
+            ) => {
+                let result = self
+                    .kelpie
+                    .refresh_attribution_after_snapshot(incarnation_id, &snapshot)
+                    .and_then(|reason| {
+                        who_identity_response(
+                            &self.kelpie,
+                            WhoIdentity::Incarnation(incarnation_id),
+                            reason,
+                        )
+                    });
+                let response = respond(&read.request_id, result);
+                if let Err(error) = write_response(&mut read.stream, &response) {
+                    eprintln!("kelpied: parked who response failed: {error}");
+                }
+            }
+            (
+                ClientReadKind::WhoPane {
+                    pane_id,
+                    lazy_key,
+                    refresh,
+                },
+                Ok(HerdrJobResult::Snapshot(snapshot)),
+            ) => self.finish_who_snapshot(read, &pane_id, &lazy_key, refresh, &snapshot),
             (_, Ok(_)) => {
                 let response = respond(
                     &read.request_id,
@@ -1473,6 +1515,68 @@ impl Daemon {
                 let response = respond(&read.request_id, Err(error));
                 if let Err(error) = write_response(&mut read.stream, &response) {
                     eprintln!("kelpied: parked read response failed: {error}");
+                }
+            }
+        }
+    }
+
+    fn finish_who_snapshot(
+        &mut self,
+        mut read: AwaitingRead,
+        pane_id: &str,
+        lazy_key: &str,
+        refresh: bool,
+        snapshot: &crate::herdr::Snapshot,
+    ) {
+        match self
+            .kelpie
+            .pane_adopt_after_snapshot(pane_id, lazy_key, snapshot)
+        {
+            Ok(AdoptAfterSnapshot::Ready(created)) => {
+                let reason = if refresh {
+                    self.kelpie.refresh_attribution(created.incarnation_id)
+                } else {
+                    Ok(None)
+                };
+                let result = reason.and_then(|reason| {
+                    who_identity_response(
+                        &self.kelpie,
+                        WhoIdentity::Incarnation(created.incarnation_id),
+                        reason,
+                    )
+                });
+                let response = respond(&read.request_id, result);
+                if let Err(error) = write_response(&mut read.stream, &response) {
+                    eprintln!("kelpied: parked who response failed: {error}");
+                }
+            }
+            Ok(AdoptAfterSnapshot::Rename(work)) => {
+                let job_id = self.alloc_job();
+                self.submit_owned(
+                    HerdrJob::Open {
+                        job_id,
+                        pane_id: work.pane_id.clone(),
+                        negotiate: false,
+                    },
+                    HerdrOwner::Adopt,
+                );
+                self.awaiting_adopts.push(AwaitingAdopt {
+                    request_id: read.request_id,
+                    stream: read.stream,
+                    reply: AdoptReply::Who { refresh },
+                    resume: None,
+                    state: AdoptParkState::Renaming {
+                        work,
+                        request_id: String::new(),
+                    },
+                    herdr_job: Some(job_id),
+                    lease: None,
+                });
+            }
+            Err(error) => {
+                let response = respond(&read.request_id, Err(error));
+                if let Err(error) = write_response(&mut read.stream, &response) {
+                    eprintln!("kelpied: parked who response failed: {error}");
                 }
             }
         }
@@ -4551,11 +4655,7 @@ enum WhoIdentity {
 }
 
 fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdentity, SliceError> {
-    let selectors = usize::from(params.incarnation_id.is_some())
-        + usize::from(params.agent_id.is_some())
-        + usize::from(params.alias.is_some())
-        + usize::from(params.pane_id.is_some());
-    if selectors != 1 {
+    if who_selector_count(params) != 1 {
         return Err(SliceError::Store(StoreError::InvalidRecord(
             "provide exactly one of incarnation_id, agent_id, alias, or pane_id".into(),
         )));
@@ -4584,9 +4684,11 @@ fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdenti
             )))),
             (Some((_, incarnation)), None) => Ok(WhoIdentity::Incarnation(incarnation)),
             (None, Some(agent)) => Ok(WhoIdentity::SocketWaiter(agent)),
-            (None, None) => Err(SliceError::Store(StoreError::Conflict(format!(
-                "no addressable agent for alias {alias}"
-            )))),
+            (None, None) => kelpie
+                .store()
+                .resolve_ready_alias(alias)
+                .map(|(_, incarnation)| WhoIdentity::Incarnation(incarnation))
+                .map_err(SliceError::Store),
         };
     }
     kelpie
@@ -4594,6 +4696,13 @@ fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdenti
         .ready_identity_for_pane(params.pane_id.as_deref().unwrap_or_default())
         .map(|identity| WhoIdentity::Incarnation(identity.incarnation_id))
         .map_err(SliceError::Store)
+}
+
+fn who_selector_count(params: &WhoParams) -> usize {
+    usize::from(params.incarnation_id.is_some())
+        + usize::from(params.agent_id.is_some())
+        + usize::from(params.alias.is_some())
+        + usize::from(params.pane_id.is_some())
 }
 
 fn who_identity_response(
@@ -5193,6 +5302,11 @@ fn prepare_who_read(
 ) -> Result<Option<ClientReadKind>, SliceError> {
     let params = serde_json::from_value::<WhoParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if who_selector_count(&params) != 1 {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "provide exactly one of incarnation_id, agent_id, alias, or pane_id".into(),
+        )));
+    }
     if params.history {
         if params.alias.is_none()
             || params.agent_id.is_some()
@@ -5207,6 +5321,7 @@ fn prepare_who_read(
         return Ok(None);
     }
     if let Some(pane_id) = params.pane_id.as_deref()
+        && params.lazy_adopt_key.is_some()
         && kelpie
             .store()
             .find_ready_identity_for_pane(pane_id)?
@@ -6511,6 +6626,39 @@ mod tests {
         .expect("history");
         assert_eq!(history["name"], "botserver");
         assert_eq!(history["claimants"].as_array().expect("claimants").len(), 1);
+
+        let explicit_missing_pane = ClientRequest {
+            id: "explicit-pane".into(),
+            method: "who".into(),
+            params: serde_json::json!({"pane_id": "w9:p9"}),
+        };
+        assert!(
+            prepare_who_read(&explicit_missing_pane, &kelpie)
+                .expect_err("explicit pane is read-only")
+                .to_string()
+                .contains("w9:p9")
+        );
+        let ambiguous = ClientRequest {
+            id: "ambiguous".into(),
+            method: "who".into(),
+            params: serde_json::json!({
+                "pane_id": "w9:p9",
+                "alias": "botserver",
+                "lazy_adopt_key": "must-not-adopt"
+            }),
+        };
+        assert!(
+            prepare_who_read(&ambiguous, &kelpie)
+                .expect_err("two selectors")
+                .to_string()
+                .contains("exactly one")
+        );
+        assert!(
+            dispatch_who(serde_json::json!({"alias": "nobody"}), &mut kelpie)
+                .expect_err("unknown alias")
+                .to_string()
+                .contains("live Herdr agent may hold that name unadopted")
+        );
     }
 
     #[test]
@@ -7101,7 +7249,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_unknown_pane_whoami_calls_share_only_the_queued_snapshot() {
+    fn concurrent_unknown_pane_who_calls_share_only_the_queued_snapshot() {
         let directory = tempfile::tempdir().expect("tempdir");
         let kelpie_socket = directory.path().join("kelpie.sock");
         let herdr_socket = directory.path().join("herdr.sock");
@@ -7163,7 +7311,7 @@ mod tests {
                     send_request(
                         &socket,
                         &serde_json::json!({
-                            "id":format!("whoami-{index}"),"method":"whoami",
+                            "id":format!("who-{index}"),"method":"who",
                             "params":{"pane_id":format!("w1:p{index}"),"lazy_adopt_key":format!("adopt-{index}")}
                         }),
                     )
@@ -7296,7 +7444,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_refresh_snapshot_does_not_delay_an_unrelated_client() {
+    fn who_refresh_snapshot_does_not_delay_an_unrelated_client() {
         let directory = tempfile::tempdir().expect("tempdir");
         let kelpie_socket = directory.path().join("kelpie.sock");
         let herdr_socket = directory.path().join("herdr.sock");
@@ -7367,7 +7515,7 @@ mod tests {
             send_request(
                 &refresh_socket,
                 &serde_json::json!({
-                    "id":"refresh","method":"attribution",
+                    "id":"refresh","method":"who",
                     "params":{"incarnation_id":declared.incarnation_id,"refresh":true}
                 }),
             )

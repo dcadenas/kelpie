@@ -89,6 +89,7 @@ pub enum Command {
     },
     Who {
         target: AttributionTarget,
+        adopt_caller: bool,
         history: bool,
         refresh: bool,
     },
@@ -195,8 +196,8 @@ pub enum Caller {
 /// Which identity an attribution lookup names.
 ///
 /// `Incarnation` is the exact form. `Agent` resolves to that agent's newest
-/// incarnation. `Alias` requires a live Ready binding. `Pane` defaults to the
-/// calling pane and never adopts.
+/// incarnation. `Alias` requires a live Ready binding. An explicit `Pane` is
+/// read-only; the no-selector `who` default may adopt the calling pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributionTarget {
     Incarnation(String),
@@ -1015,6 +1016,7 @@ fn parse_who(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(&args[1..]);
     let history = tokens.take_bool("--history")?;
     let refresh = tokens.take_bool("--refresh")?;
+    let adopt_caller = args[1..].iter().all(|arg| arg == "--refresh");
     let target = take_attribution_target(&mut tokens, "who")?;
     tokens.finish("who")?;
     if history && !matches!(target, AttributionTarget::Alias(_)) {
@@ -1025,6 +1027,7 @@ fn parse_who(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::Who {
         target,
+        adopt_caller,
         history,
         refresh,
     })
@@ -2285,7 +2288,10 @@ fn render_who(result: &Value) -> String {
     } else {
         rendered = rendered.replacen(
             "\nrequested ",
-            &format!(" transport={transport}\nrequested "),
+            &format!(
+                " transport={transport} addressable={}\nrequested ",
+                field(result, "addressable")
+            ),
             1,
         );
     }
@@ -2412,6 +2418,7 @@ mod tests {
             Invocation::Typed {
                 command: Command::Who {
                     target: AttributionTarget::Agent(ref id),
+                    adopt_caller: false,
                     history: false,
                     refresh: false,
                 },
@@ -2425,6 +2432,7 @@ mod tests {
             Invocation::Typed {
                 command: Command::Who {
                     target: AttributionTarget::Alias(ref alias),
+                    adopt_caller: false,
                     history: true,
                     ..
                 },
@@ -2433,6 +2441,16 @@ mod tests {
         ));
         assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--history"])).is_err());
         assert!(parse_invocation(&args(&["who", "botserver", "--history", "--refresh"])).is_err());
+        assert!(matches!(
+            parse_invocation(&args(&["who", "--refresh"])).expect("default self"),
+            Invocation::Typed {
+                command: Command::Who {
+                    adopt_caller: true,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3227,6 +3245,7 @@ mod tests {
                 "logical_agent_id": "agent-1",
                 "incarnation_id": "inc-1",
                 "delivery_transport": "herdr_prompt",
+                "addressable": true,
                 "backend_kind": "codex",
                 "incarnation_state": "ready",
                 "requested": {},
@@ -3239,6 +3258,7 @@ mod tests {
             "{pane}"
         );
         assert!(pane.contains("transport=herdr_prompt"), "{pane}");
+        assert!(pane.contains("addressable=true"), "{pane}");
         assert!(pane.contains("observed none"), "{pane}");
 
         let waiter = format_receipt(

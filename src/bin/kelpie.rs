@@ -233,13 +233,16 @@ fn build_typed(
         }
         Command::Who {
             target,
+            adopt_caller,
             history,
             refresh,
         } => {
             let mut params = attribution_params(&target);
             params["history"] = json!(history);
             params["refresh"] = json!(refresh);
-            params["lazy_adopt_key"] = json!(format!("{request_id}:lazy-adopt:self"));
+            if adopt_caller {
+                params["lazy_adopt_key"] = json!(format!("{request_id}:lazy-adopt:self"));
+            }
             Ok(("who".into(), params))
         }
         Command::Rename { target, name } => {
