@@ -18,6 +18,37 @@ use crate::herdr::Snapshot;
 
 const SCHEMA_VERSION: i64 = 25;
 
+const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
+    newest_incarnations(logical_agent_id, state) AS (
+        SELECT i.logical_agent_id, i.state
+        FROM incarnations i
+        WHERE i.id = (
+            SELECT newest.id
+            FROM incarnations newest
+            WHERE newest.logical_agent_id = i.logical_agent_id
+            ORDER BY newest.created_at_ms DESC, newest.id DESC
+            LIMIT 1
+        )
+    ),
+    active_agents(id) AS (
+        SELECT logical_agent_id
+        FROM newest_incarnations
+        WHERE state IN ('ready', 'starting', 'unknown')
+        UNION
+        SELECT logical_agents.parent_agent_id
+        FROM logical_agents
+        JOIN active_agents ON logical_agents.id = active_agents.id
+        WHERE logical_agents.parent_agent_id IS NOT NULL
+    )";
+
+fn report_scope(active: bool, filter: &'static str) -> (&'static str, &'static str) {
+    if active {
+        (ACTIVE_REPORT_CTE, filter)
+    } else {
+        ("", "")
+    }
+}
+
 /// How often a scheduled `--every` clock asks Herdr for occupancy.
 ///
 /// A sample attributes the whole gap since the last sample to one instantaneous
@@ -6324,28 +6355,49 @@ impl Store {
     ///
     /// Returns an error when a stored row cannot be decoded.
     pub fn report(&self) -> Result<FleetReport, StoreError> {
-        let mut agents = self.report_agents()?;
-        for (agent_id, incarnation) in self.report_incarnations()? {
-            if let Some(agent) = agents
-                .iter_mut()
-                .find(|agent| agent.id.to_string() == agent_id)
-            {
-                agent.incarnations.push(incarnation);
+        self.report_filtered(false)
+    }
+
+    /// Agents with a non-terminal newest incarnation, plus their ancestors.
+    ///
+    /// The active subgraph is selected in SQLite so retired fleet history is
+    /// not decoded and discarded by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a selected stored row cannot be decoded.
+    pub fn active_report(&self) -> Result<FleetReport, StoreError> {
+        self.report_filtered(true)
+    }
+
+    fn report_filtered(&self, active: bool) -> Result<FleetReport, StoreError> {
+        let mut agents = self.report_agents(active)?;
+        let agent_indexes: HashMap<LogicalAgentId, usize> = agents
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| (agent.id, index))
+            .collect();
+        for (agent_id, incarnation) in self.report_incarnations(active)? {
+            if let Some(index) = agent_indexes.get(&agent_id) {
+                agents[*index].incarnations.push(incarnation);
             }
         }
         Ok(FleetReport {
             generated_at_ms: now_millis()?,
             agents,
-            obligations: self.report_obligations()?,
+            obligations: self.report_obligations(active)?,
         })
     }
 
-    fn report_agents(&self) -> Result<Vec<ReportAgent>, StoreError> {
+    fn report_agents(&self, active: bool) -> Result<Vec<ReportAgent>, StoreError> {
         let mut agents_by_id: Vec<ReportAgent> = Vec::new();
-        let mut statement = self.connection.prepare(
-            "SELECT id, public_name, parent_agent_id, explicitly_parentless, created_at_ms
-             FROM logical_agents ORDER BY created_at_ms, id",
-        )?;
+        let (cte, filter) = report_scope(active, "WHERE id IN (SELECT id FROM active_agents)");
+        let sql = format!(
+            "{cte}
+             SELECT id, public_name, parent_agent_id, explicitly_parentless, created_at_ms
+             FROM logical_agents {filter} ORDER BY created_at_ms, id"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -6378,9 +6430,18 @@ impl Store {
         Ok(agents_by_id)
     }
 
-    fn report_incarnations(&self) -> Result<Vec<(String, ReportIncarnation)>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT i.logical_agent_id, i.id, i.state, i.backend_kind, i.working_directory,
+    #[allow(clippy::too_many_lines)]
+    fn report_incarnations(
+        &self,
+        active: bool,
+    ) -> Result<Vec<(LogicalAgentId, ReportIncarnation)>, StoreError> {
+        let (cte, filter) = report_scope(
+            active,
+            "WHERE i.logical_agent_id IN (SELECT id FROM active_agents)",
+        );
+        let sql = format!(
+            "{cte}
+             SELECT i.logical_agent_id, i.id, i.state, i.backend_kind, i.working_directory,
                     i.herdr_session, i.intended_pane_id, i.expected_terminal_id,
                     i.observed_pane_id, i.observed_terminal_id, i.backend_args_json,
                     i.requested_model, i.requested_provider, i.requested_effort,
@@ -6397,8 +6458,10 @@ impl Store {
              )
              LEFT JOIN renews r ON r.incarnation_id = i.id
                 AND r.phase NOT IN ('done','aborted','terminated')
-             ORDER BY i.created_at_ms DESC, i.id DESC",
-        )?;
+             {filter}
+             ORDER BY i.created_at_ms DESC, i.id DESC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -6430,11 +6493,13 @@ impl Store {
                 row.get::<_, Option<i64>>(26)?,
             ))
         })?;
-        let mut incarnations: Vec<(String, ReportIncarnation)> = Vec::new();
+        let mut incarnations: Vec<(LogicalAgentId, ReportIncarnation)> = Vec::new();
         for row in rows {
             let row = row?;
             incarnations.push((
-                row.0,
+                LogicalAgentId::parse(&row.0).ok_or_else(|| {
+                    StoreError::InvalidRecord(format!("invalid agent id {}", row.0))
+                })?,
                 ReportIncarnation {
                     id: IncarnationId::parse(&row.1).ok_or_else(|| {
                         StoreError::InvalidRecord(format!("invalid incarnation id {}", row.1))
@@ -6476,12 +6541,18 @@ impl Store {
         Ok(incarnations)
     }
 
-    fn report_obligations(&self) -> Result<Vec<ReportObligation>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT ask_message_id, owing_agent_id, waiting_agent_id, state,
+    fn report_obligations(&self, active: bool) -> Result<Vec<ReportObligation>, StoreError> {
+        let (cte, filter) = report_scope(
+            active,
+            "WHERE owing_agent_id IN (SELECT id FROM active_agents)",
+        );
+        let sql = format!(
+            "{cte}
+             SELECT ask_message_id, owing_agent_id, waiting_agent_id, state,
                     created_at_ms, last_activity_at_ms, resolving_message_id
-             FROM obligations ORDER BY creation_sequence",
-        )?;
+             FROM obligations {filter} ORDER BY creation_sequence"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -8781,6 +8852,47 @@ mod tests {
         assert_eq!(obligation.waiting_agent_id, parent.logical_agent_id);
         assert_eq!(obligation.state, ObligationState::Open);
         assert!(obligation.resolving_message_id.is_none());
+    }
+
+    #[test]
+    fn active_report_filters_retired_history_in_sql_and_keeps_ancestors() {
+        let mut store = Store::in_memory().expect("store");
+        let parent = store
+            .declare_start(&intent("parent", "term-parent", "active-parent"))
+            .expect("parent");
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'retired' WHERE id = ?1",
+                [parent.incarnation_id.to_string()],
+            )
+            .expect("retire parent");
+
+        let mut child_intent = intent("child", "term-child", "active-child");
+        child_intent.parent = Parent::Agent(parent.logical_agent_id);
+        let child = store.declare_start(&child_intent).expect("child");
+        mark_ready(&mut store, child, "child", "term-child");
+
+        let retired = store
+            .declare_start(&intent("history", "term-history", "inactive-history"))
+            .expect("history");
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations
+                 SET state = 'retired', backend_args_json = 'not json'
+                 WHERE id = ?1",
+                [retired.incarnation_id.to_string()],
+            )
+            .expect("corrupt excluded history");
+
+        let report = store.active_report().expect("active report");
+        let ids: Vec<_> = report.agents.iter().map(|agent| agent.id).collect();
+        assert_eq!(ids, vec![parent.logical_agent_id, child.logical_agent_id]);
+        assert!(
+            store.report().is_err(),
+            "the full report still loads and validates retired history"
+        );
     }
 
     #[test]
