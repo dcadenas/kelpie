@@ -7843,14 +7843,14 @@ mod tests {
         );
 
         let (stream, _peer) = UnixStream::pair().expect("report stream pair");
-        let mut expired = awaiting_write(
+        let expired = AwaitingWrite {
             stream,
-            &respond("expired", Ok(serde_json::json!({"large":"response"}))),
-        )
-        .expect("expired response");
-        expired.started_at = Instant::now()
-            .checked_sub(CLIENT_WRITE_TIMEOUT)
-            .expect("write timeout fits before now");
+            bytes: vec![b'x'; 1024 * 1024],
+            written: 0,
+            started_at: Instant::now()
+                .checked_sub(CLIENT_WRITE_TIMEOUT)
+                .expect("write timeout fits before now"),
+        };
         daemon.awaiting_writes.push(expired);
         daemon.poll().expect("expire report response");
         assert!(
