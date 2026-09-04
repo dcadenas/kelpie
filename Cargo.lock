@@ -153,6 +153,7 @@ dependencies = [
 name = "kelpie-herdr"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
