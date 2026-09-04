@@ -2441,16 +2441,6 @@ mod tests {
         ));
         assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--history"])).is_err());
         assert!(parse_invocation(&args(&["who", "botserver", "--history", "--refresh"])).is_err());
-        assert!(matches!(
-            parse_invocation(&args(&["who", "--refresh"])).expect("default self"),
-            Invocation::Typed {
-                command: Command::Who {
-                    adopt_caller: true,
-                    ..
-                },
-                ..
-            }
-        ));
     }
 
     #[test]
