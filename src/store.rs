@@ -16,7 +16,7 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 
 const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
     active_roots(logical_agent_id) AS (
@@ -48,7 +48,6 @@ fn report_scope(active: bool, filter: &'static str) -> (&'static str, &'static s
         ("", "")
     }
 }
-
 /// How often a scheduled `--every` clock asks Herdr for occupancy.
 ///
 /// A sample attributes the whole gap since the last sample to one instantaneous
@@ -164,6 +163,23 @@ pub struct NameInfo {
 pub struct CreatedAsk {
     pub message_id: MessageId,
     pub operation_id: OperationId,
+}
+
+/// Recorded receipt for a completed Herdr prompt operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptOperationReplay {
+    pub operation_id: OperationId,
+    pub message_id: MessageId,
+    pub message_kind: MessageKind,
+    pub recipient_agent_id: LogicalAgentId,
+    pub recipient_incarnation_id: IncarnationId,
+    pub delivery_outcome: DeliveryOutcome,
+    pub waiting_agent_id: Option<LogicalAgentId>,
+    pub reply_to: Option<MessageId>,
+    pub disposition: Option<ReplyDisposition>,
+    pub obligation_state: Option<ObligationState>,
+    pub remind_after_ms: Option<i64>,
+    pub intent: serde_json::Value,
 }
 
 /// IDs atomically created for a pane-less socket waiter.
@@ -2479,6 +2495,14 @@ impl Store {
                 "reminder interval must be greater than zero".into(),
             ));
         }
+        if let Some(replay) =
+            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask)?
+        {
+            return Ok(CreatedAsk {
+                message_id: replay.message_id,
+                operation_id: replay.operation_id,
+            });
+        }
         let message_id = MessageId::new();
         let operation_id = OperationId::new();
         let now = now_millis()?;
@@ -2599,6 +2623,14 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<CreatedTell, StoreError> {
+        if let Some(replay) =
+            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Tell)?
+        {
+            return Ok(CreatedTell {
+                message_id: replay.message_id,
+                operation_id: replay.operation_id,
+            });
+        }
         let message_id = MessageId::new();
         let operation_id = OperationId::new();
         let now = now_millis()?;
@@ -2778,6 +2810,21 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<CreatedReply, StoreError> {
+        if let Some(replay) =
+            self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Reply)?
+        {
+            return Ok(CreatedReply {
+                message_id: replay.message_id,
+                operation_id: Some(replay.operation_id),
+                recipient_incarnation: Some(replay.recipient_incarnation_id),
+                disposition: replay.disposition.ok_or_else(|| {
+                    StoreError::InvalidRecord(format!(
+                        "replayed reply {} has no disposition",
+                        replay.message_id
+                    ))
+                })?,
+            });
+        }
         let message_id = MessageId::new();
         let operation_id = OperationId::new();
         let now = now_millis()?;
@@ -3337,6 +3384,161 @@ impl Store {
             |row| row.get(0),
         )?;
         parse_operation_outcome(&value)
+    }
+
+    /// Return a completed prompt receipt or decide whether the caller may retry.
+    ///
+    /// A terminal failure frees the caller's key for a new operation. A success
+    /// returns the durable receipt. Every other outcome refuses the retry and
+    /// names the state that the caller must reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict for a non-terminal, ambiguous, superseded, or
+    /// different-kind prior operation, and an invalid-record error for malformed
+    /// durable state.
+    #[allow(clippy::too_many_lines)]
+    pub fn replay_prompt_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+        expected_kind: MessageKind,
+    ) -> Result<Option<PromptOperationReplay>, StoreError> {
+        type ReplayRow = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        );
+        let row: Option<ReplayRow> = self
+            .connection
+            .query_row(
+                "SELECT o.id, o.kind, o.outcome, o.intent_json, o.target_incarnation_id,
+                        m.id, m.kind, m.recipient_agent_id, m.reply_to_message_id,
+                        m.disposition, d.outcome, ob.waiting_agent_id, r.interval_ms, ob.state
+                 FROM operations o
+                 LEFT JOIN deliveries d ON d.operation_id = o.id
+                 LEFT JOIN messages m ON m.id = d.message_id
+                 LEFT JOIN obligations ob ON ob.ask_message_id = CASE
+                     WHEN m.kind = 'reply' THEN m.reply_to_message_id ELSE m.id END
+                 LEFT JOIN obligation_reminders r ON r.ask_message_id = m.id
+                 WHERE o.idempotency_key = ?1
+                 ORDER BY (o.outcome != 'failed') DESC, o.created_at_ms DESC, o.id DESC
+                 LIMIT 1",
+                [idempotency_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            operation_id,
+            operation_kind,
+            outcome,
+            intent,
+            recipient_incarnation_id,
+            message_id,
+            message_kind,
+            recipient_agent_id,
+            reply_to,
+            disposition,
+            delivery_outcome,
+            waiting_agent_id,
+            remind_after_ms,
+            obligation_state,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let outcome = parse_operation_outcome(&outcome)?;
+        if outcome == OperationOutcome::Failed {
+            return Ok(None);
+        }
+        if outcome != OperationOutcome::Succeeded {
+            return Err(idempotency_conflict(
+                idempotency_key,
+                &operation_id,
+                outcome,
+            ));
+        }
+        let actual_kind = message_kind
+            .as_deref()
+            .map(parse_message_kind)
+            .transpose()?
+            .ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "succeeded prompt operation {operation_id} has no message kind"
+                ))
+            })?;
+        if operation_kind != "prompt" || actual_kind != expected_kind {
+            return Err(StoreError::Conflict(format!(
+                "idempotency key {idempotency_key} belongs to prior operation {operation_id} with \
+                 outcome succeeded, but not to a matching {expected_kind:?} prompt; refusing replay"
+            )));
+        }
+        Ok(Some(PromptOperationReplay {
+            operation_id: parse_operation_id(&operation_id)?,
+            message_id: parse_message_id(message_id.as_deref().ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "succeeded prompt operation {operation_id} has no message"
+                ))
+            })?)?,
+            message_kind: actual_kind,
+            recipient_agent_id: parse_logical_agent_id(recipient_agent_id.as_deref().ok_or_else(
+                || {
+                    StoreError::InvalidRecord(format!(
+                        "succeeded prompt operation {operation_id} has no recipient"
+                    ))
+                },
+            )?)?,
+            recipient_incarnation_id: parse_incarnation_id(&recipient_incarnation_id)?,
+            delivery_outcome: parse_delivery_outcome(delivery_outcome.as_deref().ok_or_else(
+                || {
+                    StoreError::InvalidRecord(format!(
+                        "succeeded prompt operation {operation_id} has no delivery"
+                    ))
+                },
+            )?)?,
+            waiting_agent_id: waiting_agent_id
+                .as_deref()
+                .map(parse_logical_agent_id)
+                .transpose()?,
+            reply_to: reply_to.as_deref().map(parse_message_id).transpose()?,
+            disposition: disposition
+                .as_deref()
+                .map(parse_reply_disposition)
+                .transpose()?,
+            obligation_state: obligation_state
+                .as_deref()
+                .map(parse_obligation_state)
+                .transpose()?,
+            remind_after_ms,
+            intent: serde_json::from_str(&intent).map_err(|error| invalid_json(&error))?,
+        }))
     }
 
     /// Persist one standalone clear before its Herdr write.
@@ -7611,6 +7813,11 @@ fn parse_message_id(value: &str) -> Result<MessageId, StoreError> {
         .ok_or_else(|| StoreError::InvalidRecord(format!("invalid message id {value}")))
 }
 
+fn parse_operation_id(value: &str) -> Result<OperationId, StoreError> {
+    OperationId::parse(value)
+        .ok_or_else(|| StoreError::InvalidRecord(format!("invalid operation id {value}")))
+}
+
 fn parse_logical_agent_id(value: &str) -> Result<LogicalAgentId, StoreError> {
     LogicalAgentId::parse(value)
         .ok_or_else(|| StoreError::InvalidRecord(format!("invalid logical agent id {value}")))
@@ -7836,6 +8043,12 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 25 {
         connection.execute_batch(include_str!("../migrations/026_active_report_indexes.sql"))?;
         version = 26;
+    }
+    if version == 26 {
+        connection.execute_batch(include_str!(
+            "../migrations/027_operation_idempotency_outcome.sql"
+        ))?;
+        version = 27;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
@@ -8579,6 +8792,29 @@ fn parse_operation_outcome(value: &str) -> Result<OperationOutcome, StoreError> 
     }
 }
 
+fn operation_outcome_name(value: OperationOutcome) -> &'static str {
+    match value {
+        OperationOutcome::Pending => "pending",
+        OperationOutcome::Accepted => "accepted",
+        OperationOutcome::Succeeded => "succeeded",
+        OperationOutcome::Failed => "failed",
+        OperationOutcome::Superseded => "superseded",
+        OperationOutcome::Unknown => "unknown",
+    }
+}
+
+fn idempotency_conflict(
+    idempotency_key: &str,
+    operation_id: &str,
+    outcome: OperationOutcome,
+) -> StoreError {
+    StoreError::Conflict(format!(
+        "idempotency key {idempotency_key} belongs to prior operation {operation_id} with outcome \
+         {}; refusing retry",
+        operation_outcome_name(outcome)
+    ))
+}
+
 fn parse_obligation_state(value: &str) -> Result<ObligationState, StoreError> {
     match value {
         "open" => Ok(ObligationState::Open),
@@ -9287,6 +9523,7 @@ mod tests {
         let store = Store::in_memory().expect("store");
         for name in [
             "incarnations_logical_state",
+            "operations_live_idempotency_key",
             "operations_target_kind_outcome",
             "messages_reply_kind_disposition",
             "deliveries_message_outcome",

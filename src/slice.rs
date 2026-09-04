@@ -1496,6 +1496,18 @@ impl Kelpie {
         remind_after_ms: Option<i64>,
         operator_attributed: bool,
     ) -> Result<(CreatedAsk, Option<PreparedPrompt>), SliceError> {
+        if let Some(replay) = self
+            .store
+            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask)?
+        {
+            return Ok((
+                CreatedAsk {
+                    message_id: replay.message_id,
+                    operation_id: replay.operation_id,
+                },
+                None,
+            ));
+        }
         let _binding = self.store.ready_binding(recipient_incarnation)?;
         let (effective_due_at_ms, defer) =
             self.prompt_schedule(recipient_incarnation, due_at_ms)?;
@@ -1574,6 +1586,18 @@ impl Kelpie {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<(CreatedTell, Option<PreparedPrompt>), SliceError> {
+        if let Some(replay) = self
+            .store
+            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Tell)?
+        {
+            return Ok((
+                CreatedTell {
+                    message_id: replay.message_id,
+                    operation_id: replay.operation_id,
+                },
+                None,
+            ));
+        }
         let _binding = self.store.ready_binding(recipient_incarnation)?;
         let (effective_due_at_ms, defer) =
             self.prompt_schedule(recipient_incarnation, due_at_ms)?;
@@ -3247,6 +3271,25 @@ impl Kelpie {
         disposition: ReplyDisposition,
         idempotency_key: &str,
     ) -> Result<(CreatedReply, Option<PreparedPrompt>), SliceError> {
+        if let Some(replay) = self
+            .store
+            .replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Reply)?
+        {
+            return Ok((
+                CreatedReply {
+                    message_id: replay.message_id,
+                    operation_id: Some(replay.operation_id),
+                    recipient_incarnation: Some(replay.recipient_incarnation_id),
+                    disposition: replay.disposition.ok_or_else(|| {
+                        StoreError::InvalidRecord(format!(
+                            "replayed reply {} has no disposition",
+                            replay.message_id
+                        ))
+                    })?,
+                },
+                None,
+            ));
+        }
         let receive_path = self
             .store
             .reply_receive_path(reply_to, requester_agent_id)?;

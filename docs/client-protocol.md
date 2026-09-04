@@ -185,6 +185,13 @@ pane, which reads to every observer as an ask that went unanswered. Reminders
 (`remind_after_ms`) cover being nudged about an ask already in flight, and a
 `tell` covers a message that should arrive later.
 
+Repeating a prompt's idempotency key is outcome-aware. A succeeded prompt
+returns its recorded message, operation, recipient, and delivery receipt without
+another Herdr write. A terminally failed prompt permits a fresh operation under
+the same caller key while retaining the failed history. Pending, accepted,
+superseded, and unknown operations refuse the retry and name the prior operation
+and outcome; callers must reconcile rather than vary the key.
+
 On a `tell`, optional `due_at_ms` (Unix epoch milliseconds, same store
 `SystemTime` clock as other timestamps) persists the delivery as `queued` and
 fires it once when
