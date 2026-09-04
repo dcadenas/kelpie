@@ -234,6 +234,7 @@ struct AwaitingWrite {
     stream: UnixStream,
     bytes: Vec<u8>,
     written: usize,
+    started_at: Instant,
 }
 
 /// A bound foreground daemon. Dropping it removes only the socket it created.
@@ -561,7 +562,6 @@ impl Daemon {
             || !self.awaiting_starts.is_empty()
             || !self.awaiting_clears.is_empty()
             || !self.reading.is_empty()
-            || !self.awaiting_writes.is_empty()
             || !self.awaiting_prompts.is_empty()
             || !self.awaiting_cancels.is_empty()
             || self.reminder_job.is_some()
@@ -681,6 +681,11 @@ impl Daemon {
         let mut progressed = false;
         let mut pending = Vec::with_capacity(self.awaiting_writes.len());
         for mut write in std::mem::take(&mut self.awaiting_writes) {
+            if write.started_at.elapsed() >= CLIENT_WRITE_TIMEOUT {
+                eprintln!("kelpied: report response timed out while the client was not reading");
+                progressed = true;
+                continue;
+            }
             match advance_write(&mut write) {
                 Ok((complete, advanced)) => {
                     progressed |= advanced;
@@ -4346,6 +4351,7 @@ fn awaiting_write(
         stream,
         bytes,
         written: 0,
+        started_at: Instant::now(),
     })
 }
 
@@ -5129,8 +5135,6 @@ struct ReportParams {
     active: bool,
 }
 
-/// Report every durable node and edge, optionally beside a Herdr snapshot.
-///
 fn cycle_due_at_ms(renew: &crate::store::ReportRenew) -> i64 {
     if renew.phase == crate::domain::RenewPhase::Scheduled
         && let Some(remaining) = renew.active_remaining_ms
@@ -7811,7 +7815,7 @@ mod tests {
         while !unrelated.is_finished() {
             daemon.poll().expect("poll");
             assert!(
-                asked_at.elapsed() < Duration::from_millis(500),
+                asked_at.elapsed() < Duration::from_millis(400),
                 "unrelated request waited for the report response"
             );
         }
@@ -7820,12 +7824,18 @@ mod tests {
             !daemon.awaiting_writes.is_empty(),
             "the report client is still not reading, so its response must remain parked"
         );
-
-        while !report_client.is_finished() {
-            daemon.poll().expect("drain report");
-            thread::yield_now();
-        }
-        assert!(!report_client.join().expect("report client").is_empty());
+        daemon.awaiting_writes[0].started_at = Instant::now()
+            .checked_sub(CLIENT_WRITE_TIMEOUT)
+            .expect("write timeout fits before now");
+        daemon.poll().expect("expire report response");
+        assert!(
+            daemon.awaiting_writes.is_empty(),
+            "a non-reading report client is bounded by the write timeout"
+        );
+        assert!(
+            !report_client.join().expect("report client").ends_with('\n'),
+            "timed-out report responses must not appear complete"
+        );
     }
 
     #[test]

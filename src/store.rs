@@ -16,24 +16,24 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
-    newest_incarnations(logical_agent_id, state) AS (
-        SELECT i.logical_agent_id, i.state
+    active_roots(logical_agent_id) AS (
+        SELECT i.logical_agent_id
         FROM incarnations i
-        WHERE i.id = (
-            SELECT newest.id
-            FROM incarnations newest
-            WHERE newest.logical_agent_id = i.logical_agent_id
-            ORDER BY newest.created_at_ms DESC, newest.id DESC
-            LIMIT 1
+        WHERE i.state IN ('ready', 'starting', 'unknown')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM incarnations newer
+            WHERE newer.logical_agent_id = i.logical_agent_id
+              AND (newer.created_at_ms > i.created_at_ms
+                   OR (newer.created_at_ms = i.created_at_ms AND newer.id > i.id))
         )
     ),
     active_agents(id) AS (
         SELECT logical_agent_id
-        FROM newest_incarnations
-        WHERE state IN ('ready', 'starting', 'unknown')
+        FROM active_roots
         UNION
         SELECT logical_agents.parent_agent_id
         FROM logical_agents
@@ -7833,6 +7833,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         connection.execute_batch(include_str!("../migrations/025_inflight_final_indexes.sql"))?;
         version = 25;
     }
+    if version == 25 {
+        connection.execute_batch(include_str!("../migrations/026_active_report_indexes.sql"))?;
+        version = 26;
+    }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
             "unsupported schema version {version}"
@@ -9286,6 +9290,8 @@ mod tests {
             "operations_target_kind_outcome",
             "messages_reply_kind_disposition",
             "deliveries_message_outcome",
+            "incarnations_state_logical_created_id",
+            "incarnations_logical_created_id",
         ] {
             let found: i64 = store
                 .connection
