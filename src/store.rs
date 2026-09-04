@@ -158,6 +158,11 @@ pub struct EndedWaiter {
 }
 
 /// One queued socket-inbox delivery named by waiter agent, not incarnation.
+///
+/// `sender_agent_id` is the sending logical agent and `sender_public_name`
+/// is that agent's public name as of the query, not as of the send. Both are
+/// `None` when the message has no agent sender: operator-attributed messages
+/// and host-authored cancellations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketInboxDelivery {
     pub message_id: MessageId,
@@ -166,6 +171,8 @@ pub struct SocketInboxDelivery {
     pub reply_to: Option<MessageId>,
     pub disposition: Option<ReplyDisposition>,
     pub attempt_number: i64,
+    pub sender_agent_id: Option<LogicalAgentId>,
+    pub sender_public_name: Option<String>,
 }
 
 /// IDs atomically created for one tell and its delivery operation.
@@ -2137,9 +2144,11 @@ impl Store {
     ) -> Result<Vec<SocketInboxDelivery>, StoreError> {
         require_active_socket_waiter(&self.connection, recipient_agent_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT m.id, m.kind, m.body, m.reply_to_message_id, m.disposition, d.attempt_number
+            "SELECT m.id, m.kind, m.body, m.reply_to_message_id, m.disposition, d.attempt_number,
+                    m.sender_agent_id, s.public_name
                FROM deliveries d
                JOIN messages m ON m.id = d.message_id
+               LEFT JOIN logical_agents s ON s.id = m.sender_agent_id
               WHERE d.recipient_agent_id = ?1
                 AND d.delivery_transport = 'socket_inbox'
                 AND d.outcome = 'queued'
@@ -2155,11 +2164,22 @@ impl Store {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut deliveries = Vec::new();
         for row in rows {
-            let (message_id, kind, body, reply_to, disposition, attempt_number) = row?;
+            let (
+                message_id,
+                kind,
+                body,
+                reply_to,
+                disposition,
+                attempt_number,
+                sender_agent_id,
+                sender_public_name,
+            ) = row?;
             deliveries.push(SocketInboxDelivery {
                 message_id: parse_message_id(&message_id)?,
                 kind: parse_message_kind(&kind)?,
@@ -2170,6 +2190,11 @@ impl Store {
                     .map(parse_reply_disposition)
                     .transpose()?,
                 attempt_number,
+                sender_agent_id: sender_agent_id
+                    .as_deref()
+                    .map(parse_logical_agent_id)
+                    .transpose()?,
+                sender_public_name,
             });
         }
         Ok(deliveries)
@@ -13096,6 +13121,23 @@ mod tests {
         assert_eq!(queued[0].message_id, tell.message_id);
         assert_eq!(queued[0].kind, MessageKind::Tell);
         assert_eq!(queued[0].body, "unsolicited progress");
+        assert_eq!(queued[0].sender_agent_id, Some(sender.logical_agent_id));
+        assert_eq!(queued[0].sender_public_name.as_deref(), Some("sender"));
+        store
+            .connection
+            .execute(
+                "UPDATE logical_agents SET public_name = 'renamed' WHERE id = ?1",
+                [sender.logical_agent_id.to_string()],
+            )
+            .expect("rename sender");
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("queued after rename");
+        assert_eq!(
+            queued[0].sender_public_name.as_deref(),
+            Some("renamed"),
+            "sender_public_name is the name at query time, not at send time"
+        );
         assert_eq!(
             store
                 .ack_socket_inbox_delivery(waiter.logical_agent_id, tell.message_id)

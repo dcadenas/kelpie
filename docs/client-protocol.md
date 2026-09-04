@@ -48,6 +48,19 @@ reconnect re-offers that queued row. Dropping the connection leaves those
 deliveries `queued`. Claiming an id that is not an active socket waiter is
 `conflict`. `pending` and `ask.info` are not this receive path.
 
+Each `inbox.delivery` event's `params` carry `message_id`, `kind` (`tell`,
+`ask`, `reply`, or `cancellation`), `body`, `reply_to`, `disposition`,
+`attempt_number`, `sender_agent_id`, and `sender_public_name`.
+`sender_agent_id` is the sending logical agent's id and `sender_public_name`
+is that agent's public name at delivery time, so a host can attribute a `tell`
+to a known occupant rather than correlating only replies by `reply_to`.
+`sender_agent_id` is the `sender` the originating request claimed: Kelpie
+checks that the agent exists, not who sent the request, so both fields carry
+the local socket's same-user attribution and are not authentication. Both
+are `null` when the message has no agent sender: operator-attributed messages
+and host-generated cancellations. Neither field changes ordering, ACK
+semantics, or the fault-injection points.
+
 `kelpie adopt --pane ID --terminal ID [--logical-id ID]` is the client form.
 `--logical-id` continues that exact logical agent in a new incarnation, keeping
 its obligations, messages, and history; without it adoption creates a new logical
