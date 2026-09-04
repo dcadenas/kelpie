@@ -15,8 +15,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::domain::{
-    AdoptIntent, IncarnationId, LogicalAgentId, MessageId, OperationId, Parent, RenewId,
-    RenewPhase, RenewTimeout, ReplyDisposition, StartIntent,
+    AdoptIntent, IncarnationId, LogicalAgentId, MessageId, MessageKind, OperationId, Parent,
+    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, StartIntent,
 };
 use crate::herdr::HerdrError;
 use crate::herdr_exec::{FailPhase, HerdrEvent, HerdrExec, HerdrJob, HerdrJobResult, LeaseCmd};
@@ -27,7 +27,7 @@ use crate::slice::{
     RetireAfterSnapshot, RetireCloseWork, RetirePreflight, SliceError, WaiterRetireOutcome,
     WaiterRetireOwingNotice,
 };
-use crate::store::{BoundaryReminder, DueReminder, DueRenew, StoreError};
+use crate::store::{BoundaryReminder, DueReminder, DueRenew, PromptOperationReplay, StoreError};
 
 const DEFAULT_REMINDER_INTERVAL_MS: i64 = 300_000;
 /// A client must finish sending its request line within this window.
@@ -5640,6 +5640,67 @@ fn fill_prompt_result(kelpie: &mut Kelpie, awaiting: &mut AwaitingPrompt, delive
     }
 }
 
+fn prompt_replay_result(replay: &PromptOperationReplay) -> Result<Value, StoreError> {
+    let mut result = match replay.message_kind {
+        MessageKind::Ask => serde_json::json!({
+            "message_id": replay.message_id,
+            "operation_id": replay.operation_id,
+            "recipient": replay.recipient_agent_id,
+            "recipient_incarnation": replay.recipient_incarnation_id,
+            "waiting_agent_id": replay.waiting_agent_id.ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "replayed ask {} has no waiting agent",
+                    replay.message_id
+                ))
+            })?,
+            "delivery_outcome": replay.delivery_outcome,
+        }),
+        MessageKind::Tell => serde_json::json!({
+            "message_id": replay.message_id,
+            "operation_id": replay.operation_id,
+            "recipient": replay.recipient_agent_id,
+            "recipient_incarnation": replay.recipient_incarnation_id,
+            "delivery_transport": "herdr_prompt",
+            "delivery_outcome": replay.delivery_outcome,
+        }),
+        MessageKind::Reply => serde_json::json!({
+            "message_id": replay.message_id,
+            "operation_id": replay.operation_id,
+            "recipient_incarnation": replay.recipient_incarnation_id,
+            "disposition": replay.disposition.ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "replayed reply {} has no disposition",
+                    replay.message_id
+                ))
+            })?,
+            "delivery_outcome": replay.delivery_outcome,
+            "obligation_state": replay.obligation_state.ok_or_else(|| {
+                StoreError::InvalidRecord(format!(
+                    "replayed reply {} has no obligation state",
+                    replay.message_id
+                ))
+            })?,
+        }),
+        MessageKind::Cancellation => {
+            return Err(StoreError::InvalidRecord(format!(
+                "client idempotency key resolved to cancellation message {}",
+                replay.message_id
+            )));
+        }
+    };
+    if replay.message_kind == MessageKind::Ask {
+        if let Some(remind_after_ms) = replay.remind_after_ms {
+            result["remind_after_ms"] = serde_json::json!(remind_after_ms);
+        } else {
+            result["reminders"] = serde_json::json!("disabled");
+        }
+    }
+    if let Some(due_at_ms) = replay.intent.get("due_at_ms") {
+        result["due_at_ms"] = due_at_ms.clone();
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_lines)]
 fn prepare_client_prompt(
     request: &ClientRequest,
@@ -5656,6 +5717,14 @@ fn prepare_client_prompt(
             )));
         }
         let reminder_interval = ask_reminder_interval(&params)?;
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Ask,
+            params.sender,
+            None,
+        )? {
+            return Ok((prompt_replay_result(&replay)?, None, None));
+        }
         let (recipient, recipient_incarnation) = resolve_recipient(
             kelpie,
             params.recipient,
@@ -5693,6 +5762,14 @@ fn prepare_client_prompt(
     } else if request.method == "tell" {
         let params = serde_json::from_value::<TellParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Tell,
+            params.sender,
+            None,
+        )? {
+            return Ok((prompt_replay_result(&replay)?, None, None));
+        }
         match resolve_tell_recipient(
             kelpie,
             params.recipient,
@@ -5753,6 +5830,14 @@ fn prepare_client_prompt(
     } else {
         let params = serde_json::from_value::<ReplyParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+        if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
+            &params.idempotency_key,
+            MessageKind::Reply,
+            params.requester_agent_id,
+            Some(params.reply_to),
+        )? {
+            return Ok((prompt_replay_result(&replay)?, None, replay.reply_to));
+        }
         let (created, prepared) = kelpie.record_reply(
             params.reply_to,
             params.requester_agent_id,
@@ -8091,6 +8176,370 @@ mod tests {
             )
             .expect("ready");
         declared
+    }
+
+    fn ask_request(
+        id: &str,
+        sender: LogicalAgentId,
+        recipient: LogicalAgentId,
+        recipient_incarnation: IncarnationId,
+        key: &str,
+    ) -> ClientRequest {
+        ClientRequest {
+            id: id.into(),
+            method: "ask".into(),
+            params: serde_json::json!({
+                "sender": sender,
+                "recipient": recipient,
+                "recipient_incarnation": recipient_incarnation,
+                "body": "question",
+                "idempotency_key": key,
+                "no_remind": true,
+            }),
+        }
+    }
+
+    #[test]
+    fn failed_prompt_idempotency_key_allows_a_fresh_attempt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let sender = seed_ready(&mut store, "sender", "w1:p1", "term-a", "sender-start");
+        let recipient = seed_ready(
+            &mut store,
+            "recipient",
+            "w1:p2",
+            "term-b",
+            "recipient-start",
+        );
+        let prior = store
+            .create_ask(
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "question",
+                "retryable-ask",
+            )
+            .expect("prior ask");
+        store
+            .begin_attempt(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "prior-request",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(prior.operation_id, 1, "prior-request")
+            .expect("submitted");
+        store
+            .mark_rejected(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "target unavailable",
+                crate::domain::DeliveryOutcome::TargetUnavailable,
+            )
+            .expect("terminal failure");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+
+        let (result, prepared, _) = prepare_client_prompt(
+            &ask_request(
+                "retry",
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "retryable-ask",
+            ),
+            &mut kelpie,
+        )
+        .expect("failed operation frees the key");
+        let fresh_operation =
+            OperationId::parse(result["operation_id"].as_str().expect("fresh operation id"))
+                .expect("valid operation id");
+        assert_ne!(fresh_operation, prior.operation_id);
+        assert!(prepared.is_some(), "fresh prompt should be prepared");
+        assert_eq!(
+            kelpie
+                .store()
+                .operation_outcome(prior.operation_id)
+                .expect("prior outcome"),
+            crate::domain::OperationOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn succeeded_prompt_idempotency_key_replays_the_recorded_receipt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let sender = seed_ready(&mut store, "sender", "w1:p1", "term-a", "sender-start");
+        let recipient = seed_ready(
+            &mut store,
+            "recipient",
+            "w1:p2",
+            "term-b",
+            "recipient-start",
+        );
+        let prior = store
+            .create_ask(
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "question",
+                "completed-ask",
+            )
+            .expect("prior ask");
+        store
+            .begin_attempt(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "prior-request",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(prior.operation_id, 1, "prior-request")
+            .expect("submitted");
+        store
+            .accept_delivery(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "w1:p2",
+                "term-b",
+            )
+            .expect("accepted");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+
+        let (result, prepared, _) = prepare_client_prompt(
+            &ask_request(
+                "replay",
+                sender.logical_agent_id,
+                LogicalAgentId::new(),
+                IncarnationId::new(),
+                "completed-ask",
+            ),
+            &mut kelpie,
+        )
+        .expect("succeeded operation replays before target resolution");
+        assert_eq!(result["message_id"], prior.message_id.to_string());
+        assert_eq!(result["operation_id"], prior.operation_id.to_string());
+        assert_eq!(
+            result["recipient_incarnation"],
+            recipient.incarnation_id.to_string()
+        );
+        assert_eq!(result["delivery_outcome"], "accepted");
+        assert!(prepared.is_none(), "replay must not prepare another write");
+    }
+
+    #[test]
+    fn succeeded_tell_idempotency_key_replays_the_recorded_receipt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let sender = seed_ready(&mut store, "sender", "w1:p1", "term-a", "sender-start");
+        let recipient = seed_ready(
+            &mut store,
+            "recipient",
+            "w1:p2",
+            "term-b",
+            "recipient-start",
+        );
+        let prior = store
+            .create_tell(
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "notice",
+                "completed-tell",
+            )
+            .expect("prior tell");
+        store
+            .begin_attempt(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "prior-request",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(prior.operation_id, 1, "prior-request")
+            .expect("submitted");
+        store
+            .accept_delivery(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "w1:p2",
+                "term-b",
+            )
+            .expect("accepted");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+        let request = ClientRequest {
+            id: "replay-tell".into(),
+            method: "tell".into(),
+            params: serde_json::json!({
+                "sender": sender.logical_agent_id,
+                "recipient": LogicalAgentId::new(),
+                "recipient_incarnation": IncarnationId::new(),
+                "body": "notice",
+                "idempotency_key": "completed-tell",
+            }),
+        };
+
+        let (result, prepared, _) =
+            prepare_client_prompt(&request, &mut kelpie).expect("replay tell");
+        assert_eq!(result["message_id"], prior.message_id.to_string());
+        assert_eq!(result["operation_id"], prior.operation_id.to_string());
+        assert_eq!(result["delivery_outcome"], "accepted");
+        assert!(prepared.is_none(), "replay must not prepare another write");
+    }
+
+    #[test]
+    fn succeeded_reply_idempotency_key_replays_the_recorded_receipt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let waiting = seed_ready(&mut store, "waiting", "w1:p1", "term-a", "waiting-start");
+        let owing = seed_ready(&mut store, "owing", "w1:p2", "term-b", "owing-start");
+        let ask = store
+            .create_ask(
+                waiting.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "reply-source",
+            )
+            .expect("ask");
+        let prior = store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "completed-reply",
+            )
+            .expect("prior reply");
+        let operation_id = prior.operation_id.expect("Herdr reply operation");
+        store
+            .accept_delivery(operation_id, waiting.incarnation_id, "w1:p1", "term-a")
+            .expect("accepted");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+        let request = ClientRequest {
+            id: "replay-reply".into(),
+            method: "reply".into(),
+            params: serde_json::json!({
+                "reply_to": ask.message_id,
+                "requester_agent_id": owing.logical_agent_id,
+                "body": "done",
+                "disposition": "final",
+                "idempotency_key": "completed-reply",
+            }),
+        };
+
+        let (result, prepared, reply_to) =
+            prepare_client_prompt(&request, &mut kelpie).expect("replay reply");
+        assert_eq!(result["message_id"], prior.message_id.to_string());
+        assert_eq!(result["operation_id"], operation_id.to_string());
+        assert_eq!(result["disposition"], "final");
+        assert_eq!(result["obligation_state"], "resolved");
+        assert_eq!(reply_to, Some(ask.message_id));
+        assert!(prepared.is_none(), "replay must not prepare another write");
+
+        let wrong_requester = ClientRequest {
+            id: "wrong-replay-reply".into(),
+            method: "reply".into(),
+            params: serde_json::json!({
+                "reply_to": ask.message_id,
+                "requester_agent_id": LogicalAgentId::new(),
+                "body": "done",
+                "disposition": "final",
+                "idempotency_key": "completed-reply",
+            }),
+        };
+        let error = prepare_client_prompt(&wrong_requester, &mut kelpie)
+            .expect_err("another sender cannot read the receipt");
+        assert!(error.to_string().contains("different sender"), "{error}");
+    }
+
+    #[test]
+    fn unknown_prompt_idempotency_key_refuses_with_the_prior_outcome() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let sender = seed_ready(&mut store, "sender", "w1:p1", "term-a", "sender-start");
+        let recipient = seed_ready(
+            &mut store,
+            "recipient",
+            "w1:p2",
+            "term-b",
+            "recipient-start",
+        );
+        let prior = store
+            .create_ask(
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "question",
+                "unknown-ask",
+            )
+            .expect("prior ask");
+        store
+            .begin_attempt(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "prior-request",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(prior.operation_id, 1, "prior-request")
+            .expect("submitted");
+        store
+            .mark_unknown(
+                prior.operation_id,
+                recipient.incarnation_id,
+                "response lost",
+            )
+            .expect("unknown");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+
+        let error = prepare_client_prompt(
+            &ask_request(
+                "refuse",
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                recipient.incarnation_id,
+                "unknown-ask",
+            ),
+            &mut kelpie,
+        )
+        .expect_err("unknown operation must not be retried");
+        let message = error.to_string();
+        assert!(message.contains("outcome unknown"), "{message}");
+        assert!(
+            message.contains(&prior.operation_id.to_string()),
+            "{message}"
+        );
     }
 
     fn tell_request(id: &str, agent: &crate::store::DeclaredStart, body: &str, key: &str) -> Value {

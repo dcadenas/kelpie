@@ -270,6 +270,22 @@ The outcome MUST be one of:
 `unknown` MUST NOT be coerced to either success or failure. Retrying an unknown
 operation MUST follow operation-specific idempotency rules.
 
+A repeated caller idempotency key for a prompt operation MUST be resolved from
+the prior operation's outcome, not from an undifferentiated uniqueness
+violation. `succeeded` MUST return the recorded result without creating another
+effect only when the message kind, sender, and reply correlation match the
+recorded request; a mismatch MUST refuse replay. `failed` MAY create a fresh
+operation under the same caller key because
+terminal failure proves no effect landed; the failed operation and its evidence
+MUST remain intact. `pending`, `accepted`, `superseded`, and `unknown` MUST
+refuse a fresh operation. Every refusal MUST name the prior outcome so the caller
+can reconcile it.
+
+Non-prompt operations retain their key for every outcome. Operation-specific
+replay MAY return a recorded result, but reuse MUST NOT mint a second logical
+identity or repeat another non-prompt effect. When reuse is refused, the error
+MUST name the prior operation and outcome.
+
 ### Message
 
 A `Message` MUST contain:
@@ -1001,7 +1017,7 @@ The durable store MUST provide:
 
 - atomic commits across records that establish one invariant;
 - crash-safe intent recording before external side effects;
-- unique constraints for immutable IDs and idempotency keys;
+- unique constraints for immutable IDs and non-failed uses of idempotency keys;
 - append-preserving evidence for attempts and outcomes;
 - schema versioning and explicit migrations;
 - consistent reads during recovery;

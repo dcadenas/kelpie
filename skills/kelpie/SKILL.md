@@ -76,6 +76,12 @@ Choose the verb by whether you need a durable answer the other side can see.
   answer.
 - Need to know they finished or heard you? `ask`. Text they type only in their
   TUI never arrives here.
+- Keep one idempotency key for one intended prompt. Repeating it after success
+  returns the recorded receipt only for the same sender and reply correlation;
+  repeating it after a proven terminal failure starts a fresh attempt. Pending,
+  accepted, superseded, and unknown outcomes are refused with the prior outcome
+  named. Never vary the key to bypass that refusal, because the original effect
+  may already have landed.
 
 **Never wait for a reply.** Send, read the delivery outcome, and end your turn.
 The reply is pushed to you: when they answer, Kelpie delivers
