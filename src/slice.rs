@@ -667,32 +667,50 @@ impl Kelpie {
                 let error = self
                     .apply_rename_write_error(&work, source)
                     .expect_err("name projection repair error must fail");
-                self.store.create_operator_notice(&format!(
-                    "name projection repair for incarnation {} could not be applied: {error}",
-                    work.incarnation_id
-                ))?;
-                return self.recover_with_snapshot(&snapshot);
+                return self.recover_after_projection_failure(
+                    &snapshot,
+                    names_reprojected,
+                    work.incarnation_id,
+                    &format!("could not be applied: {error}"),
+                );
             }
             crate::test_fault::pause("name_projection_after_response_before_commit");
             let confirmed = match self.blocking_snapshot() {
                 Ok(confirmed) => confirmed,
                 Err(error) => {
-                    self.store.create_operator_notice(&format!(
-                        "name projection repair for incarnation {} could not be confirmed: {error}",
-                        work.incarnation_id
-                    ))?;
-                    return self.recover_with_snapshot(&snapshot);
+                    return self.recover_after_projection_failure(
+                        &snapshot,
+                        names_reprojected,
+                        work.incarnation_id,
+                        &format!("could not be confirmed: {error}"),
+                    );
                 }
             };
             if let Err(error) = self.commit_rename_confirm(&work, &confirmed) {
-                self.store.create_operator_notice(&format!(
-                    "name projection repair for incarnation {} could not be confirmed: {error}",
-                    work.incarnation_id
-                ))?;
-                return self.recover_with_snapshot(&confirmed);
+                return self.recover_after_projection_failure(
+                    &confirmed,
+                    names_reprojected,
+                    work.incarnation_id,
+                    &format!("could not be confirmed: {error}"),
+                );
             }
             names_reprojected += 1;
         }
+    }
+
+    fn recover_after_projection_failure(
+        &mut self,
+        snapshot: &crate::herdr::Snapshot,
+        names_reprojected: usize,
+        incarnation_id: IncarnationId,
+        reason: &str,
+    ) -> Result<RecoveryReport, SliceError> {
+        self.store.create_operator_notice(&format!(
+            "name projection repair for incarnation {incarnation_id} {reason}"
+        ))?;
+        let mut report = self.recover_with_snapshot(snapshot)?;
+        report.names_reprojected = names_reprojected;
+        Ok(report)
     }
 
     /// Reconcile durable state against an already-fetched snapshot.
@@ -6250,6 +6268,39 @@ mod tests {
                 .any(|notice| notice.body.contains("could not be applied"))
         );
         server.join().expect("server");
+    }
+
+    #[test]
+    fn degraded_recovery_reports_repairs_completed_before_the_failure() {
+        let mut store = Store::in_memory().expect("store");
+        let prior = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("partial-repair"),
+                &foobar_pane_evidence(),
+            )
+            .expect("prior");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+        let report = kelpie
+            .recover_after_projection_failure(
+                &crate::herdr::Snapshot {
+                    protocol: 20,
+                    panes: vec![],
+                    agents: vec![crate::herdr::AgentObservation {
+                        terminal_id: "term-2".into(),
+                        pane_id: "w1:p2".into(),
+                        name: Some("foobar".into()),
+                        agent: Some("opencode".into()),
+                        interactive_ready: false,
+                        launch_pending: false,
+                        agent_session: None,
+                    }],
+                },
+                3,
+                prior.incarnation_id,
+                "could not be applied: refused",
+            )
+            .expect("degraded recovery");
+        assert_eq!(report.names_reprojected, 3);
     }
 
     fn unnamed_foobar_snapshot() -> Value {

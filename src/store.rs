@@ -922,20 +922,28 @@ impl Store {
                 && continued.as_deref() != Some(obligation.responder_agent_id.as_str())
         });
         if foreign_unresolved {
-            let seat_match = if let Some(id) = intent.logical_agent_id {
+            let preferred = intent.logical_agent_id.map(|id| id.to_string());
+            let mut seat_matches = Vec::new();
+            for claimant in &info.claimants {
                 let matches: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM incarnations
                          WHERE logical_agent_id = ?1 AND observed_pane_id = ?2
                            AND observed_terminal_id = ?3)",
-                    params![id.to_string(), evidence.pane_id, evidence.terminal_id],
+                    params![
+                        claimant.logical_agent_id,
+                        evidence.pane_id,
+                        evidence.terminal_id
+                    ],
                     |row| row.get(0),
                 )?;
-                matches.then_some(id)
-            } else {
-                None
-            };
+                if matches {
+                    seat_matches.push(claimant.logical_agent_id.clone());
+                }
+            }
+            seat_matches.sort_by_key(|id| (preferred.as_deref() != Some(id.as_str()), id.clone()));
             return Err(StoreError::Conflict(Self::name_conflict_message(
-                &info, seat_match,
+                &info,
+                &seat_matches,
             )));
         }
         let logical_agent_id = if let Some(existing) = intent.logical_agent_id {
@@ -3204,12 +3212,13 @@ impl Store {
     /// different name. The refusal names the prior agent id, the unresolved
     /// count, and both remedies; the asks themselves are here so the operator
     /// does not re-derive the diagnosis by hand.
-    fn name_conflict_message(info: &NameInfo, seat_match: Option<LogicalAgentId>) -> String {
-        let prior = seat_match
+    fn name_conflict_message(info: &NameInfo, seat_matches: &[String]) -> String {
+        let prior = seat_matches
+            .first()
             .and_then(|id| {
                 info.claimants
                     .iter()
-                    .find(|claimant| claimant.logical_agent_id == id.to_string())
+                    .find(|claimant| claimant.logical_agent_id == *id)
             })
             .or_else(|| {
                 info.claimants.iter().max_by_key(|claimant| {
@@ -3263,11 +3272,16 @@ impl Store {
             .expect("a refusal is only composed when an obligation exists");
         let _ = write!(
             text,
-            "\nremedies (recorded seat match first):\n  - continue logical agent {}{}: \
+            "\nremedies{}:\n  - continue logical agent {}{}: \
              kelpie adopt --pane <pane> \
              --terminal <terminal> --logical-id {}",
+            if seat_matches.is_empty() {
+                ""
+            } else {
+                " (recorded seat matches first)"
+            },
             prior.logical_agent_id,
-            if seat_match.is_some() {
+            if seat_matches.contains(&prior.logical_agent_id) {
                 " (matches this pane and terminal)"
             } else {
                 ""
@@ -3278,9 +3292,14 @@ impl Store {
             if claimant.logical_agent_id != prior.logical_agent_id {
                 let _ = write!(
                     text,
-                    "\n  - other claimant {} (no recorded match for this pane and terminal): \
+                    "\n  - other claimant {} ({}): \
                      inspect before using adopt --logical-id",
-                    claimant.logical_agent_id
+                    claimant.logical_agent_id,
+                    if seat_matches.contains(&claimant.logical_agent_id) {
+                        "also matches this pane and terminal"
+                    } else {
+                        "no recorded match for this pane and terminal"
+                    }
                 );
             }
         }
@@ -12944,7 +12963,7 @@ mod tests {
                 last_activity_at_ms: 2,
             }],
         };
-        let message = Store::name_conflict_message(&info, None);
+        let message = Store::name_conflict_message(&info, &[]);
         assert!(message.contains("1 unresolved obligation(s)"), "{message}");
         assert!(
             message.contains("ask 01a008ed-ask (in_progress)"),
