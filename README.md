@@ -39,10 +39,12 @@ to do other work or sit idle.
 An ask is always delivered now — nobody is ever owed work they cannot see. A
 tell can be scheduled once with `--due-in`, or repeatedly on the wall clock with
 `--every`. A repeating tell follows the logical agent across runtime changes but
-never starts or revives one. A reminder nudges a reviewer who went idle
-without replying. A cancelled ask records who cancelled and why, instead of
-lingering forever. A delivery that crosses an uncertain write boundary is
-recorded `unknown` and never resent blindly.
+never starts or revives one. Missed intervals coalesce instead of bursting, an
+in-flight firing is not doubled, and `kelpie schedules` lists the handles. A
+reminder nudges a reviewer who went idle without replying. A cancelled ask
+records who cancelled and why, instead of lingering forever. A delivery that
+crosses an uncertain write boundary is recorded `unknown` and never resent
+blindly.
 
 ## Install
 
@@ -56,10 +58,12 @@ herdr`, `mise use -g herdr`, and a curl installer. Kelpie speaks Herdr protocol
 `~/.config/herdr/herdr.sock`, which is where Kelpie looks by default.
 
 **2. Install Kelpie.** The crate is published as `kelpie-herdr`; the plain
-`kelpie` name on crates.io belongs to an unrelated project.
+`kelpie` name on crates.io belongs to an unrelated project. Releases are
+pre-release while Kelpie is alpha, so the version requirement is required —
+`cargo install` otherwise skips them.
 
 ```sh
-cargo install kelpie-herdr
+cargo install kelpie-herdr --version '^0.2.0-alpha.1'
 # or, from a checkout:
 cargo install --path .
 ```
