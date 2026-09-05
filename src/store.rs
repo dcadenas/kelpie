@@ -460,6 +460,22 @@ pub struct ScheduleFiring {
     pub message_id: Option<MessageId>,
 }
 
+/// One repeating schedule visible to its requester or target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleInfo {
+    pub id: ScheduleId,
+    pub kind: String,
+    pub logical_agent_id: LogicalAgentId,
+    pub incarnation_id: Option<IncarnationId>,
+    pub interval_ms: i64,
+    pub clock: String,
+    pub next_fire_at_ms: i64,
+    pub cycle: i64,
+    pub state: String,
+    pub last_outcome: Option<ScheduleFiringOutcome>,
+    pub last_message_id: Option<MessageId>,
+}
+
 /// One overdue reminder whose owing agent has one exact Ready incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueReminder {
@@ -3065,7 +3081,46 @@ impl Store {
              WHERE id = ?2 AND cycle = ?3 AND state = 'active'",
             params![next, item.schedule_id.to_string(), item.cycle],
         )?;
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM schedule_firings f
+                JOIN deliveries d ON d.message_id = f.message_id
+                WHERE f.schedule_id = ?1
+                  AND d.outcome IN ('pending','queued','submitted','unknown')
+             )",
+            [item.schedule_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            tx.execute(
+                "INSERT INTO schedule_firings
+                 (schedule_id, cycle, due_at_ms, fired_at_ms, outcome, detail)
+                 VALUES (?1, ?2, ?3, ?4, 'skipped', ?5)",
+                params![
+                    item.schedule_id.to_string(),
+                    item.cycle,
+                    item.due_at_ms,
+                    now_ms,
+                    "prior schedule delivery is unresolved"
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(ScheduleFiring {
+                schedule_id: item.schedule_id,
+                cycle: item.cycle,
+                outcome: ScheduleFiringOutcome::Skipped,
+                message_id: None,
+            });
+        }
         if !socket && !herdr {
+            let previous_outcome: Option<String> = tx
+                .query_row(
+                    "SELECT outcome FROM schedule_firings
+                     WHERE schedule_id = ?1 ORDER BY cycle DESC LIMIT 1",
+                    [item.schedule_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
             tx.execute(
                 "INSERT INTO schedule_firings
                  (schedule_id, cycle, due_at_ms, fired_at_ms, outcome, detail)
@@ -3078,18 +3133,20 @@ impl Store {
                     "target has no unique addressable receive path"
                 ],
             )?;
-            let notice_id = OperatorNoticeId::new();
-            tx.execute(
-                "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
-                params![
-                    notice_id.to_string(),
-                    format!(
-                        "schedule {} cycle {} target {} unavailable; no message delivered",
-                        item.schedule_id, item.cycle, item.recipient
-                    ),
-                    now_ms
-                ],
-            )?;
+            if previous_outcome.as_deref() != Some("target_unavailable") {
+                let notice_id = OperatorNoticeId::new();
+                tx.execute(
+                    "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
+                    params![
+                        notice_id.to_string(),
+                        format!(
+                            "schedule {} cycle {} target {} unavailable; no message delivered",
+                            item.schedule_id, item.cycle, item.recipient
+                        ),
+                        now_ms
+                    ],
+                )?;
+            }
             tx.commit()?;
             return Ok(ScheduleFiring {
                 schedule_id: item.schedule_id,
@@ -3210,6 +3267,64 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(StoreError::Sql)
+    }
+
+    /// List schedules owned by or targeting one logical agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durable identifiers or outcomes are malformed.
+    pub fn schedules_for_agent(
+        &self,
+        agent_id: LogicalAgentId,
+    ) -> Result<Vec<ScheduleInfo>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.kind, s.logical_agent_id, s.incarnation_id,
+                    s.interval_ms, s.clock, s.next_fire_at_ms, s.cycle, s.state,
+                    (SELECT f.outcome FROM schedule_firings f
+                     WHERE f.schedule_id = s.id ORDER BY f.cycle DESC LIMIT 1),
+                    (SELECT f.message_id FROM schedule_firings f
+                     WHERE f.schedule_id = s.id ORDER BY f.cycle DESC LIMIT 1)
+             FROM schedules s
+             WHERE s.requester_agent_id = ?1 OR s.logical_agent_id = ?1
+             ORDER BY s.created_at_ms, s.id",
+        )?;
+        let rows = statement.query_map([agent_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let row = row?;
+            Ok(ScheduleInfo {
+                id: parse_schedule_id(&row.0)?,
+                kind: row.1,
+                logical_agent_id: parse_logical_agent_id(&row.2)?,
+                incarnation_id: row.3.as_deref().map(parse_incarnation_id).transpose()?,
+                interval_ms: row.4,
+                clock: row.5,
+                next_fire_at_ms: row.6,
+                cycle: row.7,
+                state: row.8,
+                last_outcome: row
+                    .9
+                    .as_deref()
+                    .map(parse_schedule_firing_outcome)
+                    .transpose()?,
+                last_message_id: row.10.as_deref().map(parse_message_id).transpose()?,
+            })
+        })
+        .collect()
     }
 
     /// Persist a correlated progress or final reply and its delivery intent.
@@ -6244,9 +6359,10 @@ impl Store {
                     (SELECT o.last_activity_at_ms FROM obligations o
                      WHERE o.ask_message_id = r.ask_message_id
                        AND o.state = 'resolved'),
-                    r.active_remaining_ms
+                    COALESCE(s.active_remaining_ms, r.active_remaining_ms)
              FROM renews r
              JOIN incarnations i ON i.id = r.incarnation_id
+             LEFT JOIN schedules s ON s.id = r.schedule_id
              WHERE i.state = 'ready'
                AND NOT EXISTS (SELECT 1 FROM operations clear
                                WHERE clear.kind = 'clear'
@@ -6254,8 +6370,8 @@ impl Store {
                                  AND clear.outcome IN ('pending','accepted'))
                AND ((r.phase = 'scheduled'
                      AND ((r.every_ms IS NULL AND r.scheduled_at_ms <= ?1)
-                          OR (r.every_ms IS NOT NULL
-                              AND COALESCE(r.active_remaining_ms, 0) <= 0)))
+                           OR (r.every_ms IS NOT NULL AND s.state = 'active'
+                               AND COALESCE(s.active_remaining_ms, 0) <= 0)))
                     OR r.phase IN ('preparing','ready','clearing','injected','timed_out'))
              ORDER BY r.created_at_ms",
         )?;
@@ -6335,13 +6451,15 @@ impl Store {
     pub fn scheduled_interval_renews(&self) -> Result<Vec<IntervalRenewClock>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT r.id, i.observed_pane_id, i.observed_terminal_id,
-                    r.active_remaining_ms, r.occupancy_sampled_at_ms
+                    s.active_remaining_ms, s.occupancy_sampled_at_ms
              FROM renews r
              JOIN incarnations i ON i.id = r.incarnation_id
+             JOIN schedules s ON s.id = r.schedule_id
              WHERE i.state = 'ready'
-               AND r.phase = 'scheduled'
-               AND r.every_ms IS NOT NULL
-               AND COALESCE(r.active_remaining_ms, 0) > 0
+                AND r.phase = 'scheduled'
+                AND r.every_ms IS NOT NULL
+                AND s.state = 'active'
+                AND COALESCE(s.active_remaining_ms, 0) > 0
              ORDER BY r.created_at_ms",
         )?;
         let rows = statement.query_map([], |row| {
@@ -6386,20 +6504,21 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         let changed = tx.execute(
-            "UPDATE renews
+            "UPDATE schedules
              SET active_remaining_ms = MAX(0, active_remaining_ms - CASE
                     WHEN ?2 AND occupancy_sampled_at_ms IS NOT NULL
                     THEN MIN(MAX(0, ?1 - occupancy_sampled_at_ms), ?4)
                     ELSE 0
                  END),
                  occupancy_sampled_at_ms = ?1,
-                 scheduled_at_ms = ?1 + MAX(0, active_remaining_ms - CASE
+                 next_fire_at_ms = ?1 + MAX(0, active_remaining_ms - CASE
                     WHEN ?2 AND occupancy_sampled_at_ms IS NOT NULL
                     THEN MIN(MAX(0, ?1 - occupancy_sampled_at_ms), ?4)
                     ELSE 0
                  END)
-             WHERE id = ?3 AND phase = 'scheduled' AND every_ms IS NOT NULL
-               AND active_remaining_ms IS NOT NULL",
+             WHERE id = (SELECT schedule_id FROM renews WHERE id = ?3 AND phase = 'scheduled')
+               AND kind = 'renew' AND state = 'active'
+                AND active_remaining_ms IS NOT NULL",
             params![
                 now_ms,
                 accumulating,
@@ -6413,12 +6532,13 @@ impl Store {
             ));
         }
         tx.execute(
-            "UPDATE schedules
-             SET active_remaining_ms = (SELECT active_remaining_ms FROM renews WHERE id = ?1),
+            "UPDATE renews
+             SET active_remaining_ms = (SELECT active_remaining_ms FROM schedules
+                                         WHERE id = renews.schedule_id),
                  occupancy_sampled_at_ms = ?2,
-                 next_fire_at_ms = (SELECT scheduled_at_ms FROM renews WHERE id = ?1)
-             WHERE id = (SELECT schedule_id FROM renews WHERE id = ?1)
-               AND state = 'active'",
+                 scheduled_at_ms = (SELECT next_fire_at_ms FROM schedules
+                                    WHERE id = renews.schedule_id)
+             WHERE id = ?1 AND phase = 'scheduled' AND every_ms IS NOT NULL",
             params![renew_id.to_string(), now_ms],
         )?;
         tx.commit()?;
@@ -7030,7 +7150,15 @@ impl Store {
     /// Returns an error if the lookup fails.
     pub fn next_renew_due_at_ms(&self) -> Result<Option<i64>, StoreError> {
         let next: Option<i64> = self.connection.query_row(
-            "SELECT MIN(scheduled_at_ms) FROM renews WHERE phase = 'scheduled'",
+            "SELECT MIN(due_at_ms) FROM (
+                 SELECT scheduled_at_ms AS due_at_ms FROM renews
+                  WHERE phase = 'scheduled' AND every_ms IS NULL
+                 UNION ALL
+                 SELECT s.next_fire_at_ms FROM schedules s
+                 JOIN renews r ON r.schedule_id = s.id AND r.cycle = s.cycle
+                  WHERE s.kind = 'renew' AND s.state = 'active'
+                    AND r.phase = 'scheduled'
+             )",
             [],
             |row| row.get(0),
         )?;
@@ -8369,16 +8497,32 @@ fn arm_next_renew_cycle(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((Some(every_ms), cycle, Some(schedule_id))) = policy else {
+    let Some((every_ms, cycle, schedule_id)) = policy else {
         return Ok(None);
     };
-    let active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM schedules WHERE id = ?1 AND state = 'active')",
-        [&schedule_id],
-        |row| row.get(0),
-    )?;
-    if !active {
+    let Some(every_ms) = every_ms else {
         return Ok(None);
+    };
+    let schedule_id = schedule_id.ok_or_else(|| {
+        StoreError::InvalidRecord(format!("recurring renew {renew_id} has no shared schedule"))
+    })?;
+    let schedule: Option<(i64, i64, String)> = tx
+        .query_row(
+            "SELECT interval_ms, cycle, state FROM schedules
+             WHERE id = ?1 AND kind = 'renew'",
+            [&schedule_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((interval_ms, schedule_cycle, state)) = schedule else {
+        return Err(StoreError::InvalidRecord(format!(
+            "recurring renew {renew_id} references absent shared schedule {schedule_id}"
+        )));
+    };
+    if state != "active" || interval_ms != every_ms || schedule_cycle != cycle {
+        return Err(StoreError::InvalidRecord(format!(
+            "recurring renew {renew_id} disagrees with shared schedule {schedule_id}"
+        )));
     }
     let next_id = RenewId::new();
     tx.execute(
@@ -8401,8 +8545,8 @@ fn arm_next_renew_cycle(
          WHERE id = ?5 AND state = 'active'",
         params![
             cycle + 1,
-            now.saturating_add(every_ms),
-            every_ms,
+            now.saturating_add(interval_ms),
+            interval_ms,
             now,
             schedule_id
         ],
@@ -8422,7 +8566,7 @@ fn arm_next_renew_cycle(
             cycle + 1,
             now.saturating_add(every_ms),
             now,
-            every_ms,
+            interval_ms,
             renew_id.to_string()
         ],
     )?;
@@ -8498,6 +8642,17 @@ fn parse_renew_id(value: &str) -> Result<RenewId, StoreError> {
 fn parse_schedule_id(value: &str) -> Result<ScheduleId, StoreError> {
     ScheduleId::parse(value)
         .ok_or_else(|| StoreError::InvalidRecord(format!("invalid schedule id {value}")))
+}
+
+fn parse_schedule_firing_outcome(value: &str) -> Result<ScheduleFiringOutcome, StoreError> {
+    match value {
+        "materialized" => Ok(ScheduleFiringOutcome::Materialized),
+        "target_unavailable" => Ok(ScheduleFiringOutcome::TargetUnavailable),
+        "skipped" => Ok(ScheduleFiringOutcome::Skipped),
+        other => Err(StoreError::InvalidRecord(format!(
+            "unknown schedule firing outcome {other}"
+        ))),
+    }
 }
 
 /// Build the armed-renew view of one report row.
@@ -10533,6 +10688,7 @@ mod tests {
         let agent_id = LogicalAgentId::new();
         let incarnation_id = IncarnationId::new();
         let prompt_id = OperationId::new();
+        let renew_id = RenewId::new();
         {
             let connection = Connection::open(&path).expect("db");
             for migration in [
@@ -10599,9 +10755,25 @@ mod tests {
                     [prompt_id.to_string()],
                 )
                 .expect("attempt");
+            connection
+                .execute(
+                    "INSERT INTO renews
+                     (id, logical_agent_id, incarnation_id, requester_agent_id,
+                      prepare_prompt, resume_prompt, on_timeout, prepare_timeout_ms,
+                      every_ms, cycle, scheduled_at_ms, phase, created_at_ms,
+                      active_remaining_ms, occupancy_sampled_at_ms)
+                     VALUES (?1, ?2, ?3, ?2, 'save', 'resume', 'abort', 60000,
+                             2700000, 4, 2700100, 'scheduled', 100, 2700000, 100)",
+                    params![
+                        renew_id.to_string(),
+                        agent_id.to_string(),
+                        incarnation_id.to_string()
+                    ],
+                )
+                .expect("legacy recurring renew");
         }
 
-        let store = Store::open(&path).expect("open migrates to v26");
+        let mut store = Store::open(&path).expect("open migrates to current");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -10614,6 +10786,45 @@ mod tests {
             })
             .expect("foreign key check");
         assert_eq!(foreign_key_errors, 0);
+        let backfilled: (String, String, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT r.schedule_id, s.kind, s.cycle, s.active_remaining_ms
+                 FROM renews r JOIN schedules s ON s.id = r.schedule_id
+                 WHERE r.id = ?1",
+                [renew_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("recurring renew schedule backfilled");
+        assert_eq!(backfilled.0, renew_id.to_string());
+        assert_eq!(backfilled.1, "renew");
+        assert_eq!(backfilled.2, 4);
+        assert_eq!(backfilled.3, 2_700_000);
+        let marker = store
+            .create_tell(
+                agent_id,
+                agent_id,
+                incarnation_id,
+                "migration marker",
+                "migration-marker",
+            )
+            .expect("marker message");
+        store
+            .connection
+            .execute(
+                "UPDATE renews SET phase = 'injected', ask_message_id = ?1,
+                        pre_clear_session_json = '{}'
+                 WHERE id = ?2",
+                params![marker.message_id.to_string(), renew_id.to_string()],
+            )
+            .expect("finish migrated cycle");
+        assert!(
+            store
+                .complete_renew(renew_id)
+                .expect("complete migrated policy")
+                .is_some(),
+            "the backfilled shared schedule re-arms the migrated policy"
+        );
         store
             .connection
             .execute(
@@ -11172,6 +11383,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn repeating_tell_materializes_against_the_current_incarnation() {
         let mut store = Store::in_memory().expect("store");
         let first = store
@@ -11211,6 +11423,36 @@ mod tests {
             )
             .expect("first target");
         assert_eq!(first_target, first.incarnation_id.to_string());
+        let first_operation: String = store
+            .connection
+            .query_row(
+                "SELECT d.operation_id FROM deliveries d
+                 JOIN schedule_firings f ON f.message_id = d.message_id
+                 WHERE f.schedule_id = ?1 AND f.cycle = 1",
+                [schedule.schedule_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("first operation");
+        let first_operation = parse_operation_id(&first_operation).expect("operation id");
+        store
+            .begin_attempt(
+                first_operation,
+                first.incarnation_id,
+                "schedule-first-request",
+            )
+            .expect("attempt");
+        store
+            .submit_queued_delivery(first_operation, 1, "schedule-first-request", now)
+            .expect("submit queued");
+        store
+            .accept_delivery(first_operation, first.incarnation_id, "w1:p1", "term-a")
+            .expect("accepted");
+        assert_eq!(
+            store
+                .delivery_outcome(first_operation)
+                .expect("first delivery"),
+            DeliveryOutcome::Accepted
+        );
 
         let mut successor = intent("worker", "term-b", "schedule-second");
         successor.logical_agent_id = Some(first.logical_agent_id);
@@ -11251,9 +11493,10 @@ mod tests {
             )
             .expect("make due");
         let due = store.due_tell_schedules(now).expect("due again");
-        store
+        let second_firing = store
             .fire_tell_schedule(&due[0], now)
             .expect("second firing");
+        assert_eq!(second_firing.outcome, ScheduleFiringOutcome::Materialized);
         let second_target: String = store
             .connection
             .query_row(
@@ -11265,6 +11508,27 @@ mod tests {
             )
             .expect("second target");
         assert_eq!(second_target, second.incarnation_id.to_string());
+        let messages_before_skip: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("message count");
+        store
+            .connection
+            .execute(
+                "UPDATE schedules SET next_fire_at_ms = ?1 WHERE id = ?2",
+                params![now, schedule.schedule_id.to_string()],
+            )
+            .expect("make third due");
+        let third = store
+            .fire_tell_schedule(&store.due_tell_schedules(now).expect("third due")[0], now)
+            .expect("third firing");
+        assert_eq!(third.outcome, ScheduleFiringOutcome::Skipped);
+        assert_eq!(third.message_id, None);
+        let messages_after_skip: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("message count");
+        assert_eq!(messages_after_skip, messages_before_skip);
     }
 
     #[test]
@@ -11299,6 +11563,32 @@ mod tests {
             .expect("firing");
         assert_eq!(firing.outcome, ScheduleFiringOutcome::TargetUnavailable);
         assert_eq!(firing.message_id, None);
+        let listed = store
+            .schedules_for_agent(target.logical_agent_id)
+            .expect("list schedule");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, schedule.schedule_id);
+        assert_eq!(
+            listed[0].last_outcome,
+            Some(ScheduleFiringOutcome::TargetUnavailable)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE schedules SET next_fire_at_ms = ?1 WHERE id = ?2",
+                params![now, schedule.schedule_id.to_string()],
+            )
+            .expect("make unavailable again");
+        store
+            .fire_tell_schedule(&store.due_tell_schedules(now).expect("due again")[0], now)
+            .expect("second unavailable firing");
+        let notices: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM operator_notices", [], |row| {
+                row.get(0)
+            })
+            .expect("notice count");
+        assert_eq!(notices, 1, "one notice per consecutive unavailable run");
         let after: (i64, i64, i64) = store
             .connection
             .query_row(
@@ -11313,6 +11603,13 @@ mod tests {
         store
             .cancel_schedule(schedule.schedule_id, target.logical_agent_id, "done")
             .expect("cancel");
+        assert_eq!(
+            store
+                .schedules_for_agent(target.logical_agent_id)
+                .expect("list ended")[0]
+                .state,
+            "cancelled"
+        );
         assert!(
             store
                 .due_tell_schedules(i64::MAX)

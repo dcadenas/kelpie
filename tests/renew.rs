@@ -816,6 +816,16 @@ fn a_policy_rearms_with_the_next_cycle_and_a_one_shot_does_not() {
         "the resumed agent is told which cycle it is"
     );
     assert_eq!(armed.every_ms, Some(45 * 60 * 1_000));
+    let schedules = store
+        .schedules_for_agent(worker.logical_agent_id)
+        .expect("shared schedule");
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(schedules[0].kind, "renew");
+    assert_eq!(schedules[0].cycle, 2);
+    assert_eq!(
+        schedules[0].last_outcome,
+        Some(kelpie::domain::ScheduleFiringOutcome::Materialized)
+    );
 }
 
 #[test]

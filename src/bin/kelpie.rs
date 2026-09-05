@@ -447,6 +447,10 @@ fn build_typed(
                 }),
             ))
         }
+        Command::Schedules { target } => {
+            let agent = resolve_caller(socket, target, request_id)?.0;
+            Ok(("schedule.list".into(), json!({"agent_id": agent})))
+        }
         Command::ReminderSnooze {
             ask_id,
             until_ms,

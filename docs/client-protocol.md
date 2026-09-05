@@ -26,7 +26,7 @@ The local protocol is one newline-delimited JSON request per connection. Each
 request contains `id`, `method`, and `params`; each response echoes `id` and
 contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
-`reply`, `clear`, `renew`, `renew.cancel`, `schedule.cancel`, `pending`, `cancel`, `retire`,
+`reply`, `clear`, `renew`, `renew.cancel`, `schedule.cancel`, `schedule.list`, `pending`, `cancel`, `retire`,
 `waiter.register`, `waiter.retire`, `inbox.claim`, `inbox.ack`,
 `notice.create`, `notice.list`, `who`, `name.info`, `ask.info`, `attribution`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
@@ -219,10 +219,16 @@ without an incarnation. Every firing then resolves that identity's
 current unique Herdr incarnation or active socket inbox. This is why a schedule
 survives handoff and adoption. An unavailable firing records
 `target_unavailable`, creates no message, operation, delivery, or runtime, and
-raises an operator notice. Missed intervals are coalesced into one firing and
-the next due time is measured from that firing. `schedule.cancel` takes the
+raises one operator notice for a consecutive unavailable run, not one notice per
+interval. Missed intervals are coalesced into one firing and
+the next due time is measured from that firing. A due firing is recorded as
+`skipped` when an earlier firing still has an unresolved delivery, preventing a
+restart burst. `schedule.cancel` takes the
 schedule id, requester agent id, and a non-empty reason; only the schedule's
 requester or target may cancel it.
+`schedule.list` takes an `agent_id` and returns every schedule requested by or
+targeting that logical agent, including ended schedules and the latest firing
+outcome. This makes the cancellation handle recoverable after a lost receipt.
 
 Every ask creates a correlated pending-reply reminder with a five-minute
 default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
