@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::domain::{
     AdoptIntent, IncarnationId, LogicalAgentId, MessageId, MessageKind, OperationId, Parent,
-    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, StartIntent,
+    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, ScheduleId, StartIntent,
 };
 use crate::herdr::HerdrError;
 use crate::herdr_exec::{FailPhase, HerdrEvent, HerdrExec, HerdrJob, HerdrJobResult, LeaseCmd};
@@ -496,11 +496,19 @@ impl Daemon {
     /// # Errors
     ///
     /// Returns for socket, request decoding, or response encoding failures.
+    #[allow(clippy::too_many_lines)]
     pub fn poll(&mut self) -> Result<bool, DaemonError> {
         let pass_started = PollTimer::start();
         let mut phase = PollTimer::start();
         self.drain_herdr_events();
         log_slow_phase("herdr_events", &mut phase);
+        if let Err(error) = self.kelpie.fire_due_schedules() {
+            let _ = self
+                .kelpie
+                .store_mut()
+                .create_operator_notice(&format!("schedule fire failed: {error}"));
+        }
+        log_slow_phase("due_schedules", &mut phase);
         match self.kelpie.begin_due_deliveries() {
             Ok(prepared) => {
                 for prompt in prepared {
@@ -4860,6 +4868,13 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
                         serde_json::json!({"renew_id": params.renew_id, "notice_id": notice_id})
                     })
             }),
+        "schedule.cancel" => serde_json::from_value::<ScheduleCancelParams>(request.params)
+            .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))
+            .and_then(|params| {
+                kelpie
+                    .cancel_schedule(params.schedule_id, params.requester_agent_id, &params.reason)
+                    .map(|()| serde_json::json!({"schedule_id": params.schedule_id, "state": "cancelled"}))
+            }),
         "reply" => dispatch_reply(request.params, kelpie),
         "pending" => dispatch_pending(request.params, kelpie),
         "name.info" => dispatch_name_info(request.params, kelpie),
@@ -5903,6 +5918,40 @@ fn prepare_client_prompt(
     } else if request.method == "tell" {
         let params = serde_json::from_value::<TellParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+        if let Some(every_ms) = params.every_ms {
+            if params.due_at_ms.is_some() {
+                return Err(SliceError::Store(StoreError::InvalidRecord(
+                    "tell accepts either a one-shot due_at_ms or every_ms, not both".into(),
+                )));
+            }
+            if let Some(created) = kelpie.store().tell_schedule_by_idempotency_key(
+                &params.idempotency_key,
+                params.sender,
+                every_ms,
+                &params.body,
+            )? {
+                return Ok((schedule_result(&created), None, None));
+            }
+            let recipient = resolve_schedule_recipient(
+                kelpie,
+                params.recipient,
+                params.recipient_incarnation,
+                params.recipient_alias.as_deref(),
+                &format!("{}:lazy-adopt:recipient", params.idempotency_key),
+            )?;
+            let first_fire_at_ms = crate::store::store_clock_ms()
+                .map_err(SliceError::Store)?
+                .saturating_add(every_ms);
+            let created = kelpie.schedule_tell(
+                params.sender,
+                recipient,
+                &params.body,
+                every_ms,
+                first_fire_at_ms,
+                &params.idempotency_key,
+            )?;
+            return Ok((schedule_result(&created), None, None));
+        }
         if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
             &params.idempotency_key,
             MessageKind::Tell,
@@ -6078,6 +6127,40 @@ fn ask_reminder_interval(params: &AskParams) -> Result<Option<i64>, SliceError> 
 fn dispatch_tell(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<TellParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if let Some(every_ms) = params.every_ms {
+        if params.due_at_ms.is_some() {
+            return Err(SliceError::Store(StoreError::InvalidRecord(
+                "tell accepts either a one-shot due_at_ms or every_ms, not both".into(),
+            )));
+        }
+        if let Some(created) = kelpie.store().tell_schedule_by_idempotency_key(
+            &params.idempotency_key,
+            params.sender,
+            every_ms,
+            &params.body,
+        )? {
+            return Ok(schedule_result(&created));
+        }
+        let recipient = resolve_schedule_recipient(
+            kelpie,
+            params.recipient,
+            params.recipient_incarnation,
+            params.recipient_alias.as_deref(),
+            &format!("{}:lazy-adopt:recipient", params.idempotency_key),
+        )?;
+        let first_fire_at_ms = crate::store::store_clock_ms()
+            .map_err(SliceError::Store)?
+            .saturating_add(every_ms);
+        let created = kelpie.schedule_tell(
+            params.sender,
+            recipient,
+            &params.body,
+            every_ms,
+            first_fire_at_ms,
+            &params.idempotency_key,
+        )?;
+        return Ok(schedule_result(&created));
+    }
     let mut result = match resolve_tell_recipient(
         kelpie,
         params.recipient,
@@ -6133,6 +6216,16 @@ fn dispatch_tell(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError
         result["due_at_ms"] = serde_json::json!(due_at_ms);
     }
     Ok(result)
+}
+
+fn schedule_result(created: &crate::store::CreatedSchedule) -> Value {
+    serde_json::json!({
+        "schedule_id": created.schedule_id,
+        "recipient": created.recipient,
+        "every_ms": created.interval_ms,
+        "next_fire_at_ms": created.next_fire_at_ms,
+        "state": created.state
+    })
 }
 
 /// When a renew's first cycle comes due.
@@ -6318,6 +6411,38 @@ fn pending_alias_bind(request: &ClientRequest, kelpie: &Kelpie) -> Option<(Strin
 enum TellRecipient {
     Herdr(LogicalAgentId, IncarnationId),
     SocketInbox(LogicalAgentId),
+}
+
+fn resolve_schedule_recipient(
+    kelpie: &mut Kelpie,
+    recipient: Option<LogicalAgentId>,
+    recipient_incarnation: Option<IncarnationId>,
+    recipient_alias: Option<&str>,
+    lazy_adopt_key: &str,
+) -> Result<LogicalAgentId, SliceError> {
+    if let (Some(recipient), Some(incarnation), None) =
+        (recipient, recipient_incarnation, recipient_alias)
+    {
+        if kelpie.store().logical_agent_of(incarnation)? != recipient {
+            return Err(SliceError::Store(StoreError::Conflict(
+                "recipient incarnation does not belong to the schedule's logical agent".into(),
+            )));
+        }
+        return Ok(recipient);
+    }
+    if let (Some(recipient), None, None) = (recipient, recipient_incarnation, recipient_alias) {
+        return Ok(recipient);
+    }
+    resolve_tell_recipient(
+        kelpie,
+        recipient,
+        recipient_incarnation,
+        recipient_alias,
+        lazy_adopt_key,
+    )
+    .map(|target| match target {
+        TellRecipient::Herdr(agent, _) | TellRecipient::SocketInbox(agent) => agent,
+    })
 }
 
 fn resolve_tell_recipient(
@@ -6623,6 +6748,8 @@ struct TellParams {
     idempotency_key: String,
     #[serde(default)]
     due_at_ms: Option<i64>,
+    #[serde(default)]
+    every_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6661,6 +6788,13 @@ struct RenewParams {
 struct RenewCancelParams {
     renew_id: RenewId,
     /// The agent asking. Must be the policy's requester or its target.
+    requester_agent_id: LogicalAgentId,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCancelParams {
+    schedule_id: ScheduleId,
     requester_agent_id: LogicalAgentId,
     reason: String,
 }

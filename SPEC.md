@@ -70,11 +70,10 @@ Kelpie MUST NOT:
 - treat Herdr's event stream as a durable event ledger;
 - promise exactly-once terminal delivery;
 - add remote networking or peer discovery to the supported local architecture;
-- provide a dashboard, LLM router, general cron scheduler, automatic loop-stall
-  recovery, or backend-launch monolith. A renew policy is not a general
-  scheduler: it is bound to exactly one incarnation, it injects only that
-  incarnation's own maintenance prompts, and it MUST end when that incarnation
-  stops being Ready;
+- provide a dashboard, LLM router, workflow-driving cron system, automatic
+  loop-stall recovery, or backend-launch monolith. A repeating schedule only
+  delivers an opaque tell to one existing logical agent. It MUST NOT interpret
+  the body, choose a next action, or start, revive, or restart an agent;
 - place coordination records in a repository being worked on by an agent.
 
 ## Authority boundaries
@@ -405,13 +404,20 @@ the ephemeral notification MUST NOT remove or invalidate the durable record.
 
 ### ScheduledDelivery
 
-A future delivery MAY have a due time and cancellation state. Scheduling MUST be
-limited to delayed message delivery, reminders, and renew policies. It MUST NOT
-encode recurring workflow phases, application verdicts, or automatic next
-actions.
+A future delivery MAY have a due time and cancellation state. A repeating
+schedule MAY materialize an ordinary tell on an interval. Scheduling MUST be
+limited to delayed message delivery, repeating opaque tells, reminders, and
+renew policies. It MUST NOT encode workflow phases, application verdicts, or
+automatic next actions.
 
-A due time is one-shot, except a renew policy, which re-arms after each
-completed injection and MUST terminate when its incarnation is no longer Ready.
+A delivery due time is one-shot. A repeating tell schedule is bound to a logical
+agent, advances on the host wall clock, survives incarnation replacement, and is
+cancellable by its requester or target. Each firing MUST resolve the target's
+current unique receive path. When none exists, the firing MUST record and report
+`target_unavailable`, MUST create no message, delivery, operation, pane,
+worktree, or runtime, and MUST continue to its next interval. Missed intervals
+while kelpied is down are coalesced into one due firing; the next interval starts
+when that firing is recorded rather than producing a restart burst.
 Every ask creates a reply-reminder policy by default.
 The caller MAY explicitly disable reminders for one ask. The policy is armed
 only after the ask delivery is accepted. Reminder injection is `herdr_prompt`
@@ -580,7 +586,10 @@ incarnation MUST NOT be submitted. They MUST remain queued and become due after
 the resume prompt is delivered. A message delivered into a context that is about
 to be cleared MUST NOT be recorded as accepted.
 
-A renew policy re-arms after each completed injection. It MUST terminate when
+A renew policy uses the same durable recurrence and per-firing ledger as a
+repeating tell, with an active-occupancy clock instead of a wall clock. Its
+overlap guard MUST prevent a firing from starting another cycle while one is in
+flight. It re-arms after each completed injection and MUST terminate when
 its incarnation is no longer Ready, and MUST NOT terminate for any other reason:
 a cycle that is skipped, aborted, or abandoned unproven MUST arm the next one. A
 prepare timeout MUST be recorded as an operator notice and MUST NOT by itself

@@ -37,7 +37,9 @@ to do other work or sit idle.
 ```
 
 An ask is always delivered now — nobody is ever owed work they cannot see. A
-tell can be scheduled for later. A reminder nudges a reviewer who went idle
+tell can be scheduled once with `--due-in`, or repeatedly on the wall clock with
+`--every`. A repeating tell follows the logical agent across runtime changes but
+never starts or revives one. A reminder nudges a reviewer who went idle
 without replying. A cancelled ask records who cancelled and why, instead of
 lingering forever. A delivery that crosses an uncertain write boundary is
 recorded `unknown` and never resent blindly.

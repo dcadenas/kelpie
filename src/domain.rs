@@ -39,6 +39,7 @@ id_type!(OperationId);
 id_type!(MessageId);
 id_type!(OperatorNoticeId);
 id_type!(RenewId);
+id_type!(ScheduleId);
 
 impl IncarnationId {
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -74,6 +75,21 @@ impl RenewId {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         Uuid::parse_str(value).ok().map(Self)
     }
+}
+
+impl ScheduleId {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Uuid::parse_str(value).ok().map(Self)
+    }
+}
+
+/// Outcome of one repeating schedule firing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleFiringOutcome {
+    Materialized,
+    TargetUnavailable,
+    Skipped,
 }
 
 /// A logical agent's durable parent relationship.

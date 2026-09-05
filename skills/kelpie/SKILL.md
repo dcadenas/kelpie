@@ -29,7 +29,7 @@ Kelpie `reply` and that ask's durable `reply_to` ID.
 
 ## Identity model
 
-- `MessageId`, `LogicalAgentId`, `IncarnationId`, and delivery bindings are
+- `MessageId`, `ScheduleId`, `LogicalAgentId`, `IncarnationId`, and delivery bindings are
   immutable durable identities. Preserve every returned ID exactly.
 - Requested model, provider, and effort are launch configuration. Observed
   attribution is append-only and comes only from named session adapters.
@@ -124,6 +124,11 @@ indistinguishable from an ask they simply have not answered. To be nudged about
 an ask already in flight, use `--remind-after-ms`. To send something that should
 arrive later, use `tell`. On a `tell`, `delivery=queued` means Kelpie is holding
 the message, not that anyone received it; only `delivery=accepted` is dispatched.
+`tell --every 15m` instead creates a repeating wall-clock schedule. Its receipt
+names a schedule, not a delivered message. Each firing targets the logical
+agent's current receive path; an unavailable firing reports and delivers
+nothing, and Kelpie never starts or revives an agent for it. End it with
+`schedule-cancel <schedule-id> --reason TEXT`.
 
 For work that must pause until a known future time, compose the existing verbs:
 send `kelpie reply <ask-id> --progress` so the obligation visibly remains held,
@@ -311,6 +316,8 @@ EOF
 kelpie tell coordinator --due-in 10m --stdin <<'EOF'
 one-shot reminder; not cron
 EOF
+kelpie tell coordinator --every 15m --file supervision-pass.txt
+kelpie schedule-cancel <schedule-id> --reason supervision-moved
 kelpie ask kelpie-envelope-builder --file ./task.md
 kelpie clear kelpie-envelope-builder
 kelpie ask kelpie-envelope-builder --remind-after-ms 600000 --file ./long-task.md
@@ -468,12 +475,19 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   once to the unique active logical agent and then follows its fixed transport:
   a Herdr recipient binds its exact Ready incarnation; a socket waiter queues
   to its logical ID and becomes accepted only on inbox ACK. An optional due
-  time persists the delivery as `queued` and offers it once due. This is
-  delayed one-way delivery, not a schedule.
+  time persists the delivery as `queued` and offers it once due. `--every 15m`
+  instead creates a wall-clock schedule bound to the resolved logical agent;
+  it also accepts `--recipient-id ID` without an incarnation.
+  Each firing resolves that agent's current incarnation or socket inbox and
+  materializes a normal tell. If the target is unavailable, Kelpie records and
+  reports the firing but creates no message or runtime; it never starts,
+  revives, or restarts an agent. Missed intervals coalesce into one firing.
   Prefer `--due-in 10m` or `--due-at 2026-08-12T20:00:00Z` over computing
   `--due-at-ms` yourself: a wrong epoch does not fail, it delivers at the wrong
   moment, while a bad duration or timestamp fails immediately. Keep returned
   message and delivery IDs.
+- `schedule-cancel <schedule-id> --reason TEXT`: end a repeating tell schedule.
+  Only its requester or target may cancel it.
 - `clear`: replace one Ready agent's backend-native conversation without a
   prepare ask or resume prompt. Same recipient shape as `tell`. Verified
   on-clear backends (`claude`, `codex`, `grok`, `pi`) return only after Herdr
@@ -518,7 +532,9 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   waiter's inbox with no Herdr prompt. Persist is not acceptance. Only an
   accepted final reply resolves the obligation — Herdr prompt acceptance, or
   socket `inbox.ack`.
-- `renew`: bound one agent's context by clearing it and re-seeding it. With no
+- `renew`: bound one agent's context by clearing it and re-seeding it. Its
+  recurrence uses the shared schedule ledger with an overlap guard while
+  retaining renew's active-occupancy clock and exact incarnation binding. With no
   recipient it arms on the caller; it accepts no alias, only `--recipient-id`
   with `--recipient-incarnation` for a deliberate cross-target. Two phases: the
   `--prepare-prompt` is delivered as

@@ -55,6 +55,7 @@ pub enum Command {
         sender: Option<Caller>,
         idempotency_key: Option<String>,
         due: Option<Due>,
+        every_ms: Option<i64>,
     },
     Ask {
         recipient: Recipient,
@@ -124,6 +125,11 @@ pub enum Command {
     /// End a renew policy before its incarnation does.
     RenewCancel {
         renew_id: String,
+        reason: String,
+        requester: Option<Caller>,
+    },
+    ScheduleCancel {
+        schedule_id: String,
         reason: String,
         requester: Option<Caller>,
     },
@@ -227,6 +233,8 @@ pub enum Recipient {
     Alias(String),
     /// Exact durable IDs.
     Exact(ExactRecipient),
+    /// Durable logical-agent target for a repeating tell.
+    Agent(String),
 }
 
 /// Everything one renew needs: two prompts, a disposition, and a schedule.
@@ -383,6 +391,16 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
     let result = response.get("result").cloned().unwrap_or(Value::Null);
     match method {
         "tell" | "ask" => {
+            if method == "tell" && result.get("schedule_id").is_some() {
+                return format!(
+                    "schedule {} recipient={} state={} every={}ms next-fire-at-ms={}\n",
+                    field(&result, "schedule_id"),
+                    field(&result, "recipient"),
+                    field(&result, "state"),
+                    field(&result, "every_ms"),
+                    field(&result, "next_fire_at_ms")
+                );
+            }
             // A queued delivery is a deferral, not a dispatch. Epoch milliseconds
             // are unreadable at a glance, and a reader who skims one has no way
             // to notice the message has not been sent yet.
@@ -519,9 +537,9 @@ kelpie SOCKET                         # raw NDJSON request on stdin
 kelpie [--socket PATH] [--json] COMMAND
 
 Commands:
-  tell <recipient> | --recipient-id ID --recipient-incarnation ID
+  tell <recipient> | --recipient-id ID [--recipient-incarnation ID]
        (--stdin | --file PATH | --body TEXT)
-       [--due-in 10m | --due-at RFC3339 | --due-at-ms MS]
+       [--due-in 10m | --due-at RFC3339 | --due-at-ms MS | --every 15m]
   ask  <recipient> | --recipient-id ID --recipient-incarnation ID
        (--stdin | --file PATH | --body TEXT)
        [--remind-after-ms MS | --no-remind]
@@ -534,6 +552,7 @@ Commands:
        [--prepare-timeout 10m | --prepare-timeout-ms MS]
        [--due-in 45m | --due-at RFC3339 | --due-at-ms MS | --every 45m]
   renew-cancel <renew-id> --reason TEXT
+  schedule-cancel <schedule-id> --reason TEXT
   pending [alias]
   recover
   who [alias] | --pane ID | --agent-id ID | --incarnation-id ID
@@ -608,6 +627,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "clear" => parse_clear(args),
         "renew" => parse_renew(args),
         "renew-cancel" => parse_renew_cancel(args),
+        "schedule-cancel" => parse_schedule_cancel(args),
         "pending" => parse_pending(args),
         "recover" => {
             let tokens = Tokens::new(&args[1..]);
@@ -720,6 +740,16 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
     let body = take_body(&mut tokens, verb)?;
     let idempotency_key = tokens.take_value("--idempotency-key")?;
     let due = take_due(&mut tokens, verb)?;
+    let every_values = tokens.take_all_values("--every")?;
+    let every_ms = match every_values.as_slice() {
+        [] => None,
+        [value] if verb == "tell" => Some(parse_duration_for("--every", value)?),
+        [_] => return Err("ask does not accept --every".into()),
+        _ => return Err("--every specified more than once".into()),
+    };
+    if every_ms.is_some() && due.is_some() {
+        return Err("tell accepts either a one-shot due time or --every, not both".into());
+    }
     let reminder_values = tokens.take_all_values("--remind-after-ms")?;
     let no_remind = tokens.take_bool("--no-remind")?;
     let remind_after_ms = match reminder_values.as_slice() {
@@ -757,9 +787,12 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
             recipient,
             incarnation,
         }),
+        (None, Some(recipient), None) if verb == "tell" && every_ms.is_some() => {
+            Recipient::Agent(recipient)
+        }
         _ => {
             return Err(format!(
-                "{verb} requires exactly one of <recipient> or --recipient-id plus --recipient-incarnation"
+                "{verb} requires exactly one of <recipient> or --recipient-id plus --recipient-incarnation; repeating tells also accept --recipient-id alone"
             ));
         }
     };
@@ -770,6 +803,7 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
             sender,
             idempotency_key,
             due,
+            every_ms,
         })
     } else {
         Ok(Command::Ask {
@@ -932,6 +966,23 @@ fn parse_renew_cancel(args: &[String]) -> Result<Command, String> {
     tokens.finish("renew-cancel")?;
     Ok(Command::RenewCancel {
         renew_id,
+        reason,
+        requester,
+    })
+}
+
+fn parse_schedule_cancel(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let requester = take_caller(&mut tokens)?;
+    let reason = tokens
+        .take_value("--reason")?
+        .ok_or("schedule-cancel requires --reason")?;
+    let schedule_id = tokens
+        .take_positional()
+        .ok_or("usage: kelpie schedule-cancel <schedule-id> --reason TEXT")?;
+    tokens.finish("schedule-cancel")?;
+    Ok(Command::ScheduleCancel {
+        schedule_id,
         reason,
         requester,
     })
@@ -3035,6 +3086,75 @@ mod tests {
         let error = parse_invocation(&args(&["tell", "quorum", "--due-at-ms", "-1", "--stdin"]))
             .expect_err("negative");
         assert!(error.contains("non-negative"), "{error}");
+    }
+
+    #[test]
+    fn tell_accepts_a_repeating_interval_but_not_a_second_clock() {
+        let invocation = parse_invocation(&args(&[
+            "tell",
+            "coordinator",
+            "--every",
+            "15m",
+            "--body",
+            "supervise",
+        ]))
+        .expect("parse schedule");
+        match invocation {
+            Invocation::Typed {
+                command: Command::Tell { every_ms, due, .. },
+                ..
+            } => {
+                assert_eq!(every_ms, Some(15 * 60 * 1_000));
+                assert_eq!(due, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let error = parse_invocation(&args(&[
+            "tell",
+            "coordinator",
+            "--every",
+            "15m",
+            "--due-in",
+            "1m",
+            "--body",
+            "x",
+        ]))
+        .expect_err("two clocks");
+        assert!(error.contains("either"), "{error}");
+
+        let exact_logical = parse_invocation(&args(&[
+            "tell",
+            "--recipient-id",
+            "aaaaaaaa-bbbb-7ccc-dddd-eeeeeeeeeeee",
+            "--every",
+            "15m",
+            "--body",
+            "supervise",
+        ]))
+        .expect("logical target");
+        assert!(matches!(
+            exact_logical,
+            Invocation::Typed {
+                command: Command::Tell {
+                    recipient: Recipient::Agent(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn schedule_receipt_cannot_be_mistaken_for_a_delivered_tell() {
+        let text = format_receipt(
+            "tell",
+            &json!({"result":{
+                "schedule_id":"s","recipient":"r","state":"active",
+                "every_ms":900_000,"next_fire_at_ms":1_770_000_000_000_i64
+            }}),
+        );
+        assert!(text.starts_with("schedule s"), "{text}");
+        assert!(!text.contains("delivery="), "{text}");
     }
 
     fn parsed_due(args_in: &[&str]) -> Due {
