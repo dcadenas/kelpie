@@ -3086,7 +3086,7 @@ impl Store {
                 SELECT 1 FROM schedule_firings f
                 JOIN deliveries d ON d.message_id = f.message_id
                 WHERE f.schedule_id = ?1
-                  AND d.outcome IN ('pending','queued','submitted','unknown')
+                  AND d.outcome IN ('pending','queued','submitted')
              )",
             [item.schedule_id.to_string()],
             |row| row.get(0),
@@ -11529,6 +11529,47 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("message count");
         assert_eq!(messages_after_skip, messages_before_skip);
+
+        let second_operation: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM deliveries WHERE message_id = ?1",
+                [second_firing
+                    .message_id
+                    .expect("second message")
+                    .to_string()],
+                |row| row.get(0),
+            )
+            .expect("second operation");
+        let second_operation = parse_operation_id(&second_operation).expect("operation id");
+        store
+            .begin_attempt(
+                second_operation,
+                second.incarnation_id,
+                "schedule-second-request",
+            )
+            .expect("second attempt");
+        store
+            .submit_queued_delivery(second_operation, 1, "schedule-second-request", now)
+            .expect("submit second queued");
+        store
+            .mark_unknown(second_operation, second.incarnation_id, "ambiguous write")
+            .expect("mark unknown");
+        store
+            .connection
+            .execute(
+                "UPDATE schedules SET next_fire_at_ms = ?1 WHERE id = ?2",
+                params![now, schedule.schedule_id.to_string()],
+            )
+            .expect("make fourth due");
+        let fourth = store
+            .fire_tell_schedule(&store.due_tell_schedules(now).expect("fourth due")[0], now)
+            .expect("fourth firing");
+        assert_eq!(
+            fourth.outcome,
+            ScheduleFiringOutcome::Materialized,
+            "unknown is terminal for its message, not for later intervals"
+        );
     }
 
     #[test]

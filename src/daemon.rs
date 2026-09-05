@@ -2516,10 +2516,10 @@ impl Daemon {
             .kelpie
             .apply_renew_confirm_observation(&item, now_ms, &observed)
         {
-            Ok(true) => {
-                let _ = self.kelpie.store_mut().complete_renew(item.renew_id);
-                self.finish_parked_renew(index);
-            }
+            Ok(true) => match self.kelpie.store_mut().complete_renew(item.renew_id) {
+                Ok(_) => self.finish_parked_renew(index),
+                Err(error) => self.drop_parked_renew(index, &error.into()),
+            },
             Ok(false) => self.finish_parked_renew(index),
             Err(error) if Self::renew_drive_skips(&error) => self.finish_parked_renew(index),
             Err(error) => self.drop_parked_renew(index, &error),
@@ -8719,32 +8719,35 @@ mod tests {
     }
 
     #[test]
-    fn poll_fires_repeating_tell_with_no_client() {
+    #[allow(clippy::too_many_lines)]
+    fn poll_fires_due_and_repeating_tells_with_no_client() {
         let directory = tempfile::tempdir().expect("tempdir");
         let kelpie_socket = directory.path().join("kelpie.sock");
         let herdr_socket = directory.path().join("herdr.sock");
         let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept due prompt");
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().expect("clone"))
-                .read_line(&mut line)
-                .expect("read");
-            let request: Value = serde_json::from_str(&line).expect("json");
-            assert_eq!(request["method"], "agent.prompt");
-            let result = serde_json::json!({
-                "type":"agent_prompted",
-                "agent":{
-                    "terminal_id":"term-a","pane_id":"w1:p1","name":"waiting",
-                    "agent":"codex","interactive_ready":true,"launch_pending":false
-                }
-            });
-            serde_json::to_writer(
-                &mut stream,
-                &serde_json::json!({"id":request["id"],"result":result}),
-            )
-            .expect("write");
-            stream.write_all(b"\n").expect("finish");
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept due prompt");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("json");
+                assert_eq!(request["method"], "agent.prompt");
+                let result = serde_json::json!({
+                    "type":"agent_prompted",
+                    "agent":{
+                        "terminal_id":"term-a","pane_id":"w1:p1","name":"waiting",
+                        "agent":"codex","interactive_ready":true,"launch_pending":false
+                    }
+                });
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("finish");
+            }
         });
 
         let mut store = Store::in_memory().expect("store");
@@ -8781,6 +8784,16 @@ mod tests {
                 "due-poll-tell",
             )
             .expect("queued");
+        let one_shot = store
+            .create_tell_with_due(
+                declared.logical_agent_id,
+                declared.logical_agent_id,
+                declared.incarnation_id,
+                "wake once",
+                "due-poll-one-shot",
+                Some(due_at),
+            )
+            .expect("one-shot queued");
         let mut daemon = Daemon::bind(
             &kelpie_socket,
             Kelpie::new(
@@ -8804,6 +8817,12 @@ mod tests {
                     .store_mut()
                     .delivery_outcome_for_message(message_id)
                     .expect("delivery")
+                    == crate::domain::DeliveryOutcome::Accepted
+                && daemon
+                    .kelpie
+                    .store_mut()
+                    .delivery_outcome(one_shot.operation_id)
+                    .expect("one-shot delivery")
                     == crate::domain::DeliveryOutcome::Accepted
             {
                 break;

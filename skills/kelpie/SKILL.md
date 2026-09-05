@@ -484,7 +484,9 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   materializes a normal tell. If the target is unavailable, Kelpie records and
   reports the firing but creates no message or runtime; it never starts,
   revives, or restarts an agent. Missed intervals coalesce into one firing, and
-  a new firing is skipped while an earlier schedule delivery remains unresolved.
+  a new firing is skipped while an earlier schedule delivery is still pending,
+  queued, or submitted. An unknown firing is never resent but does not stop later
+  intervals.
   Prefer `--due-in 10m` or `--due-at 2026-08-12T20:00:00Z` over computing
   `--due-at-ms` yourself: a wrong epoch does not fail, it delivers at the wrong
   moment, while a bad duration or timestamp fails immediately. Keep returned

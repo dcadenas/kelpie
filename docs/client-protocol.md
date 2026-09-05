@@ -222,8 +222,9 @@ survives handoff and adoption. An unavailable firing records
 raises one operator notice for a consecutive unavailable run, not one notice per
 interval. Missed intervals are coalesced into one firing and
 the next due time is measured from that firing. A due firing is recorded as
-`skipped` when an earlier firing still has an unresolved delivery, preventing a
-restart burst. `schedule.cancel` takes the
+`skipped` when an earlier firing is still `pending`, `queued`, or `submitted`,
+preventing a restart burst. An `unknown` firing is never resent but does not stop
+later intervals. `schedule.cancel` takes the
 schedule id, requester agent id, and a non-empty reason; only the schedule's
 requester or target may cancel it.
 `schedule.list` takes an `agent_id` and returns every schedule requested by or

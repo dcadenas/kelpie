@@ -418,9 +418,10 @@ current unique receive path. When none exists, the firing MUST record and report
 worktree, or runtime, and MUST continue to its next interval. Missed intervals
 while kelpied is down are coalesced into one due firing; the next interval starts
 when that firing is recorded rather than producing a restart burst.
-If an earlier firing still has a `pending`, `queued`, `submitted`, or `unknown`
+If an earlier firing still has a `pending`, `queued`, or `submitted`
 delivery, a later due firing MUST be recorded as skipped and MUST NOT materialize
-a second message beside it.
+a second message beside it. An `unknown` delivery MUST NOT be resent, but it MUST
+NOT stop later intervals from materializing distinct messages.
 Kelpie MUST raise an operator notice when a schedule enters an unavailable run,
 but MUST NOT repeat that notice on every interval until a firing succeeds.
 Every ask creates a reply-reminder policy by default.
