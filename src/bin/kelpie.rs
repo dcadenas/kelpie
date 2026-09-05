@@ -90,9 +90,9 @@ fn build_typed(
             sender,
             idempotency_key,
             due,
-        } => Ok((
-            "tell".into(),
-            message_command(
+            every_ms,
+        } => Ok(("tell".into(), {
+            let mut params = message_command(
                 socket,
                 recipient,
                 &body,
@@ -100,8 +100,12 @@ fn build_typed(
                 idempotency_key,
                 resolve_due(due)?,
                 request_id,
-            )?,
-        )),
+            )?;
+            if let Some(every_ms) = every_ms {
+                params["every_ms"] = json!(every_ms);
+            }
+            params
+        })),
         Command::Clear {
             recipient,
             idempotency_key,
@@ -114,6 +118,9 @@ fn build_typed(
                 Recipient::Exact(exact) => {
                     params["recipient"] = json!(exact.recipient);
                     params["recipient_incarnation"] = json!(exact.incarnation);
+                }
+                Recipient::Agent(_) => {
+                    return Err("clear requires an alias or exact incarnation".into());
                 }
             }
             Ok(("clear".into(), params))
@@ -425,6 +432,25 @@ fn build_typed(
                 }),
             ))
         }
+        Command::ScheduleCancel {
+            schedule_id,
+            reason,
+            requester,
+        } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            Ok((
+                "schedule.cancel".into(),
+                json!({
+                    "requester_agent_id": agent,
+                    "schedule_id": schedule_id,
+                    "reason": reason
+                }),
+            ))
+        }
+        Command::Schedules { target } => {
+            let agent = resolve_caller(socket, target, request_id)?.0;
+            Ok(("schedule.list".into(), json!({"agent_id": agent})))
+        }
         Command::ReminderSnooze {
             ask_id,
             until_ms,
@@ -532,6 +558,18 @@ fn message_command(
             &key,
             due_at_ms,
         )),
+        Recipient::Agent(id) => {
+            let mut params = json!({
+                "sender": sender,
+                "recipient": id,
+                "body": body,
+                "idempotency_key": key,
+            });
+            if let Some(due_at_ms) = due_at_ms {
+                params["due_at_ms"] = json!(due_at_ms);
+            }
+            Ok(params)
+        }
     }
 }
 

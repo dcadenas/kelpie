@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::domain::{
     AdoptIntent, IncarnationId, LogicalAgentId, MessageId, MessageKind, OperationId, Parent,
-    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, StartIntent,
+    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, ScheduleId, StartIntent,
 };
 use crate::herdr::HerdrError;
 use crate::herdr_exec::{FailPhase, HerdrEvent, HerdrExec, HerdrJob, HerdrJobResult, LeaseCmd};
@@ -496,11 +496,19 @@ impl Daemon {
     /// # Errors
     ///
     /// Returns for socket, request decoding, or response encoding failures.
+    #[allow(clippy::too_many_lines)]
     pub fn poll(&mut self) -> Result<bool, DaemonError> {
         let pass_started = PollTimer::start();
         let mut phase = PollTimer::start();
         self.drain_herdr_events();
         log_slow_phase("herdr_events", &mut phase);
+        if let Err(error) = self.kelpie.fire_due_schedules() {
+            let _ = self
+                .kelpie
+                .store_mut()
+                .create_operator_notice(&format!("schedule fire failed: {error}"));
+        }
+        log_slow_phase("due_schedules", &mut phase);
         match self.kelpie.begin_due_deliveries() {
             Ok(prepared) => {
                 for prompt in prepared {
@@ -2508,10 +2516,10 @@ impl Daemon {
             .kelpie
             .apply_renew_confirm_observation(&item, now_ms, &observed)
         {
-            Ok(true) => {
-                let _ = self.kelpie.store_mut().complete_renew(item.renew_id);
-                self.finish_parked_renew(index);
-            }
+            Ok(true) => match self.kelpie.store_mut().complete_renew(item.renew_id) {
+                Ok(_) => self.finish_parked_renew(index),
+                Err(error) => self.drop_parked_renew(index, &error.into()),
+            },
             Ok(false) => self.finish_parked_renew(index),
             Err(error) if Self::renew_drive_skips(&error) => self.finish_parked_renew(index),
             Err(error) => self.drop_parked_renew(index, &error),
@@ -4839,6 +4847,7 @@ fn launch_result(created: crate::slice::LaunchResult) -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
     let result = match request.method.as_str() {
         "whoami" => dispatch_whoami(request.params, kelpie, &request.id),
@@ -4859,6 +4868,32 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
                     .map(|notice_id| {
                         serde_json::json!({"renew_id": params.renew_id, "notice_id": notice_id})
                     })
+            }),
+        "schedule.cancel" => serde_json::from_value::<ScheduleCancelParams>(request.params)
+            .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))
+            .and_then(|params| {
+                kelpie
+                    .cancel_schedule(params.schedule_id, params.requester_agent_id, &params.reason)
+                    .map(|()| serde_json::json!({"schedule_id": params.schedule_id, "state": "cancelled"}))
+            }),
+        "schedule.list" => serde_json::from_value::<ScheduleListParams>(request.params)
+            .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))
+            .and_then(|params| {
+                kelpie.store().schedules_for_agent(params.agent_id).map(|items| {
+                    serde_json::json!({"schedules": items.into_iter().map(|item| serde_json::json!({
+                        "schedule_id": item.id,
+                        "kind": item.kind,
+                        "logical_agent_id": item.logical_agent_id,
+                        "incarnation_id": item.incarnation_id,
+                        "interval_ms": item.interval_ms,
+                        "clock": item.clock,
+                        "next_fire_at_ms": item.next_fire_at_ms,
+                        "cycle": item.cycle,
+                        "state": item.state,
+                        "last_outcome": item.last_outcome,
+                        "last_message_id": item.last_message_id,
+                    })).collect::<Vec<_>>()})
+                }).map_err(SliceError::Store)
             }),
         "reply" => dispatch_reply(request.params, kelpie),
         "pending" => dispatch_pending(request.params, kelpie),
@@ -5903,6 +5938,40 @@ fn prepare_client_prompt(
     } else if request.method == "tell" {
         let params = serde_json::from_value::<TellParams>(request.params.clone())
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+        if let Some(every_ms) = params.every_ms {
+            if params.due_at_ms.is_some() {
+                return Err(SliceError::Store(StoreError::InvalidRecord(
+                    "tell accepts either a one-shot due_at_ms or every_ms, not both".into(),
+                )));
+            }
+            if let Some(created) = kelpie.store().tell_schedule_by_idempotency_key(
+                &params.idempotency_key,
+                params.sender,
+                every_ms,
+                &params.body,
+            )? {
+                return Ok((schedule_result(&created), None, None));
+            }
+            let recipient = resolve_schedule_recipient(
+                kelpie,
+                params.recipient,
+                params.recipient_incarnation,
+                params.recipient_alias.as_deref(),
+                &format!("{}:lazy-adopt:recipient", params.idempotency_key),
+            )?;
+            let first_fire_at_ms = crate::store::store_clock_ms()
+                .map_err(SliceError::Store)?
+                .saturating_add(every_ms);
+            let created = kelpie.schedule_tell(
+                params.sender,
+                recipient,
+                &params.body,
+                every_ms,
+                first_fire_at_ms,
+                &params.idempotency_key,
+            )?;
+            return Ok((schedule_result(&created), None, None));
+        }
         if let Some(replay) = kelpie.store().replay_prompt_by_idempotency_key(
             &params.idempotency_key,
             MessageKind::Tell,
@@ -6078,6 +6147,40 @@ fn ask_reminder_interval(params: &AskParams) -> Result<Option<i64>, SliceError> 
 fn dispatch_tell(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<TellParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if let Some(every_ms) = params.every_ms {
+        if params.due_at_ms.is_some() {
+            return Err(SliceError::Store(StoreError::InvalidRecord(
+                "tell accepts either a one-shot due_at_ms or every_ms, not both".into(),
+            )));
+        }
+        if let Some(created) = kelpie.store().tell_schedule_by_idempotency_key(
+            &params.idempotency_key,
+            params.sender,
+            every_ms,
+            &params.body,
+        )? {
+            return Ok(schedule_result(&created));
+        }
+        let recipient = resolve_schedule_recipient(
+            kelpie,
+            params.recipient,
+            params.recipient_incarnation,
+            params.recipient_alias.as_deref(),
+            &format!("{}:lazy-adopt:recipient", params.idempotency_key),
+        )?;
+        let first_fire_at_ms = crate::store::store_clock_ms()
+            .map_err(SliceError::Store)?
+            .saturating_add(every_ms);
+        let created = kelpie.schedule_tell(
+            params.sender,
+            recipient,
+            &params.body,
+            every_ms,
+            first_fire_at_ms,
+            &params.idempotency_key,
+        )?;
+        return Ok(schedule_result(&created));
+    }
     let mut result = match resolve_tell_recipient(
         kelpie,
         params.recipient,
@@ -6133,6 +6236,16 @@ fn dispatch_tell(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError
         result["due_at_ms"] = serde_json::json!(due_at_ms);
     }
     Ok(result)
+}
+
+fn schedule_result(created: &crate::store::CreatedSchedule) -> Value {
+    serde_json::json!({
+        "schedule_id": created.schedule_id,
+        "recipient": created.recipient,
+        "every_ms": created.interval_ms,
+        "next_fire_at_ms": created.next_fire_at_ms,
+        "state": created.state
+    })
 }
 
 /// When a renew's first cycle comes due.
@@ -6318,6 +6431,38 @@ fn pending_alias_bind(request: &ClientRequest, kelpie: &Kelpie) -> Option<(Strin
 enum TellRecipient {
     Herdr(LogicalAgentId, IncarnationId),
     SocketInbox(LogicalAgentId),
+}
+
+fn resolve_schedule_recipient(
+    kelpie: &mut Kelpie,
+    recipient: Option<LogicalAgentId>,
+    recipient_incarnation: Option<IncarnationId>,
+    recipient_alias: Option<&str>,
+    lazy_adopt_key: &str,
+) -> Result<LogicalAgentId, SliceError> {
+    if let (Some(recipient), Some(incarnation), None) =
+        (recipient, recipient_incarnation, recipient_alias)
+    {
+        if kelpie.store().logical_agent_of(incarnation)? != recipient {
+            return Err(SliceError::Store(StoreError::Conflict(
+                "recipient incarnation does not belong to the schedule's logical agent".into(),
+            )));
+        }
+        return Ok(recipient);
+    }
+    if let (Some(recipient), None, None) = (recipient, recipient_incarnation, recipient_alias) {
+        return Ok(recipient);
+    }
+    resolve_tell_recipient(
+        kelpie,
+        recipient,
+        recipient_incarnation,
+        recipient_alias,
+        lazy_adopt_key,
+    )
+    .map(|target| match target {
+        TellRecipient::Herdr(agent, _) | TellRecipient::SocketInbox(agent) => agent,
+    })
 }
 
 fn resolve_tell_recipient(
@@ -6623,6 +6768,8 @@ struct TellParams {
     idempotency_key: String,
     #[serde(default)]
     due_at_ms: Option<i64>,
+    #[serde(default)]
+    every_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6663,6 +6810,18 @@ struct RenewCancelParams {
     /// The agent asking. Must be the policy's requester or its target.
     requester_agent_id: LogicalAgentId,
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCancelParams {
+    schedule_id: ScheduleId,
+    requester_agent_id: LogicalAgentId,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleListParams {
+    agent_id: LogicalAgentId,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8482,32 +8641,113 @@ mod tests {
     }
 
     #[test]
-    fn poll_fires_due_tell_with_no_client() {
+    fn schedule_rpc_lists_and_authorizes_cancellation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let owner = store
+            .declare_start(&test_intent("owner", "term-a", "schedule-owner"))
+            .expect("owner");
+        let other = store
+            .declare_start(&test_intent("other", "term-b", "schedule-other"))
+            .expect("other");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("herdr.sock"),
+                Duration::from_millis(10),
+            ),
+        );
+        let armed = dispatch(
+            ClientRequest {
+                id: "arm".into(),
+                method: "tell".into(),
+                params: serde_json::json!({
+                    "sender": owner.logical_agent_id,
+                    "recipient": owner.logical_agent_id,
+                    "body": "repeat",
+                    "idempotency_key": "schedule-rpc",
+                    "every_ms": 60_000
+                }),
+            },
+            &mut kelpie,
+        );
+        let schedule_id = armed.result.expect("arm result")["schedule_id"]
+            .as_str()
+            .expect("schedule id")
+            .to_string();
+        let listed = dispatch(
+            ClientRequest {
+                id: "list".into(),
+                method: "schedule.list".into(),
+                params: serde_json::json!({"agent_id": owner.logical_agent_id}),
+            },
+            &mut kelpie,
+        );
+        assert_eq!(
+            listed.result.expect("list result")["schedules"][0]["schedule_id"],
+            schedule_id
+        );
+        let refused = dispatch(
+            ClientRequest {
+                id: "refused".into(),
+                method: "schedule.cancel".into(),
+                params: serde_json::json!({
+                    "schedule_id": schedule_id,
+                    "requester_agent_id": other.logical_agent_id,
+                    "reason": "not mine"
+                }),
+            },
+            &mut kelpie,
+        );
+        assert!(refused.error.is_some(), "unrelated agent cannot cancel");
+        let cancelled = dispatch(
+            ClientRequest {
+                id: "cancel".into(),
+                method: "schedule.cancel".into(),
+                params: serde_json::json!({
+                    "schedule_id": schedule_id,
+                    "requester_agent_id": owner.logical_agent_id,
+                    "reason": "done"
+                }),
+            },
+            &mut kelpie,
+        );
+        assert_eq!(
+            cancelled.result.expect("cancel result")["state"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn poll_fires_due_and_repeating_tells_with_no_client() {
         let directory = tempfile::tempdir().expect("tempdir");
         let kelpie_socket = directory.path().join("kelpie.sock");
         let herdr_socket = directory.path().join("herdr.sock");
         let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept due prompt");
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().expect("clone"))
-                .read_line(&mut line)
-                .expect("read");
-            let request: Value = serde_json::from_str(&line).expect("json");
-            assert_eq!(request["method"], "agent.prompt");
-            let result = serde_json::json!({
-                "type":"agent_prompted",
-                "agent":{
-                    "terminal_id":"term-a","pane_id":"w1:p1","name":"waiting",
-                    "agent":"codex","interactive_ready":true,"launch_pending":false
-                }
-            });
-            serde_json::to_writer(
-                &mut stream,
-                &serde_json::json!({"id":request["id"],"result":result}),
-            )
-            .expect("write");
-            stream.write_all(b"\n").expect("finish");
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept due prompt");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("json");
+                assert_eq!(request["method"], "agent.prompt");
+                let result = serde_json::json!({
+                    "type":"agent_prompted",
+                    "agent":{
+                        "terminal_id":"term-a","pane_id":"w1:p1","name":"waiting",
+                        "agent":"codex","interactive_ready":true,"launch_pending":false
+                    }
+                });
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("finish");
+            }
         });
 
         let mut store = Store::in_memory().expect("store");
@@ -8534,16 +8774,26 @@ mod tests {
             )
             .expect("ready");
         let due_at = crate::store::store_clock_ms().expect("clock") - 1;
-        let tell = store
+        let schedule = store
+            .create_tell_schedule(
+                declared.logical_agent_id,
+                declared.logical_agent_id,
+                "wake",
+                60_000,
+                due_at,
+                "due-poll-tell",
+            )
+            .expect("queued");
+        let one_shot = store
             .create_tell_with_due(
                 declared.logical_agent_id,
                 declared.logical_agent_id,
                 declared.incarnation_id,
-                "wake",
-                "due-poll-tell",
+                "wake once",
+                "due-poll-one-shot",
                 Some(due_at),
             )
-            .expect("queued");
+            .expect("one-shot queued");
         let mut daemon = Daemon::bind(
             &kelpie_socket,
             Kelpie::new(
@@ -8555,12 +8805,25 @@ mod tests {
         let started = Instant::now();
         loop {
             let _ = daemon.poll().expect("poll without client");
-            if daemon
+            let schedules = daemon
                 .kelpie
                 .store()
-                .delivery_outcome(tell.operation_id)
-                .expect("delivery")
-                == crate::domain::DeliveryOutcome::Accepted
+                .schedules_for_agent(declared.logical_agent_id)
+                .expect("schedule list");
+            assert_eq!(schedules[0].id, schedule.schedule_id);
+            if let Some(message_id) = schedules[0].last_message_id
+                && daemon
+                    .kelpie
+                    .store_mut()
+                    .delivery_outcome_for_message(message_id)
+                    .expect("delivery")
+                    == crate::domain::DeliveryOutcome::Accepted
+                && daemon
+                    .kelpie
+                    .store_mut()
+                    .delivery_outcome(one_shot.operation_id)
+                    .expect("one-shot delivery")
+                    == crate::domain::DeliveryOutcome::Accepted
             {
                 break;
             }

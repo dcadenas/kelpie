@@ -10,14 +10,14 @@ use thiserror::Error;
 use crate::domain::{
     AdoptIntent, DeliveryOutcome, IncarnationId, InitialMessageKind, LogicalAgentId, MessageId,
     MessageKind, ObligationState, OperationId, OperationOutcome, OperatorNoticeId, RenewId,
-    RenewIntent, RenewPhase, RenewStep, RenewTimeout, ReplyDisposition, StartIntent,
+    RenewIntent, RenewPhase, RenewStep, RenewTimeout, ReplyDisposition, ScheduleId, StartIntent,
 };
 use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{AgentObservation, HerdrClient, HerdrError};
 use crate::store::{
     AdoptEvidence, BoundaryReminder, CancellationAudience, CreatedAsk, CreatedReply,
-    CreatedSocketTell, CreatedTell, DeclaredStart, DueDelivery, DueReminder, DueRenew,
-    IntervalRenewClock, PendingObligation, RENEW_OCCUPANCY_SAMPLE_MS, RecoveryReport,
+    CreatedSchedule, CreatedSocketTell, CreatedTell, DeclaredStart, DueDelivery, DueReminder,
+    DueRenew, IntervalRenewClock, PendingObligation, RENEW_OCCUPANCY_SAMPLE_MS, RecoveryReport,
     ReplyReceivePath, Store, StoreError, store_clock_ms,
 };
 
@@ -1735,6 +1735,67 @@ impl Kelpie {
             .map_err(SliceError::Store)
     }
 
+    /// Arm a wall-clock repeating tell against a logical agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error for absent identities or conflicting replay.
+    pub fn schedule_tell(
+        &mut self,
+        sender: LogicalAgentId,
+        recipient: LogicalAgentId,
+        body: &str,
+        interval_ms: i64,
+        first_fire_at_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<CreatedSchedule, SliceError> {
+        self.store
+            .create_tell_schedule(
+                sender,
+                recipient,
+                body,
+                interval_ms,
+                first_fire_at_ms,
+                idempotency_key,
+            )
+            .map_err(SliceError::Store)
+    }
+
+    /// Materialize all due wall-clock schedule firings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if durable schedule state cannot advance.
+    pub fn fire_due_schedules(&mut self) -> Result<usize, SliceError> {
+        let now_ms = store_clock_ms()?;
+        let due = self.store.due_tell_schedules(now_ms)?;
+        let mut fired = 0;
+        for item in due {
+            match self.store.fire_tell_schedule(&item, now_ms) {
+                Ok(_) => fired += 1,
+                Err(StoreError::Conflict(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(fired)
+    }
+
+    /// Cancel a repeating schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if the caller is neither requester nor target.
+    pub fn cancel_schedule(
+        &mut self,
+        schedule_id: ScheduleId,
+        requester: LogicalAgentId,
+        reason: &str,
+    ) -> Result<(), SliceError> {
+        self.store
+            .cancel_schedule(schedule_id, requester, reason)
+            .map_err(SliceError::Store)
+    }
+
     /// Clear one Ready incarnation's backend-native context.
     ///
     /// The operation records its intent and pre-clear session reference before
@@ -3278,6 +3339,7 @@ impl Kelpie {
             return cap;
         };
         let delivery_due = self.store.next_queued_due_at_ms().ok().flatten();
+        let schedule_due = self.store.next_schedule_due_at_ms().ok().flatten();
         let reminder_due = self.store.next_reminder_due_at_ms().ok().flatten();
         let boundary_due = self.store.next_boundary_check_at_ms().ok().flatten();
         let renew_due = self.store.next_renew_due_at_ms().ok().flatten();
@@ -3291,11 +3353,16 @@ impl Kelpie {
         if renew_active {
             return cap;
         }
-        let Some(due_at_ms) = [delivery_due, reminder_due, boundary_due, renew_due]
-            .into_iter()
-            .flatten()
-            .min()
-        else {
+        let Some(due_at_ms) = [
+            delivery_due,
+            schedule_due,
+            reminder_due,
+            boundary_due,
+            renew_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min() else {
             return cap;
         };
         let wait_ms = due_at_ms.saturating_sub(now_ms);

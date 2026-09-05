@@ -26,7 +26,7 @@ The local protocol is one newline-delimited JSON request per connection. Each
 request contains `id`, `method`, and `params`; each response echoes `id` and
 contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
-`reply`, `clear`, `renew`, `renew.cancel`, `pending`, `cancel`, `retire`,
+`reply`, `clear`, `renew`, `renew.cancel`, `schedule.cancel`, `schedule.list`, `pending`, `cancel`, `retire`,
 `waiter.register`, `waiter.retire`, `inbox.claim`, `inbox.ack`,
 `notice.create`, `notice.list`, `who`, `name.info`, `ask.info`, `attribution`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
@@ -201,7 +201,7 @@ On a `tell`, optional `due_at_ms` (Unix epoch milliseconds, same store
 `SystemTime` clock as other timestamps) persists the delivery as `queued` and
 fires it once when
 `now_ms >= due_at_ms` against that exact Ready incarnation. A reminder is a
-delayed tell. There is no recurring schedule and no receiver ack. Cancel of a
+delayed tell. There is no receiver ack. Cancel of a
 queued delivery is legal only before the first Herdr write; after submit, the
 existing no-resend and unknown rules apply. If the due time elapses while
 `kelpied` is down, recover marks the delivery `unknown` instead of firing it
@@ -210,6 +210,26 @@ no client connected. Durable attempt intent is recorded before the Herdr
 write. A due-vs-accepted race is resolved in one SQLite writer: submit
 requires the row still `queued` and due; cancel requires the row still
 `queued` with no submitted attempt.
+
+Alternatively, `every_ms` arms a repeating wall-clock tell schedule and cannot
+be combined with `due_at_ms`. The initial firing is one interval away. The
+receipt returns `schedule_id`, not a message or delivery id. The alias is
+resolved once to a logical agent; callers may instead provide that logical id
+without an incarnation. Every firing then resolves that identity's
+current unique Herdr incarnation or active socket inbox. This is why a schedule
+survives handoff and adoption. An unavailable firing records
+`target_unavailable`, creates no message, operation, delivery, or runtime, and
+raises one operator notice for a consecutive unavailable run, not one notice per
+interval. Missed intervals are coalesced into one firing and
+the next due time is measured from that firing. A due firing is recorded as
+`skipped` when an earlier firing is still `pending`, `queued`, or `submitted`,
+preventing a restart burst. An `unknown` firing is never resent but does not stop
+later intervals. `schedule.cancel` takes the
+schedule id, requester agent id, and a non-empty reason; only the schedule's
+requester or target may cancel it.
+`schedule.list` takes an `agent_id` and returns every schedule requested by or
+targeting that logical agent, including ended schedules and the latest firing
+outcome. This makes the cancellation handle recoverable after a lost receipt.
 
 Every ask creates a correlated pending-reply reminder with a five-minute
 default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
