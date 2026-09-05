@@ -1107,6 +1107,7 @@ impl Daemon {
             RenameParkState::Confirm(work) => {
                 let result = match result {
                     Ok(HerdrJobResult::Snapshot(snapshot)) => {
+                        self.remember_recovery_snapshot(index, &snapshot);
                         self.kelpie.commit_rename_confirm(&work, &snapshot)
                     }
                     Ok(_) => Err(SliceError::Herdr(HerdrError::Unexpected(
@@ -1116,6 +1117,16 @@ impl Daemon {
                 };
                 self.answer_rename_at(index, result);
             }
+        }
+    }
+
+    fn remember_recovery_snapshot(&mut self, index: usize, snapshot: &crate::herdr::Snapshot) {
+        if let RenameReply::Recover {
+            snapshot: recovery_snapshot,
+            ..
+        } = &mut self.awaiting_renames[index].reply
+        {
+            *recovery_snapshot = snapshot.clone();
         }
     }
 
@@ -7586,16 +7597,111 @@ mod tests {
             HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
         );
         let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
-        let server = thread::spawn(move || daemon.serve_one().expect("serve recovery"));
 
-        let response = send_request(
+        let response = rpc(
+            &mut daemon,
             &kelpie_socket,
-            &serde_json::json!({"id":"recover-refused","method":"recover","params":{}}),
+            serde_json::json!({"id":"recover-refused","method":"recover","params":{}}),
         );
         assert_eq!(response["result"]["names_reprojected"], 0);
         assert_eq!(response["result"]["incarnations_marked_lost"], 0);
         assert!(response.get("error").is_none(), "{response}");
-        server.join().expect("daemon thread");
+        herdr.join().expect("Herdr thread");
+    }
+
+    #[test]
+    fn parked_recovery_uses_the_fresh_confirmation_after_projection_drift() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
+        let herdr = thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({
+                        "type":"session_snapshot","snapshot":{"protocol":20,"panes":[],
+                        "agents":[{"terminal_id":"term-1","pane_id":"w1:p1",
+                        "agent":"codex","interactive_ready":true,"launch_pending":false}]}
+                    }),
+                ),
+                (
+                    "agent.rename",
+                    serde_json::json!({"type":"agent_info","agent":{
+                        "terminal_id":"term-1","pane_id":"w1:p1","name":"worker",
+                        "agent":"codex"
+                    }}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({
+                        "type":"session_snapshot","snapshot":{"protocol":20,"panes":[],
+                        "agents":[{"terminal_id":"term-1","pane_id":"w1:p1",
+                        "name":"stranger","agent":"codex","interactive_ready":true,
+                        "launch_pending":false}]}
+                    }),
+                ),
+            ];
+            for (method, result) in exchanges {
+                let (mut stream, _) = listener.accept().expect("accept Herdr request");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut line)
+                    .expect("read Herdr request");
+                let request: Value = serde_json::from_str(&line).expect("request JSON");
+                assert_eq!(request["method"], method);
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write response");
+                stream.write_all(b"\n").expect("finish response");
+            }
+        });
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&test_intent("worker", "term-1", "confirm-drift"))
+            .expect("intent");
+        store
+            .begin_attempt(
+                declared.operation_id,
+                declared.incarnation_id,
+                "start-request",
+            )
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                declared.operation_id,
+                declared.incarnation_id,
+                &crate::herdr::AgentObservation {
+                    terminal_id: "term-1".into(),
+                    pane_id: "w1:p1".into(),
+                    name: Some("worker".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        let kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
+        );
+        let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
+
+        let response = rpc(
+            &mut daemon,
+            &kelpie_socket,
+            serde_json::json!({"id":"recover-confirm-drift","method":"recover","params":{}}),
+        );
+        assert_eq!(response["result"]["incarnations_marked_lost"], 1);
+        assert_eq!(response["result"]["names_reprojected"], 0);
         herdr.join().expect("Herdr thread");
     }
 
