@@ -819,6 +819,102 @@ fn a_policy_rearms_with_the_next_cycle_and_a_one_shot_does_not() {
 }
 
 #[test]
+fn reconcile_after_a_completed_renew_restores_the_name_and_keeps_identity() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).expect("bind Herdr");
+    let named = serde_json::json!({
+        "type":"session_snapshot",
+        "snapshot":{"protocol":20,"panes":[{
+            "pane_id":"w:p1","terminal_id":"term-1","cwd":"/tmp/work"
+        }],"agents":[{
+            "terminal_id":"term-1","pane_id":"w:p1","name":"worker",
+            "agent":"opencode","interactive_ready":true,"launch_pending":false,
+            "agent_session":"after-renew"
+        }]}
+    });
+    let server = thread::spawn(move || {
+        let exchanges = [
+            (
+                "ping",
+                serde_json::json!({"type":"pong","version":"test","protocol":20}),
+            ),
+            (
+                "session.snapshot",
+                serde_json::json!({
+                    "type":"session_snapshot",
+                    "snapshot":{"protocol":20,"panes":[{
+                        "pane_id":"w:p1","terminal_id":"term-1","cwd":"/tmp/work"
+                    }],"agents":[{
+                        "terminal_id":"term-1","pane_id":"w:p1","agent":"opencode",
+                        "interactive_ready":true,"launch_pending":false,
+                        "agent_session":"after-renew"
+                    }]}
+                }),
+            ),
+            (
+                "agent.rename",
+                serde_json::json!({
+                    "type":"agent_info","agent":{
+                        "terminal_id":"term-1","pane_id":"w:p1","name":"worker",
+                        "agent":"opencode"
+                    }
+                }),
+            ),
+            ("session.snapshot", named.clone()),
+            ("session.snapshot", named),
+        ];
+        for (method, result) in exchanges {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut line)
+                .expect("read request");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("request JSON");
+            assert_eq!(request["method"], method);
+            serde_json::to_writer(
+                &mut stream,
+                &serde_json::json!({"id":request["id"],"result":result}),
+            )
+            .expect("write response");
+            stream.write_all(b"\n").expect("finish response");
+        }
+    });
+    let mut store = Store::in_memory().expect("store");
+    let worker = ready(
+        &mut store,
+        "worker",
+        "w:p1",
+        "term-1",
+        "renew-reproject",
+        "opencode",
+    );
+    let renew = store
+        .create_renew(&renew_intent(&worker, None))
+        .expect("renew");
+    armed_prepare(&mut store, &worker, renew);
+    store.mark_renew_ready(renew).expect("ready to clear");
+    store
+        .mark_renew_clearing(renew, "\"before-renew\"", far_clear_deadline(), None)
+        .expect("clearing");
+    store.mark_renew_injected(renew).expect("injected");
+    assert_eq!(store.complete_renew(renew).expect("complete"), None);
+    let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+
+    let report = kelpie.recover().expect("reconcile after renew");
+    assert_eq!(report.names_reprojected, 1);
+    assert_eq!(report.incarnations_marked_lost, 0);
+    assert_eq!(
+        kelpie
+            .store()
+            .incarnation_state(worker.incarnation_id)
+            .expect("incarnation"),
+        kelpie::domain::IncarnationState::Ready
+    );
+    server.join().expect("server");
+}
+
+#[test]
 fn one_incarnation_cannot_be_cleared_by_two_rules_at_once() {
     let mut store = Store::in_memory().expect("store");
     let worker = ready(&mut store, "worker", "w:p1", "term-1", "start", "claude");

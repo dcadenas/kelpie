@@ -20,18 +20,19 @@ Every Ready Kelpie alias MUST equal the live Herdr agent name. Named
 occupants are adopted under that exact name. Unnamed occupants persist adopt
 intent, claim a cwd-basename name through Herdr `agent.rename` (one
 pane-derived suffix if that basename is taken; never `adopted-`), and become
-Ready only after a fresh snapshot shows the claimed name. Recovery requires
-that same live name.
+Ready only after a fresh snapshot shows the claimed name. A later missing name
+is projection drift: recovery restores it when the recorded seat still matches.
 
 Kelpie also performs targeted lazy adoption. A command that needs the calling
 pane's identity adopts that exact live occupant when no Ready binding exists.
-If that pane, terminal, and backend already record a unique lost, unknown,
+If that pane and terminal already record a unique lost, unknown,
 declared, or failed incarnation, the adoption continues that logical agent and
 keeps its recorded alias. Several continuable agents, a live-name mismatch, or
-a starting occupant fail closed. An alias-addressed tell or ask
-may adopt one unique unnamed live agent whose working-directory basename
-derives to that alias. Ambiguous matches fail closed. This does not scan or
-silently adopt the rest of the Herdr fleet.
+a starting occupant fail closed. Backend changes do not change logical identity.
+An alias-addressed tell or ask may continue one unique unnamed live agent on a
+recorded seat. It may use a working-directory basename to create an identity
+only when the alias has no prior claimant. Ambiguous matches fail closed. This
+does not scan or silently adopt the rest of the Herdr fleet.
 
 ## Why not only Herdr plugin hooks
 

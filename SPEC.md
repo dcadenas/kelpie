@@ -84,7 +84,7 @@ Authority MUST be singular for each concern:
 | Concern | Authority |
 | --- | --- |
 | Live terminals, processes, topology, cwd, and observed agent state | Herdr |
-| Logical agent identity and parentage | Kelpie |
+| Logical agent identity, desired public name, and parentage | Kelpie |
 | Agent incarnation and coordination operation identity | Kelpie |
 | Backend-native conversation reference as currently observed | Herdr |
 | Association of that reference with a logical incarnation | Kelpie |
@@ -96,6 +96,13 @@ Authority MUST be singular for each concern:
 
 Kelpie MUST query or subscribe to Herdr for present runtime facts. It MUST NOT
 maintain an independent opinion about whether a terminal or process is alive.
+The Herdr agent name is a projection of Kelpie's desired public name. A missing
+name MUST NOT by itself invalidate a Ready binding; Kelpie MUST repair that
+projection only when the recorded pane and terminal still identify the live
+seat, the current incarnation's backend still matches, and no different live
+name claims it. A backend change ends the current incarnation but MUST NOT
+prevent automatic continuation of its logical agent on that recorded seat.
+Continuation MUST fail closed when more than one logical agent matches the seat.
 
 ## System boundary
 
@@ -840,23 +847,25 @@ auto-adoption is out of scope.
 
 Kelpie MAY perform targeted lazy adoption when a command needs an unbound
 calling pane or addresses a missing alias. Caller adoption MUST select the
-exact pane and observed terminal. When that exact pane, terminal, and backend
-kind already record a unique `lost`, `unknown`, `declared`, or `failed`
+exact pane and observed terminal. When that exact pane and terminal already
+record a unique `lost`, `unknown`, `declared`, or `failed`
 incarnation, lazy caller adoption MUST continue that logical agent and MUST
 keep its recorded public name: an unnamed live occupant is claimed under that
 name, and a live name that does not equal it MUST fail closed. `declared` and
 `failed` are included so a rejected or interrupted name claim on first use can
 be retried against the same agent rather than wedging the pane. `starting`
-incarnations on the same pane and terminal, a backend mismatch, or more than
-one such logical agent MUST fail closed and name the id so the caller can pass
-an explicit `logical_agent_id` or adopt the live occupant as a new agent. When none exist, it MAY create a new logical
+incarnations on the same pane and terminal or more than one such logical agent
+MUST fail closed and name the ids so the caller can pass an explicit
+`logical_agent_id`. A backend change MUST NOT prevent continuation. When none exist, it MAY create a new logical
 agent. Lazy caller adoption MUST NOT mint a new logical agent while a
 continuable prior incarnation occupies that exact pane and terminal, MUST NOT
 replace the continued agent's alias with a working-directory basename, and
 MUST NOT continue under a public name another logical agent still holds
 unresolved obligations on. Recipient adoption MUST require exactly one
-unnamed, non-launch-pending live agent whose working-directory basename derives
-to the requested alias. Ambiguous or absent matches MUST fail closed. Targeted
+unnamed, non-launch-pending live agent. If its recorded seat has a unique
+continuable identity, recipient adoption MUST continue it. A working-directory
+basename MAY create a new identity only when the alias has no prior claimant.
+Ambiguous or absent matches MUST fail closed. Targeted
 lazy adoption MUST use the normal durable adoption contract below and MUST NOT
 scan and adopt unrelated live agents.
 

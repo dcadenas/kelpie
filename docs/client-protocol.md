@@ -607,12 +607,15 @@ and neither message is attributed to the asker or the responder. Authenticated
 or capability-bearing transports must validate the requester claim above Kelpie
 before invoking this method.
 
-`recover` negotiates Herdr compatibility, obtains a fresh authoritative
-snapshot, and reconciles durable state without retrying ambiguous effects. A
-previously Ready incarnation becomes Lost when the snapshot no longer contains
-its exact pane, terminal, backend kind, and public name. A recorded native
-agent session must still match when present. This preserves the logical
-identity, messages, obligations, and recorded working directory.
+`recover` negotiates Herdr compatibility and obtains a fresh authoritative
+snapshot. A missing Herdr name on the recorded pane and terminal is repairable
+projection drift: Kelpie records the intent, restores its desired name through
+`agent.rename`, confirms it with another snapshot, and reports the count as
+`names_reprojected`. A present different name fails closed. A missing seat or
+backend replacement marks the incarnation Lost, but a later adoption on the
+same recorded seat continues its logical agent without requiring the backend to
+match. Native sessions are refreshed observations. Recovery preserves logical
+identity, messages, obligations, and the recorded working directory.
 
 `kelpie` is the local client. Ordinary use is typed (`kelpie tell NAME --stdin`,
 `kelpie ask NAME --file PATH [--due-at-ms MS]`, `kelpie reply ASK --final --stdin`,

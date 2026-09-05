@@ -80,6 +80,13 @@ The compiled points are test infrastructure, not a public operational API:
   independently `succeeded`/`ready`; a structured `agent.prompt` acceptance for
   the initial tell has been decoded; its separate operation remains `pending`,
   its attempt and delivery remain `submitted`, and no reply obligation exists.
+- `name_projection_after_intent_before_write`: the desired name repair is
+  durable in `pending_rename_to`, a Herdr connection exists, and no
+  `agent.rename` request byte has been written.
+- `name_projection_after_write_before_response`: the complete `agent.rename`
+  request has been written and flushed, while no response has been decoded.
+- `name_projection_after_response_before_commit`: Herdr accepted the projected
+  name, while the durable repair intent remains pending.
 - `clear_after_submitted_before_write`: the standalone clear operation, its
   pre-clear session reference, and its request attempt are durable; the attempt
   is `submitted`; a Herdr connection exists; and no clear-command byte has been
@@ -122,6 +129,11 @@ before its local commit. On restart, an exact authoritative Ready snapshot
 reconciles the original operation to `succeeded` without replay. A snapshot
 showing only the still-launching identity cannot prove the outcome and preserves
 it as `unknown`, also without replay.
+
+The name-projection process-kill test proves the pre-write boundary sends no
+bytes. Recovery retries only when a fresh snapshot proves the desired name is
+still absent. At either later boundary, a fresh snapshot showing the projected
+name commits the pending repair without another `agent.rename`.
 
 The ask pre-write process-kill test proves the prompt connection receives zero
 bytes before `SIGKILL`. On restart, the fresh snapshot cannot prove terminal

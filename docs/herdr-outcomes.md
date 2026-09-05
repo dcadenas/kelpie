@@ -66,12 +66,12 @@ those are the same process continuing. Herdr knows which one occurred; protocol
 20 does not expose that, and Kelpie reads snapshots rather than subscribing, so
 a rotation and a replacement look identical from outside.
 
-Kelpie therefore treats a changed reference as a stale record, not as absence:
-when the pane, terminal, backend kind, and public name still match, the
-incarnation stays Ready and the recorded reference is replaced with the reported
-one. `recover` reports the count as `native_sessions_refreshed`. Requiring the
-reference to match instead cost 52 live agents their identity and their
-obligations over five days.
+Kelpie therefore treats a changed reference as a stale record, not as absence.
+When the pane, terminal, backend, and desired name still match, the incarnation
+stays Ready and the recorded session observation is refreshed. A missing name
+is repaired rather than treated as absence. `recover` reports changed references
+as `native_sessions_refreshed`. A later runtime in the recorded seat can
+continue the logical identity even when its backend changed.
 
 ## Retirement
 

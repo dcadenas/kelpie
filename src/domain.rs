@@ -297,9 +297,11 @@ pub struct StartIntent {
 /// Explicit adoption of an already-running Herdr agent without `agent.start`.
 ///
 /// Fail-closed exact selector is `pane_id` + `expected_terminal_id`. Optional
-/// fields further constrain the snapshot match. Create-new vs continue mirrors
-/// [`StartIntent`]: absent [`Self::logical_agent_id`] allocates a new logical
-/// agent; a set id continues that exact identity and preserves its history.
+/// fields further constrain the snapshot match. A set
+/// [`Self::logical_agent_id`] continues that exact identity. When it is absent,
+/// adoption still continues a unique recoverable identity previously recorded
+/// on the same pane and terminal; only a seat with no prior identity allocates a
+/// new logical agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdoptIntent {
     pub pane_id: String,
@@ -308,7 +310,7 @@ pub struct AdoptIntent {
     /// When absent, adopt uses the observed Herdr name or a cwd-derived claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_name: Option<String>,
-    /// Exact logical agent to continue, or `None` for create-new intent.
+    /// Exact logical agent to continue, or `None` to infer from the recorded seat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_agent_id: Option<LogicalAgentId>,
     /// Used only for create-new logical agents.

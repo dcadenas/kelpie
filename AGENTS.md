@@ -126,12 +126,14 @@ explicitly. Do not rename them to match the package.
   `reply_to`.
 - **Fail closed on ambiguity.** Adoption, alias resolution, and reply correlation
   all reject ambiguous or mismatched matches rather than guessing.
-- **A binding is pane + terminal + backend kind + public name.** The
-  backend-native session reference is deliberately *not* part of it. It
-  identifies a conversation, which a live agent rotates on clear, resume,
-  compaction, or fork; requiring it to match read those rotations as runtime
-  replacement and de-addressed live agents. Reconciliation refreshes the
-  recorded reference instead. Do not reintroduce the check.
+- **A binding is anchored by its pane + terminal seat.** Kelpie owns the desired
+  public name and projects it into Herdr; a missing Herdr name is drift to repair,
+  while a present different name fails closed. Backend kind and the native
+  session reference are runtime evidence, not logical-identity preconditions.
+  A backend change ends the current incarnation but does not prevent the same
+  logical agent from continuing in a new incarnation on that recorded seat.
+  A native-session rotation keeps the current incarnation and refreshes the
+  recorded observation.
 - **Recovery is idempotent.** Repeating it against unchanged durable + Herdr state
   produces no new external effects.
 
