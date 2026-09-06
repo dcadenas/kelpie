@@ -958,15 +958,16 @@ Using that session as a continuation key is allowed only after the recorded
 seat is gone. When a fresh snapshot has no exact pane and terminal for a Ready
 binding, recovery marks it lost, then MUST continue the same logical agent
 onto a live occupant whose native session id equals the last recorded session
-of that logical agent's newest incarnation, when that incarnation is
-continuable (`lost`, `unknown`, `declared`, or `failed`), if and only if that
+on a continuable incarnation of that agent (`lost`, `unknown`, `declared`, or
+`failed` — the newest such row that carries a session), if and only if that
 match is unique, the live Herdr name equals the agent's alias or the occupant
 is unnamed, and no other Ready or starting incarnation or active socket waiter
-already holds that alias. Two logical agents that would continue under the same alias
-in one pass MUST both fail closed.
-A logical agent MUST NOT gain a second Ready incarnation from this pass. A
-newest incarnation that is `retiring`, `retired`, or `superseded` MUST NOT
-continue from an older row. The new incarnation MUST bind
+already holds that alias. Two logical agents that would continue under the same
+alias in one pass MUST both fail closed. A logical agent MUST NOT gain a
+second Ready incarnation from this pass. A newest incarnation that is
+`ready`, `starting`, `retiring`, `retired`, or `superseded` MUST NOT continue
+from an older row. A newer `failed` or `unknown` row with no session MUST NOT
+hide an older continuable session. The new incarnation MUST bind
 the live pane and terminal, MUST copy `backend_args` and requested
 model/provider/effort from the continuable row, and MUST record an operator
 notice. Recovery MUST NOT call `agent.start` or type a backend resume command;

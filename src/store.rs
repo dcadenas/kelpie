@@ -1,6 +1,6 @@
 //! SQLite-backed durable intent, messaging, and obligation state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8202,29 +8202,46 @@ impl Store {
     #[allow(clippy::too_many_lines)]
     fn continue_restored_occupants(&mut self, snapshot: &Snapshot) -> Result<usize, StoreError> {
         let newest = self.newest_incarnation_rows()?;
-        let continuable: Vec<&ContinuableSessionRow> = newest
+        let blocked: HashSet<String> = newest
             .iter()
             .filter(|row| {
-                row.delivery_transport != "socket_inbox"
-                    && row.session_id.is_some()
-                    && matches!(
+                row.delivery_transport == "socket_inbox"
+                    || matches!(
                         row.state.as_str(),
-                        "lost" | "unknown" | "declared" | "failed"
+                        "ready" | "starting" | "retiring" | "retired" | "superseded"
                     )
             })
+            .map(|row| row.logical_agent_id.clone())
             .collect();
-        if continuable.is_empty() {
+        let session_rows = self.continuable_session_rows()?;
+        let mut last_by_agent: HashMap<String, &ContinuableSessionRow> = HashMap::new();
+        for row in &session_rows {
+            if blocked.contains(&row.logical_agent_id) {
+                continue;
+            }
+            last_by_agent
+                .entry(row.logical_agent_id.clone())
+                .and_modify(|current| {
+                    if (row.created_at_ms, row.incarnation_id.as_str())
+                        > (current.created_at_ms, current.incarnation_id.as_str())
+                    {
+                        *current = row;
+                    }
+                })
+                .or_insert(row);
+        }
+        if last_by_agent.is_empty() {
             return Ok(0);
         }
         let ready_seats = self.ready_seat_keys()?;
         let mut ready_agents = self.ready_logical_agent_ids()?;
         let ready_aliases = self.ready_alias_owners()?;
         let mut last_by_session: HashMap<String, Vec<&ContinuableSessionRow>> = HashMap::new();
-        for row in continuable {
+        for row in last_by_agent.values() {
             let Some(session_id) = row.session_id.clone() else {
                 continue;
             };
-            last_by_session.entry(session_id).or_default().push(row);
+            last_by_session.entry(session_id).or_default().push(*row);
         }
         let mut live_by_session: HashMap<String, Vec<&crate::herdr::AgentObservation>> =
             HashMap::new();
@@ -8391,6 +8408,48 @@ impl Store {
         }
         tx.commit()?;
         Ok(continued)
+    }
+
+    fn continuable_session_rows(&self) -> Result<Vec<ContinuableSessionRow>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.id, i.logical_agent_id, l.public_name, l.delivery_transport,
+                    i.herdr_session, i.backend_args_json, i.working_directory,
+                    i.requested_model, i.requested_provider, i.requested_effort,
+                    i.observed_pane_id, i.observed_terminal_id,
+                    i.observed_native_session_json, i.created_at_ms, i.state
+             FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state IN ('lost', 'unknown', 'declared', 'failed')
+               AND i.observed_native_session_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let session_json: Option<String> = row.get(12)?;
+            Ok(ContinuableSessionRow {
+                incarnation_id: row.get(0)?,
+                logical_agent_id: row.get(1)?,
+                public_name: row.get(2)?,
+                delivery_transport: row.get(3)?,
+                herdr_session: row.get(4)?,
+                backend_args_json: row.get(5)?,
+                working_directory: row.get(6)?,
+                requested_model: row.get(7)?,
+                requested_provider: row.get(8)?,
+                requested_effort: row.get(9)?,
+                observed_pane_id: row.get(10)?,
+                observed_terminal_id: row.get(11)?,
+                session_id: session_json.as_deref().and_then(native_session_id_stored),
+                created_at_ms: row.get(13)?,
+                state: row.get(14)?,
+            })
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            let row = row?;
+            if row.delivery_transport != "socket_inbox" && row.session_id.is_some() {
+                values.push(row);
+            }
+        }
+        Ok(values)
     }
 
     fn newest_incarnation_rows(&self) -> Result<Vec<ContinuableSessionRow>, StoreError> {
@@ -13718,6 +13777,47 @@ mod tests {
                 .expect("unique"),
             starting.incarnation_id
         );
+    }
+
+    #[test]
+    fn recovery_continues_after_a_failed_restart_using_the_last_session() {
+        let mut store = Store::in_memory().expect("store");
+        let original = ready_with_session(&mut store, "restore-failed-restart", Some("sess-a"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        let mut restart = intent("worker", "term-2", "restore-failed-restart-2");
+        restart.pane_id = "w2:p1".into();
+        restart.logical_agent_id = Some(original.logical_agent_id);
+        let failed = store.declare_start(&restart).expect("restart");
+        store
+            .begin_attempt(
+                failed.operation_id,
+                failed.incarnation_id,
+                "restore-failed-restart-2",
+            )
+            .expect("attempt");
+        store
+            .mark_rejected(
+                failed.operation_id,
+                failed.incarnation_id,
+                "herdr rejected",
+                DeliveryOutcome::Rejected,
+            )
+            .expect("failed");
+        let report = store
+            .reconcile(&snapshot_of(restored_to("sess-a", "term-restored")))
+            .expect("restore");
+        assert_eq!(report.incarnations_continued, 1);
+        let ready = store
+            .resolve_ready_incarnation(original.logical_agent_id)
+            .expect("addressable");
+        assert_ne!(ready, original.incarnation_id);
+        assert_ne!(ready, failed.incarnation_id);
     }
 
     #[test]
