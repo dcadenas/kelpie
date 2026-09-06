@@ -8330,7 +8330,7 @@ impl Store {
                     &tx,
                     now,
                     &format!(
-                        "recovery did not continue logical agent {logical_agent_id} ({}): alias already bound to a ready agent",
+                        "recovery did not continue logical agent {logical_agent_id} ({}): alias already bound to a live or starting agent",
                         source.public_name
                     ),
                 )?;
@@ -8449,7 +8449,12 @@ impl Store {
             "SELECT l.public_name, l.id
              FROM logical_agents l
              JOIN incarnations i ON i.logical_agent_id = l.id
-             WHERE i.state = 'ready'",
+             WHERE i.state IN ('starting', 'ready')
+             UNION
+             SELECT i.pending_rename_to, l.id
+             FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state = 'ready' AND i.pending_rename_to IS NOT NULL",
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -13617,6 +13622,56 @@ mod tests {
         assert!(
             bodies.iter().any(|body| body.contains("socket waiter")),
             "{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_continue_onto_an_alias_a_starting_agent_holds() {
+        let mut store = Store::in_memory().expect("store");
+        let original = ready_with_session(&mut store, "restore-starting-orig", Some("sess-a"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose original");
+        let mut start_intent = intent("worker", "term-2", "restore-starting-repl");
+        start_intent.pane_id = "w2:p1".into();
+        let starting = store.declare_start(&start_intent).expect("start");
+        store
+            .begin_attempt(
+                starting.operation_id,
+                starting.incarnation_id,
+                "restore-starting-repl",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(starting.operation_id, 1, "restore-starting-repl")
+            .expect("submitted");
+        let mut starting_live = observed_agent("term-2");
+        starting_live.pane_id = "w2:p1".into();
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![restored_to("sess-a", "term-restored"), starting_live],
+            })
+            .expect("recover");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(report.starts_recovered, 1);
+        assert_eq!(
+            store
+                .find_ready_alias("worker")
+                .expect("unique alias")
+                .map(|(agent, _)| agent),
+            Some(starting.logical_agent_id)
+        );
+        assert_eq!(
+            store
+                .incarnation_state(original.incarnation_id)
+                .expect("original"),
+            crate::domain::IncarnationState::Lost
         );
     }
 
