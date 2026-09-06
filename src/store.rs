@@ -8475,9 +8475,10 @@ impl Store {
     }
 
     fn ready_logical_agent_ids(&self) -> Result<Vec<String>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT DISTINCT logical_agent_id FROM incarnations WHERE state = 'ready'")?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT logical_agent_id FROM incarnations
+                 WHERE state IN ('starting', 'ready')",
+        )?;
         let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -13672,6 +13673,50 @@ mod tests {
                 .incarnation_state(original.incarnation_id)
                 .expect("original"),
             crate::domain::IncarnationState::Lost
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_continue_an_agent_that_already_has_a_starting_incarnation() {
+        let mut store = Store::in_memory().expect("store");
+        let original = ready_with_session(&mut store, "restore-self-start", Some("sess-a"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        let mut restart = intent("worker", "term-2", "restore-self-start-2");
+        restart.pane_id = "w2:p1".into();
+        restart.logical_agent_id = Some(original.logical_agent_id);
+        let starting = store.declare_start(&restart).expect("restart");
+        store
+            .begin_attempt(
+                starting.operation_id,
+                starting.incarnation_id,
+                "restore-self-start-2",
+            )
+            .expect("attempt");
+        store
+            .mark_submitted(starting.operation_id, 1, "restore-self-start-2")
+            .expect("submitted");
+        let mut starting_live = observed_agent("term-2");
+        starting_live.pane_id = "w2:p1".into();
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![restored_to("sess-a", "term-restored"), starting_live],
+            })
+            .expect("recover");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(report.starts_recovered, 1);
+        assert_eq!(
+            store
+                .resolve_ready_incarnation(original.logical_agent_id)
+                .expect("unique"),
+            starting.incarnation_id
         );
     }
 
