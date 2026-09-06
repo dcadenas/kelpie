@@ -8237,7 +8237,13 @@ impl Store {
             };
             live_by_session.entry(session_id).or_default().push(agent);
         }
+        let waiter_aliases = self.active_waiter_aliases()?;
         let now = now_millis()?;
+        let mut pending: Vec<(
+            &crate::herdr::AgentObservation,
+            &ContinuableSessionRow,
+            &str,
+        )> = Vec::new();
         let tx = self.connection.transaction()?;
         let mut continued = 0;
         for (session_id, occupants) in &live_by_session {
@@ -8274,6 +8280,48 @@ impl Store {
             if live_name.is_some_and(|name| name != source.public_name) {
                 continue;
             }
+            // Session id is a continuation key only after the recorded seat is
+            // gone. A backend or name change on the same pane and terminal is
+            // not a Herdr restore.
+            if source.observed_pane_id.as_deref() == Some(agent.pane_id.as_str())
+                && source.observed_terminal_id.as_deref() == Some(agent.terminal_id.as_str())
+            {
+                continue;
+            }
+            pending.push((agent, source, backend_kind));
+        }
+        let mut alias_claimants: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, source, _) in &pending {
+            let ids = alias_claimants
+                .entry(source.public_name.clone())
+                .or_default();
+            if !ids.iter().any(|id| id == &source.logical_agent_id) {
+                ids.push(source.logical_agent_id.clone());
+            }
+        }
+        for (agent, source, backend_kind) in pending {
+            let logical_agent_id = &source.logical_agent_id;
+            let claimants = alias_claimants
+                .get(&source.public_name)
+                .cloned()
+                .unwrap_or_default();
+            if claimants.len() >= 2 {
+                insert_restore_notice(
+                    &tx,
+                    now,
+                    &format!(
+                        "recovery did not continue alias {}: {} logical agents match ({})",
+                        source.public_name,
+                        claimants.len(),
+                        {
+                            let mut ids = claimants;
+                            ids.sort();
+                            ids.join(", ")
+                        }
+                    ),
+                )?;
+                continue;
+            }
             if ready_aliases
                 .iter()
                 .any(|(name, owner)| name == &source.public_name && owner != logical_agent_id)
@@ -8288,12 +8336,18 @@ impl Store {
                 )?;
                 continue;
             }
-            // Session id is a continuation key only after the recorded seat is
-            // gone. A backend or name change on the same pane and terminal is
-            // not a Herdr restore.
-            if source.observed_pane_id.as_deref() == Some(agent.pane_id.as_str())
-                && source.observed_terminal_id.as_deref() == Some(agent.terminal_id.as_str())
+            if waiter_aliases
+                .iter()
+                .any(|name| name == &source.public_name)
             {
+                insert_restore_notice(
+                    &tx,
+                    now,
+                    &format!(
+                        "recovery did not continue logical agent {logical_agent_id} ({}): alias already bound to a socket waiter",
+                        source.public_name
+                    ),
+                )?;
                 continue;
             }
             let incarnation_id = IncarnationId::new();
@@ -8375,6 +8429,17 @@ impl Store {
                 state: row.get(14)?,
             })
         })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn active_waiter_aliases(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT public_name FROM logical_agents
+             WHERE delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -13465,6 +13530,93 @@ mod tests {
             store
                 .resolve_ready_incarnation(declared.logical_agent_id)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_continue_two_lost_agents_that_share_an_alias() {
+        let mut store = Store::in_memory().expect("store");
+        let first = ready_with_session(&mut store, "restore-share-a", Some("sess-a"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose first");
+        let mut second_intent = intent("worker", "term-2", "restore-share-b");
+        second_intent.pane_id = "w2:p1".into();
+        let second = store.declare_start(&second_intent).expect("second");
+        store
+            .begin_attempt(
+                second.operation_id,
+                second.incarnation_id,
+                "restore-share-b",
+            )
+            .expect("attempt");
+        let mut live = observed_agent("term-2");
+        live.pane_id = "w2:p1".into();
+        live.agent_session = Some(serde_json::json!({"value": "sess-b"}));
+        store
+            .accept_start_ready(second.operation_id, second.incarnation_id, &live, None)
+            .expect("ready second");
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose second");
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![
+                    unnamed_at("sess-a", "w1:p1", "term-x"),
+                    unnamed_at("sess-b", "w2:p1", "term-y"),
+                ],
+            })
+            .expect("both restored");
+        assert_eq!(report.incarnations_continued, 0);
+        assert!(store.find_ready_alias("worker").expect("alias").is_none());
+        let bodies = notice_bodies(&store);
+        assert!(
+            bodies.iter().any(|body| {
+                body.contains(&first.logical_agent_id.to_string())
+                    && body.contains(&second.logical_agent_id.to_string())
+            }),
+            "{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_continue_onto_an_alias_a_socket_waiter_holds() {
+        let mut store = Store::in_memory().expect("store");
+        let original = ready_with_session(&mut store, "restore-waiter", Some("sess-a"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        store
+            .register_socket_waiter("worker", Parent::Parentless, "restore-waiter-key")
+            .expect("waiter");
+        let report = store
+            .reconcile(&snapshot_of(unnamed_at("sess-a", "w1:p1", "term-x")))
+            .expect("restore");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(
+            store
+                .incarnation_state(original.incarnation_id)
+                .expect("lost"),
+            crate::domain::IncarnationState::Lost
+        );
+        let bodies = notice_bodies(&store);
+        assert!(
+            bodies.iter().any(|body| body.contains("socket waiter")),
+            "{bodies:?}"
         );
     }
 

@@ -961,7 +961,9 @@ onto a live occupant whose native session id equals the last recorded session
 of that logical agent's newest incarnation, when that incarnation is
 continuable (`lost`, `unknown`, `declared`, or `failed`), if and only if that
 match is unique, the live Herdr name equals the agent's alias or the occupant
-is unnamed, and no other Ready incarnation already holds that alias.
+is unnamed, and no other Ready incarnation or active socket waiter already
+holds that alias. Two logical agents that would continue under the same alias
+in one pass MUST both fail closed.
 A logical agent MUST NOT gain a second Ready incarnation from this pass. A
 newest incarnation that is `retiring`, `retired`, or `superseded` MUST NOT
 continue from an older row. The new incarnation MUST bind
