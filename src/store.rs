@@ -319,6 +319,8 @@ pub struct RecoveryReport {
     pub retirements_completed: usize,
     pub retirements_still_live: usize,
     pub incarnations_marked_lost: usize,
+    /// Unique lost agents continued onto Herdr-restored occupants by session id.
+    pub incarnations_continued: usize,
     /// Ready bindings whose recorded conversation reference was stale and
     /// replaced with the live one. A rotation, not a loss.
     pub native_sessions_refreshed: usize,
@@ -335,6 +337,24 @@ struct RecoveryCandidate {
     terminal_id: String,
     intent_json: String,
     attempted: bool,
+}
+
+#[derive(Debug)]
+struct ContinuableSessionRow {
+    incarnation_id: String,
+    logical_agent_id: String,
+    public_name: String,
+    delivery_transport: String,
+    herdr_session: String,
+    backend_args_json: String,
+    working_directory: String,
+    requested_model: Option<String>,
+    requested_provider: Option<String>,
+    requested_effort: Option<String>,
+    observed_pane_id: Option<String>,
+    observed_terminal_id: Option<String>,
+    session_id: Option<String>,
+    created_at_ms: i64,
 }
 
 /// One durable operator-inbox entry.
@@ -8170,6 +8190,200 @@ impl Store {
         Ok(())
     }
 
+    /// Continue unique lost agents onto Herdr-restored occupants.
+    ///
+    /// A backend-native session is attribution while the recorded seat is still
+    /// Ready. After that seat is gone, the same session id may identify the
+    /// revived occupant. Ambiguous, unnamed-mismatch, socket-inbox, and
+    /// already-bound cases fail closed and never call `agent.start`.
+    #[allow(clippy::too_many_lines)]
+    fn continue_restored_occupants(&mut self, snapshot: &Snapshot) -> Result<usize, StoreError> {
+        let continuable = self.continuable_session_rows()?;
+        if continuable.is_empty() {
+            return Ok(0);
+        }
+        let ready_seats = self.ready_seat_keys()?;
+        let ready_agents = self.ready_logical_agent_ids()?;
+        let mut live_by_session: HashMap<String, Vec<&crate::herdr::AgentObservation>> =
+            HashMap::new();
+        for agent in &snapshot.agents {
+            if agent.launch_pending {
+                continue;
+            }
+            let Some(session_id) = native_session_id_value(agent.agent_session.as_ref()) else {
+                continue;
+            };
+            live_by_session.entry(session_id).or_default().push(agent);
+        }
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        let mut continued = 0;
+        for (session_id, occupants) in &live_by_session {
+            let matches: Vec<&ContinuableSessionRow> = continuable
+                .iter()
+                .filter(|row| row.session_id.as_ref() == Some(session_id))
+                .collect();
+            let mut logical_ids = Vec::new();
+            for row in &matches {
+                if !logical_ids
+                    .iter()
+                    .any(|existing| existing == &row.logical_agent_id)
+                {
+                    logical_ids.push(row.logical_agent_id.clone());
+                }
+            }
+            if occupants.len() != 1 || logical_ids.len() != 1 {
+                if logical_ids.len() >= 2 {
+                    insert_restore_notice(
+                        &tx,
+                        now,
+                        &ambiguous_restore_notice(occupants, &logical_ids),
+                    )?;
+                }
+                continue;
+            }
+            let agent = occupants[0];
+            let logical_agent_id = &logical_ids[0];
+            let seat = (agent.pane_id.as_str(), agent.terminal_id.as_str());
+            if ready_seats
+                .iter()
+                .any(|key| key.0 == seat.0 && key.1 == seat.1)
+                || ready_agents.iter().any(|id| id == logical_agent_id)
+            {
+                continue;
+            }
+            let Some(backend_kind) = agent.agent.as_deref().filter(|kind| !kind.is_empty()) else {
+                continue;
+            };
+            let Some(source) = matches
+                .iter()
+                .filter(|row| &row.logical_agent_id == logical_agent_id)
+                .max_by(|left, right| {
+                    left.created_at_ms
+                        .cmp(&right.created_at_ms)
+                        .then(left.incarnation_id.cmp(&right.incarnation_id))
+                })
+            else {
+                return Err(StoreError::InvalidRecord(
+                    "unique session match had no source incarnation".into(),
+                ));
+            };
+            let live_name = agent.name.as_deref().filter(|name| !name.is_empty());
+            if live_name.is_some_and(|name| name != source.public_name) {
+                continue;
+            }
+            // Session id is a continuation key only after the recorded seat is
+            // gone. A backend or name change on the same pane and terminal is
+            // not a Herdr restore.
+            if source.observed_pane_id.as_deref() == Some(agent.pane_id.as_str())
+                && source.observed_terminal_id.as_deref() == Some(agent.terminal_id.as_str())
+            {
+                continue;
+            }
+            let incarnation_id = IncarnationId::new();
+            let native_session_json = agent.agent_session.as_ref().map(ToString::to_string);
+            tx.execute(
+                "INSERT INTO incarnations (
+                    id, logical_agent_id, herdr_session, intended_pane_id,
+                    expected_terminal_id, observed_pane_id, observed_terminal_id,
+                    backend_kind, backend_args_json, working_directory, created_at_ms, state,
+                    name_authority, observed_native_session_json,
+                    requested_model, requested_provider, requested_effort
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ready', 'observed', ?12, ?13, ?14, ?15)",
+                params![
+                    incarnation_id.to_string(),
+                    logical_agent_id,
+                    source.herdr_session,
+                    agent.pane_id,
+                    agent.terminal_id,
+                    agent.pane_id,
+                    agent.terminal_id,
+                    backend_kind,
+                    source.backend_args_json,
+                    source.working_directory,
+                    now,
+                    native_session_json,
+                    source.requested_model,
+                    source.requested_provider,
+                    source.requested_effort,
+                ],
+            )?;
+            insert_restore_notice(
+                &tx,
+                now,
+                &format!(
+                    "recovery continued logical agent {logical_agent_id} ({}) onto pane {} terminal {} as incarnation {incarnation_id}",
+                    source.public_name, agent.pane_id, agent.terminal_id
+                ),
+            )?;
+            continued += 1;
+        }
+        tx.commit()?;
+        Ok(continued)
+    }
+
+    fn continuable_session_rows(&self) -> Result<Vec<ContinuableSessionRow>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.id, i.logical_agent_id, l.public_name, l.delivery_transport,
+                    i.herdr_session, i.backend_args_json, i.working_directory,
+                    i.requested_model, i.requested_provider, i.requested_effort,
+                    i.observed_pane_id, i.observed_terminal_id,
+                    i.observed_native_session_json, i.created_at_ms
+             FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state IN ('lost', 'unknown', 'declared', 'failed')
+               AND i.observed_native_session_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ContinuableSessionRow {
+                incarnation_id: row.get(0)?,
+                logical_agent_id: row.get(1)?,
+                public_name: row.get(2)?,
+                delivery_transport: row.get(3)?,
+                herdr_session: row.get(4)?,
+                backend_args_json: row.get(5)?,
+                working_directory: row.get(6)?,
+                requested_model: row.get(7)?,
+                requested_provider: row.get(8)?,
+                requested_effort: row.get(9)?,
+                observed_pane_id: row.get(10)?,
+                observed_terminal_id: row.get(11)?,
+                session_id: native_session_id_stored(row.get::<_, String>(12)?.as_str()),
+                created_at_ms: row.get(13)?,
+            })
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            let row = row?;
+            if row.delivery_transport != "socket_inbox" && row.session_id.is_some() {
+                values.push(row);
+            }
+        }
+        Ok(values)
+    }
+
+    fn ready_seat_keys(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT observed_pane_id, observed_terminal_id
+             FROM incarnations
+             WHERE state = 'ready'
+               AND observed_pane_id IS NOT NULL
+               AND observed_terminal_id IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn ready_logical_agent_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT logical_agent_id FROM incarnations WHERE state = 'ready'")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Reconcile interrupted operations against one fresh Herdr snapshot.
     ///
     /// This method never causes an external effect. An attempted start succeeds
@@ -8177,6 +8391,9 @@ impl Store {
     /// Ready incarnations remain bound to their recorded seat. A missing name is
     /// projection drift for the caller to repair; a present different name or
     /// incompatible runtime observation marks the binding lost.
+    /// After a recorded seat is gone, a unique native-session match against a
+    /// continuable incarnation continues that logical agent onto the revived
+    /// occupant. That is not a Herdr write and not fleet auto-adoption.
     /// Attempted prompts become `unknown` because a snapshot cannot prove
     /// terminal-input delivery. Intents with no attempt remain pending.
     ///
@@ -8231,8 +8448,10 @@ impl Store {
         let now = now_millis()?;
         let (incarnations_marked_lost, native_sessions_refreshed) =
             self.reconcile_ready_incarnations(snapshot)?;
+        let incarnations_continued = self.continue_restored_occupants(snapshot)?;
         let mut report = RecoveryReport {
             incarnations_marked_lost,
+            incarnations_continued,
             native_sessions_refreshed,
             outcomes_marked_unknown: self.reconcile_missed_due_wakes(now)?,
             ..RecoveryReport::default()
@@ -8983,6 +9202,50 @@ fn parse_observed_field(
             "invalid observed field status {status}"
         ))),
     }
+}
+
+fn native_session_id_value(value: Option<&serde_json::Value>) -> Option<String> {
+    value?
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn native_session_id_stored(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    native_session_id_value(Some(&value))
+}
+
+fn insert_restore_notice(tx: &Transaction<'_>, now: i64, body: &str) -> Result<(), StoreError> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operator_notices WHERE body = ?1)",
+        [body],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
+        params![OperatorNoticeId::new().to_string(), body, now],
+    )?;
+    Ok(())
+}
+
+fn ambiguous_restore_notice(
+    occupants: &[&crate::herdr::AgentObservation],
+    logical_ids: &[String],
+) -> String {
+    let mut ids = logical_ids.to_vec();
+    ids.sort();
+    let (pane, terminal) = occupants.first().map_or(("-", "-"), |agent| {
+        (agent.pane_id.as_str(), agent.terminal_id.as_str())
+    });
+    format!(
+        "recovery did not continue native session onto pane {pane} terminal {terminal}: {} logical agents match ({})",
+        ids.len(),
+        ids.join(", ")
+    )
 }
 
 /// Whether a live observation is this incarnation's exact binding.
@@ -12760,6 +13023,235 @@ mod tests {
         }
     }
 
+    fn restored_to(session: &str, terminal: &str) -> crate::herdr::AgentObservation {
+        let mut agent = rotated_to(session);
+        agent.terminal_id = terminal.into();
+        agent
+    }
+
+    fn notice_bodies(store: &Store) -> Vec<String> {
+        store
+            .operator_notices()
+            .expect("notices")
+            .into_iter()
+            .map(|notice| notice.body)
+            .collect()
+    }
+
+    fn incarnation_args(store: &Store, incarnation_id: IncarnationId) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT backend_args_json FROM incarnations WHERE id = ?1",
+                [incarnation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("args")
+    }
+
+    fn ready_with_recipe(store: &mut Store, key: &str, session: &str) -> DeclaredStart {
+        let mut start = intent("worker", "term-1", key);
+        start.backend_args = vec!["--dangerously-skip-permissions".into()];
+        start.requested_model = Some("claude-opus-5".into());
+        start.requested_provider = Some("anthropic".into());
+        start.requested_effort = Some("high".into());
+        let declared = store.declare_start(&start).expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, key)
+            .expect("attempt");
+        let mut agent = observed_agent("term-1");
+        agent.agent_session = Some(serde_json::json!({"value": session}));
+        store
+            .accept_start_ready(declared.operation_id, declared.incarnation_id, &agent, None)
+            .expect("ready");
+        declared
+    }
+
+    #[test]
+    fn recovery_continues_a_unique_lost_agent_onto_a_restored_session() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_recipe(&mut store, "restore-unique", "sess-1");
+        let report = store
+            .reconcile(&snapshot_of(restored_to("sess-1", "term-restored")))
+            .expect("reconcile");
+        assert_eq!(report.incarnations_marked_lost, 1);
+        assert_eq!(report.incarnations_continued, 1);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("lost predecessor"),
+            crate::domain::IncarnationState::Lost
+        );
+        let continued = store
+            .resolve_ready_incarnation(declared.logical_agent_id)
+            .expect("addressable");
+        assert_ne!(continued, declared.incarnation_id);
+        assert_eq!(
+            incarnation_args(&store, continued),
+            incarnation_args(&store, declared.incarnation_id)
+        );
+        let requested = store.requested_attribution(continued).expect("requested");
+        assert_eq!(requested.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(requested.provider.as_deref(), Some("anthropic"));
+        assert_eq!(requested.effort.as_deref(), Some("high"));
+        let bodies = notice_bodies(&store);
+        assert!(
+            bodies.iter().any(|body| {
+                body.contains(&declared.logical_agent_id.to_string())
+                    && body.contains("term-restored")
+                    && body.contains("continued")
+            }),
+            "{bodies:?}"
+        );
+        let again = store
+            .reconcile(&snapshot_of(restored_to("sess-1", "term-restored")))
+            .expect("idempotent");
+        assert_eq!(again.incarnations_continued, 0);
+        assert_eq!(notice_bodies(&store).len(), bodies.len());
+    }
+
+    #[test]
+    fn recovery_does_not_continue_two_lost_rows_with_the_same_session() {
+        let mut store = Store::in_memory().expect("store");
+        let first = ready_with_session(&mut store, "restore-amb-1", Some("sess-1"));
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose first");
+        let second = store
+            .declare_start(&intent("other", "term-1", "restore-amb-2"))
+            .expect("second");
+        store
+            .begin_attempt(second.operation_id, second.incarnation_id, "restore-amb-2")
+            .expect("attempt");
+        let mut agent = observed_agent("term-1");
+        agent.name = Some("other".into());
+        agent.agent_session = Some(serde_json::json!({"value": "sess-1"}));
+        store
+            .accept_start_ready(second.operation_id, second.incarnation_id, &agent, None)
+            .expect("ready");
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose second");
+        let report = store
+            .reconcile(&snapshot_of(restored_to("sess-1", "term-restored")))
+            .expect("reconcile");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(
+            store
+                .incarnation_state(first.incarnation_id)
+                .expect("first"),
+            crate::domain::IncarnationState::Lost
+        );
+        assert_eq!(
+            store
+                .incarnation_state(second.incarnation_id)
+                .expect("second"),
+            crate::domain::IncarnationState::Lost
+        );
+        let bodies = notice_bodies(&store);
+        assert!(
+            bodies.iter().any(|body| {
+                body.contains(&first.logical_agent_id.to_string())
+                    && body.contains(&second.logical_agent_id.to_string())
+                    && body.contains("did not continue")
+            }),
+            "{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_continues_an_unnamed_restored_occupant() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_session(&mut store, "restore-unnamed", Some("sess-1"));
+        let mut agent = restored_to("sess-1", "term-restored");
+        agent.name = None;
+        let report = store.reconcile(&snapshot_of(agent)).expect("reconcile");
+        assert_eq!(report.incarnations_continued, 1);
+        assert_eq!(
+            store
+                .agent_address(declared.logical_agent_id)
+                .expect("alias"),
+            "worker"
+        );
+        store
+            .resolve_ready_incarnation(declared.logical_agent_id)
+            .expect("addressable");
+    }
+
+    #[test]
+    fn recovery_does_not_continue_when_the_live_name_differs() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_session(&mut store, "restore-name", Some("sess-1"));
+        let mut agent = restored_to("sess-1", "term-restored");
+        agent.name = Some("stranger".into());
+        let report = store.reconcile(&snapshot_of(agent)).expect("reconcile");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+        assert!(
+            store
+                .resolve_ready_incarnation(declared.logical_agent_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_continue_an_occupant_without_a_session() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_session(&mut store, "restore-bare", Some("sess-1"));
+        let mut agent = restored_to("sess-1", "term-restored");
+        agent.agent_session = None;
+        let report = store.reconcile(&snapshot_of(agent)).expect("reconcile");
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+    }
+
+    #[test]
+    fn a_same_seat_rotation_is_not_a_restored_continuation() {
+        let mut store = Store::in_memory().expect("store");
+        ready_with_session(&mut store, "restore-rotate", Some("first"));
+        let report = store
+            .reconcile(&snapshot_of(rotated_to("second")))
+            .expect("reconcile");
+        assert_eq!(report.incarnations_marked_lost, 0);
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(report.native_sessions_refreshed, 1);
+    }
+
+    #[test]
+    fn recovery_does_not_continue_a_backend_change_on_the_same_seat() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_session(&mut store, "restore-backend", Some("sess-1"));
+        let mut agent = rotated_to("sess-1");
+        agent.agent = Some("claude".into());
+        let report = store.reconcile(&snapshot_of(agent)).expect("reconcile");
+        assert_eq!(report.incarnations_marked_lost, 1);
+        assert_eq!(report.incarnations_continued, 0);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+    }
+
     #[test]
     fn recovery_uses_exact_snapshot_and_never_retries() {
         let mut store = Store::in_memory().expect("store");
@@ -12800,6 +13292,7 @@ mod tests {
                 retirements_completed: 0,
                 retirements_still_live: 0,
                 incarnations_marked_lost: 0,
+                incarnations_continued: 0,
                 native_sessions_refreshed: 0,
                 names_reprojected: 0,
             }
