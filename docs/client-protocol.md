@@ -634,8 +634,12 @@ projection drift: Kelpie records the intent, restores its desired name through
 `names_reprojected`. A present different name fails closed. A missing seat or
 backend replacement marks the incarnation Lost, but a later adoption on the
 same recorded seat continues its logical agent without requiring the backend to
-match. Native sessions are refreshed observations. Recovery preserves logical
-identity, messages, obligations, and the recorded working directory.
+match. Native sessions are refreshed observations while the seat remains
+Ready. After that seat is gone, a unique native-session match continues the
+same logical agent onto the Herdr-restored occupant and reports the count as
+`incarnations_continued`. Recovery preserves logical identity, messages,
+obligations, and the recorded working directory. It does not auto-adopt agents
+Kelpie never bound.
 
 `kelpie` is the local client. Ordinary use is typed (`kelpie tell NAME --stdin`,
 `kelpie ask NAME --file PATH [--due-at-ms MS]`, `kelpie reply ASK --final --stdin`,

@@ -653,8 +653,16 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   records repair intent, restores the desired name, and confirms it. A present
   different name fails closed. A backend replacement ends the current
   incarnation but does not prevent a new incarnation from continuing the same
-  logical agent on that seat. Native sessions are refreshed observations. Exact
-  seat absence is required to complete retirement.
+  logical agent on that seat. Native sessions are attribution while the seat
+  is still Ready; a rotation there refreshes the record and is not
+  continuation. After the recorded seat is gone, a unique match between a
+  continuable incarnation's last native session id and a live occupant
+  continues that logical agent onto the revived pane and terminal when the
+  live name equals the alias or the occupant is unnamed. Ambiguous matches,
+  a different live name, a bare shell, a socket waiter, and
+  retiring/retired/superseded rows fail closed. That is restoration of an
+  identity Kelpie already bound, not fleet auto-adoption. Exact seat absence
+  is required to complete retirement.
 - `notice.create` and `notice.list`: write and inspect durable operator notices.
 
 Read `docs/client-protocol.md` and `SPEC.md` in the release for exact fields.

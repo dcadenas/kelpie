@@ -70,8 +70,11 @@ Kelpie therefore treats a changed reference as a stale record, not as absence.
 When the pane, terminal, backend, and desired name still match, the incarnation
 stays Ready and the recorded session observation is refreshed. A missing name
 is repaired rather than treated as absence. `recover` reports changed references
-as `native_sessions_refreshed`. A later runtime in the recorded seat can
-continue the logical identity even when its backend changed.
+as `native_sessions_refreshed`. After a Herdr restore replaces the terminal, the
+recorded seat is gone and that same session id is a unique continuation key:
+`recover` reports those restorations as `incarnations_continued`. A later
+runtime in the recorded seat can continue the logical identity even when its
+backend changed.
 
 ## Retirement
 

@@ -5569,6 +5569,7 @@ fn recover_result(report: crate::store::RecoveryReport) -> Value {
         "retirements_completed": report.retirements_completed,
         "retirements_still_live": report.retirements_still_live,
         "incarnations_marked_lost": report.incarnations_marked_lost,
+        "incarnations_continued": report.incarnations_continued,
         "native_sessions_refreshed": report.native_sessions_refreshed,
         "names_reprojected": report.names_reprojected
     })
