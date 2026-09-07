@@ -4217,6 +4217,21 @@ impl Kelpie {
             .map_err(SliceError::Store)
     }
 
+    /// Increase an owned reminder interval without shortening its deadline.
+    ///
+    /// # Errors
+    /// Returns a conflict for a decrease, invalid ownership, or terminal policy.
+    pub fn increase_reminder_interval(
+        &mut self,
+        requester: LogicalAgentId,
+        ask: MessageId,
+        every_ms: i64,
+    ) -> Result<(), SliceError> {
+        self.store
+            .increase_reminder_interval(requester, ask, every_ms)
+            .map_err(SliceError::Store)
+    }
+
     /// Permanently disable one owned obligation's reminders without resolving it.
     ///
     /// # Errors

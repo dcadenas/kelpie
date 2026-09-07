@@ -454,6 +454,7 @@ fn build_typed(
         Command::ReminderSnooze {
             ask_id,
             until_ms,
+            for_ms,
             requester,
         } => {
             let agent = resolve_caller(socket, requester, request_id)?.0;
@@ -462,7 +463,22 @@ fn build_typed(
                 json!({
                     "requester_agent_id": agent,
                     "ask_message_id": ask_id,
-                    "until_ms": until_ms
+                    "until_ms": until_ms,
+                    "for_ms": for_ms
+                }),
+            ))
+        }
+        Command::ReminderInterval {
+            ask_id,
+            every_ms,
+            requester,
+        } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            Ok((
+                "reminder.interval".into(),
+                json!({
+                    "requester_agent_id": agent, "ask_message_id": ask_id,
+                    "every_ms": every_ms
                 }),
             ))
         }

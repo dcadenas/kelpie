@@ -237,7 +237,7 @@ renew prepare/resume prompts live on the renew row and MUST NOT be projected as
 a tell body. Listing is read-only and MUST NOT create, fire, or rewrite a
 schedule.
 
-Every ask creates a correlated pending-reply reminder with a five-minute
+Every ask creates a correlated pending-reply reminder with a twenty-minute
 default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
 disables automatic nudges for that ask. The interval begins only after Herdr
 accepts the ask. When overdue, `kelpied` obtains a fresh snapshot and injects
@@ -245,11 +245,28 @@ only if the exact owing incarnation is `idle` or `done`. Progress resets the
 interval. A recorded final whose delivery is `queued`, `submitted`,
 `accepted`, or `unknown` holds both interval and boundary injection until
 that delivery terminals. Rejected and `target_unavailable` finals may be
-reminded again. If an unanswered receiver first works and then reaches `idle` or
-`done`, the stopped boundary can trigger the initial reminder before the
-interval. Final reply resolution stops reminders. `reminder-snooze <ask-id>
---until-ms MS` pauses injection, and `reminder-disable <ask-id>` stops it without
-resolving the ask.
+reminded again. Becoming idle never bypasses the due time. Final reply resolution
+and cancellation stop reminders. The owing receiver can use
+`reminder-snooze <ask-id> --for 2h` or `--until-ms MS` (mutually exclusive), or
+`reminder-interval <ask-id> --every 40m` to increase spacing. Durations accept
+positive integer `s`, `m`, `h`, or `d` units. The client sends `for_ms` to
+`reminder.snooze`; the daemon resolves it against its clock. `reminder.interval`
+accepts `requester_agent_id`, `ask_message_id`, and positive `every_ms`.
+Decreases are rejected; an equal interval is an idempotent no-op. An increase
+retains later deadlines and snoozes and schedules no earlier than one new
+interval from now. Progress preserves snoozes. After expiry, the stored interval
+continues. `reminder-disable <ask-id>` stops reminders without resolving the ask.
+Mutation receipts and `ask-info` expose `reminder.interval_ms`,
+`reminder.snoozed_until_ms`, `reminder.next_eligible_at_ms`, and disabled/suspended
+state. Eligibility is a timing threshold, not a promise of delivery: live
+readiness, in-flight finals, and delivery safeguards still apply. A submitted
+reminder cannot be retracted by snoozing.
+
+On database upgrade, enabled five-minute policies migrate once to twenty
+minutes. Their next eligibility is no earlier than twenty minutes after the
+migration, retaining later deadlines and snoozes. Other intervals, disabled
+policies, and obligations are unchanged. Unarmed policies arm on acceptance.
+
 Agent-facing prompt text uses compact HTML-like envelopes (not NDJSON):
 
 ```text

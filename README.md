@@ -140,8 +140,9 @@ loop: two agents, addressed by name, with the delivery recorded.
 ## What you get
 
 - **Durable asks.** A reply obligation lives in SQLite, not in a context
-  window. It survives restarts and is reminded at working-to-idle boundaries;
-  it can be snoozed or disabled per ask.
+  window. It survives restarts and gets reminders after twenty minutes by
+  default, delivered only when idle or done. Receivers can snooze an ask or
+  increase its reminder interval.
 - **Honest delivery.** Every message records whether it was accepted, rejected,
   or is unknown. An unknown is never retried blindly.
 - **Addressability.** Adopt an agent that lost its binding — same identity,

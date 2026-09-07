@@ -331,7 +331,8 @@ kelpie reply <ask-id> --progress --stdin <<'EOF'
 working
 EOF
 kelpie pending
-kelpie reminder-snooze <ask-id> --until-ms 1770000000000
+kelpie reminder-snooze <ask-id> --for 2h
+kelpie reminder-interval <ask-id> --every 40m
 kelpie reminder-disable <ask-id>
 kelpie recover
 kelpie who
@@ -530,11 +531,18 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   `pending` and `ask.info` are not the socket-waiter receive path.
 - `ask`: same recipient shape as `tell`, delivered immediately; a due time is
   refused. Every ask
-  creates a five-minute pending-reply reminder by default. Use
+  creates a twenty-minute pending-reply reminder by default. Use
   `remind_after_ms` to override it or `no_remind: true` for the explicit
-  exception. The first working-to-idle/done boundary can trigger an earlier
-  reminder when no progress or final reply was sent. Keep the returned message
+  exception. Becoming idle never bypasses the reminder due time. Keep the returned message
   ID; it identifies the durable reply obligation.
+- `reminder-snooze`: only the owing receiver can postpone an open ask. Use
+  `--for 2h` or `--until-ms MS`, never both. Relative durations accept positive
+  integers in `s`, `m`, `h`, or `d`; the daemon resolves the deadline.
+- `reminder-interval`: `--every 40m` increases an owned ask's stored interval;
+  decreases are rejected. An increase preserves later deadlines and snoozes.
+  Progress replies preserve snoozes; expiry resumes normal reminders. Receipts
+  and `ask-info` expose effective timing under `reminder`. Snoozing cannot retract
+  a reminder already submitted. Disabled policies stay disabled.
 - `ask-info`: re-read an ask by message ID, including its original body,
   parties, obligation state, current delivery outcome, and every progress or
   final reply with its current delivery outcome.

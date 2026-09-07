@@ -138,7 +138,13 @@ pub enum Command {
     },
     ReminderSnooze {
         ask_id: String,
-        until_ms: i64,
+        until_ms: Option<i64>,
+        for_ms: Option<i64>,
+        requester: Option<Caller>,
+    },
+    ReminderInterval {
+        ask_id: String,
+        every_ms: i64,
         requester: Option<Caller>,
     },
     ReminderDisable {
@@ -607,7 +613,8 @@ Commands:
   notice (--stdin | --file PATH | --body TEXT)
   notices
   cancel <ask-id> --reason TEXT
-  reminder-snooze <ask-id> --until-ms MS
+  reminder-snooze <ask-id> (--until-ms MS | --for DURATION)
+  reminder-interval <ask-id> --every DURATION
   reminder-disable <ask-id>
   retire --incarnation ID [--close-pane]
   waiter-register --name NAME (--parentless | --parent-id ID)
@@ -703,6 +710,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         "cancel" => parse_cancel(args),
         "reminder-snooze" => parse_reminder_snooze(args),
+        "reminder-interval" => parse_reminder_interval(args),
         "reminder-disable" => parse_reminder_disable(args),
         "retire" => parse_retire(&args[1..]),
         other => Err(format!("unknown command {other}")),
@@ -1030,15 +1038,24 @@ fn parse_schedules(args: &[String]) -> Result<Command, String> {
 fn parse_reminder_snooze(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(&args[1..]);
     let requester = take_caller(&mut tokens)?;
-    let until = tokens
-        .take_value("--until-ms")?
-        .ok_or("missing --until-ms")?;
+    let until = tokens.take_value("--until-ms")?;
+    let duration = tokens.take_value("--for")?;
+    if until.is_some() == duration.is_some() {
+        return Err("provide exactly one of --until-ms or --for".into());
+    }
     let until_ms = until
-        .parse::<i64>()
-        .map_err(|_| "--until-ms must be a non-negative integer".to_string())?;
-    if until_ms < 0 {
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| "--until-ms must be a non-negative integer".to_string())
+        })
+        .transpose()?;
+    if until_ms.is_some_and(|value| value < 0) {
         return Err("--until-ms must be a non-negative integer".into());
     }
+    let for_ms = duration
+        .map(|value| parse_duration_for("--for", &value))
+        .transpose()?;
     let ask_id = tokens
         .take_positional()
         .ok_or("usage: kelpie reminder-snooze <ask-id> --until-ms MS")?;
@@ -1046,6 +1063,21 @@ fn parse_reminder_snooze(args: &[String]) -> Result<Command, String> {
     Ok(Command::ReminderSnooze {
         ask_id,
         until_ms,
+        for_ms,
+        requester,
+    })
+}
+
+fn parse_reminder_interval(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let requester = take_caller(&mut tokens)?;
+    let every = tokens.take_value("--every")?.ok_or("missing --every")?;
+    let every_ms = parse_duration_for("--every", &every)?;
+    let ask_id = tokens.take_positional().ok_or("missing ask id")?;
+    tokens.finish("reminder-interval")?;
+    Ok(Command::ReminderInterval {
+        ask_id,
+        every_ms,
         requester,
     })
 }
@@ -2073,6 +2105,18 @@ fn render_ask_info(result: &Value) -> String {
             .as_i64()
             .map_or("?".into(), format_utc_ms),
     );
+    if result["reminder"].is_object() {
+        let reminder = &result["reminder"];
+        let _ = write!(
+            text,
+            "\n  reminder interval_ms={} snoozed_until_ms={} next_eligible_at_ms={} disabled_at_ms={} suspended_at_ms={}",
+            reminder["interval_ms"],
+            reminder["snoozed_until_ms"],
+            reminder["next_eligible_at_ms"],
+            reminder["disabled_at_ms"],
+            reminder["suspended_at_ms"]
+        );
+    }
     if let Some(reason) = result["cancellation_reason"].as_str() {
         let _ = write!(text, "\n  cancellation-reason {reason}");
     }
@@ -2429,6 +2473,40 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn reminder_durations_and_exclusive_deadlines() {
+        for duration in ["1s", "20m", "2h", "1d"] {
+            assert!(
+                parse_invocation(&args(&["reminder-snooze", "ask", "--for", duration])).is_ok()
+            );
+            assert!(
+                parse_invocation(&args(&["reminder-interval", "ask", "--every", duration])).is_ok()
+            );
+        }
+        for duration in ["0m", "-1h", "1.5h", "1w", "999999999999999999999d"] {
+            assert!(
+                parse_invocation(&args(&["reminder-snooze", "ask", "--for", duration])).is_err()
+            );
+            assert!(
+                parse_invocation(&args(&["reminder-interval", "ask", "--every", duration]))
+                    .is_err()
+            );
+        }
+        assert!(
+            parse_invocation(&args(&[
+                "reminder-snooze",
+                "ask",
+                "--for",
+                "2h",
+                "--until-ms",
+                "1000"
+            ]))
+            .is_err()
+        );
+        assert!(parse_invocation(&args(&["reminder-snooze", "ask"])).is_err());
+        assert!(parse_invocation(&args(&["reminder-snooze", "ask", "--until-ms", "1000"])).is_ok());
     }
 
     #[test]

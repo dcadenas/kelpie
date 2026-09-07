@@ -284,28 +284,36 @@ fn idle_exact_incarnation_receives_correlated_reminder() {
 }
 
 #[test]
-fn first_working_to_stopped_boundary_is_eligible_before_timeout() {
+fn working_to_idle_never_bypasses_due_time() {
     let mut store = Store::in_memory().expect("store");
-    let (ask, _) = accepted_reminder_ask(&mut store, 300_000);
-    let now = store_clock_ms().expect("clock");
-    let boundary = store
-        .boundary_reminders(now)
-        .expect("initial boundary")
-        .remove(0);
-    assert!(!boundary.saw_working);
-    assert!(store.due_reminders(now).expect("not timed out").is_empty());
-
+    let (ask, _) = accepted_reminder_ask(&mut store, 1_200_000);
+    let due = store
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
     store
-        .observe_reminder_lifecycle(ask.message_id, true, now)
-        .expect("observe working");
-    let stopped = store
-        .boundary_reminders(now)
-        .expect("stopped boundary")
-        .remove(0);
-    assert!(stopped.saw_working);
+        .observe_reminder_lifecycle(ask.message_id, true, due - 1)
+        .unwrap();
+    assert!(store.boundary_reminders(due - 1).unwrap().is_empty());
+    assert_eq!(store.next_boundary_check_at_ms().unwrap(), Some(due));
+    assert!(store.due_reminders(due - 1).unwrap().is_empty());
+    let reminder = store.due_reminders(due).unwrap().remove(0);
+    assert!(
+        store
+            .prepare_reminder_attempt(&reminder, "early", due - 1)
+            .is_err()
+    );
     store
-        .prepare_reminder_attempt(&stopped.reminder, "boundary-reminder", now)
-        .expect("boundary can remind before timeout");
+        .prepare_reminder_attempt(&reminder, "on-time", due)
+        .unwrap();
+    store.submit_reminder_attempt("on-time").unwrap();
+    store
+        .resolve_reminder_attempt("on-time", "accepted", None, due)
+        .unwrap();
+    assert!(store.due_reminders(due + 1_200_000 - 1).unwrap().is_empty());
+    assert_eq!(store.due_reminders(due + 1_200_000).unwrap().len(), 1);
 }
 
 fn accept_ask(
@@ -456,4 +464,331 @@ fn rejected_final_allows_reminders_again() {
         store.obligation_state(ask.message_id).expect("state"),
         ObligationState::Open
     );
+}
+
+#[test]
+fn receiver_increase_and_snooze_survive_progress_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.sqlite3");
+    let mut store = Store::open(&db).unwrap();
+    let (ask, owing) = accepted_reminder_ask(&mut store, 1_200_000);
+    let wrong = kelpie::domain::LogicalAgentId::new();
+    let until = store_clock_ms().unwrap() + 7_200_000;
+    assert!(store.snooze_reminder(wrong, ask.message_id, until).is_err());
+    assert!(
+        store
+            .increase_reminder_interval(wrong, ask.message_id, 2_400_000)
+            .is_err()
+    );
+    assert!(
+        store
+            .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 600_000)
+            .is_err()
+    );
+    store
+        .snooze_reminder(owing.logical_agent_id, ask.message_id, until)
+        .unwrap();
+    store
+        .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+        .unwrap();
+    let before = store.reminder_info(ask.message_id).unwrap().unwrap();
+    assert_eq!(before.next_eligible_at_ms, Some(until));
+    store
+        .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+        .unwrap();
+    store
+        .create_reply(
+            ask.message_id,
+            owing.logical_agent_id,
+            "started",
+            ReplyDisposition::Progress,
+            "progress",
+        )
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&db).unwrap();
+    let timing = store.ask_info(ask.message_id).unwrap().reminder.unwrap();
+    assert_eq!(timing.interval_ms, 2_400_000);
+    assert_eq!(timing.snoozed_until_ms, Some(until));
+    assert_eq!(timing.next_eligible_at_ms, Some(until));
+    assert!(store.due_reminders(until - 1).unwrap().is_empty());
+    let reminder = store.due_reminders(until).unwrap().remove(0);
+    store
+        .prepare_reminder_attempt(&reminder, "after-snooze", until)
+        .unwrap();
+    store.submit_reminder_attempt("after-snooze").unwrap();
+    store
+        .resolve_reminder_attempt("after-snooze", "accepted", None, until)
+        .unwrap();
+    assert!(
+        store
+            .due_reminders(until + 2_400_000 - 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.due_reminders(until + 2_400_000).unwrap().len(), 1);
+}
+
+#[test]
+fn in_flight_completion_preserves_new_snooze_and_interval() {
+    let mut store = Store::in_memory().unwrap();
+    let (ask, owing) = accepted_reminder_ask(&mut store, 1);
+    let due = store
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    let reminder = store.due_reminders(due).unwrap().remove(0);
+    store
+        .prepare_reminder_attempt(&reminder, "flight", due)
+        .unwrap();
+    store.submit_reminder_attempt("flight").unwrap();
+    let until = store_clock_ms().unwrap() + 7_200_000;
+    store
+        .snooze_reminder(owing.logical_agent_id, ask.message_id, until)
+        .unwrap();
+    store
+        .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+        .unwrap();
+    store
+        .resolve_reminder_attempt("flight", "accepted", None, due)
+        .unwrap();
+    let timing = store.reminder_info(ask.message_id).unwrap().unwrap();
+    assert_eq!(timing.snoozed_until_ms, Some(until));
+    assert_eq!(timing.next_eligible_at_ms, Some(until));
+    assert!(store.due_reminders(until - 1).unwrap().is_empty());
+}
+
+#[test]
+fn prepared_reminder_is_rechecked_after_snooze() {
+    let mut store = Store::in_memory().unwrap();
+    let (ask, owing) = accepted_reminder_ask(&mut store, 1);
+    let due = store
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    let reminder = store.due_reminders(due).unwrap().remove(0);
+    store
+        .snooze_reminder(
+            owing.logical_agent_id,
+            ask.message_id,
+            store_clock_ms().unwrap() + 7_200_000,
+        )
+        .unwrap();
+    assert!(
+        store
+            .prepare_reminder_attempt(&reminder, "stale", due)
+            .is_err()
+    );
+}
+
+#[test]
+fn disabled_and_terminal_policies_cannot_be_changed() {
+    for terminal in [false, true] {
+        let mut store = Store::in_memory().unwrap();
+        let (ask, owing) = accepted_reminder_ask(&mut store, 1);
+        if terminal {
+            let reply = store
+                .create_reply(
+                    ask.message_id,
+                    owing.logical_agent_id,
+                    "done",
+                    ReplyDisposition::Final,
+                    "final",
+                )
+                .unwrap();
+            store
+                .begin_attempt(
+                    reply.operation_id.unwrap(),
+                    reply.recipient_incarnation.unwrap(),
+                    "reply",
+                )
+                .unwrap();
+            store
+                .mark_submitted(reply.operation_id.unwrap(), 1, "reply")
+                .unwrap();
+            store
+                .accept_delivery(
+                    reply.operation_id.unwrap(),
+                    reply.recipient_incarnation.unwrap(),
+                    "w:p1",
+                    "term-1",
+                )
+                .unwrap();
+        } else {
+            store
+                .disable_reminder(owing.logical_agent_id, ask.message_id)
+                .unwrap();
+        }
+        assert!(
+            store
+                .snooze_reminder(
+                    owing.logical_agent_id,
+                    ask.message_id,
+                    store_clock_ms().unwrap() + 7_200_000
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+                .is_err()
+        );
+        assert!(
+            store
+                .reminder_info(ask.message_id)
+                .unwrap()
+                .unwrap()
+                .next_eligible_at_ms
+                .is_none()
+        );
+        assert!(store.due_reminders(i64::MAX).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn initial_start_ask_arms_twenty_minute_default_on_acceptance() {
+    let mut store = Store::in_memory().unwrap();
+    let sender = ready(&mut store, "sender", "w:p1", "term-1", "sender");
+    let owing = ready(&mut store, "owing", "w:p2", "term-2", "owing");
+    let ask = store
+        .create_initial_message(
+            owing.logical_agent_id,
+            owing.incarnation_id,
+            &InitialMessageIntent {
+                sender: Some(sender.logical_agent_id),
+                kind: InitialMessageKind::Ask,
+                body: "work".into(),
+            },
+            "initial",
+        )
+        .unwrap();
+    let timing = store.reminder_info(ask.message_id).unwrap().unwrap();
+    assert_eq!(timing.interval_ms, 1_200_000);
+    assert!(timing.next_eligible_at_ms.is_none());
+    store
+        .begin_attempt(ask.operation_id, owing.incarnation_id, "initial-request")
+        .unwrap();
+    store
+        .mark_submitted(ask.operation_id, 1, "initial-request")
+        .unwrap();
+    let before = store_clock_ms().unwrap();
+    store
+        .accept_delivery(ask.operation_id, owing.incarnation_id, "w:p2", "term-2")
+        .unwrap();
+    let due = store
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    assert!(due >= before + 1_200_000);
+    assert!(store.due_reminders(due - 1).unwrap().is_empty());
+}
+
+#[test]
+fn migration_is_once_and_preserves_other_policies_and_obligations() {
+    for (interval, disabled) in [(300_000, false), (300_000, true), (600_000, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("migration.sqlite3");
+        let mut store = Store::open(&db).unwrap();
+        let (ask, owing) = accepted_reminder_ask(&mut store, interval);
+        if disabled {
+            store
+                .disable_reminder(owing.logical_agent_id, ask.message_id)
+                .unwrap();
+        }
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA user_version = 28").unwrap();
+        let before = store_clock_ms().unwrap();
+        drop(conn);
+        let store = Store::open(&db).unwrap();
+        let timing = store.reminder_info(ask.message_id).unwrap().unwrap();
+        assert_eq!(
+            timing.interval_ms,
+            if interval == 300_000 && !disabled {
+                1_200_000
+            } else {
+                interval
+            }
+        );
+        if interval == 300_000 && !disabled {
+            assert!(timing.next_eligible_at_ms.unwrap() >= before + 1_200_000);
+        }
+        assert_eq!(
+            store.obligation_state(ask.message_id).unwrap(),
+            ObligationState::Open
+        );
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .reminder_info(ask.message_id)
+                .unwrap()
+                .unwrap()
+                .next_eligible_at_ms,
+            timing.next_eligible_at_ms
+        );
+    }
+}
+
+#[test]
+fn interval_increase_does_not_arm_an_unaccepted_ask() {
+    let mut store = Store::in_memory().unwrap();
+    let sender = ready(&mut store, "sender", "w:p1", "term-1", "sender");
+    let owing = ready(&mut store, "owing", "w:p2", "term-2", "owing");
+    let ask = store
+        .create_ask_with_schedule(
+            sender.logical_agent_id,
+            owing.logical_agent_id,
+            owing.incarnation_id,
+            "question",
+            "unarmed",
+            None,
+            Some(1_200_000),
+            false,
+        )
+        .unwrap();
+    store
+        .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+        .unwrap();
+    assert!(
+        store
+            .reminder_info(ask.message_id)
+            .unwrap()
+            .unwrap()
+            .next_eligible_at_ms
+            .is_none()
+    );
+    assert!(store.due_reminders(i64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn migration_retains_later_deadline_and_snooze() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("later.sqlite3");
+    let mut store = Store::open(&db).unwrap();
+    let (ask, owing) = accepted_reminder_ask(&mut store, 300_000);
+    let until = store_clock_ms().unwrap() + 7_200_000;
+    store
+        .snooze_reminder(owing.logical_agent_id, ask.message_id, until)
+        .unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE obligation_reminders SET next_due_at_ms = ?1",
+        [until + 1000],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA user_version = 28").unwrap();
+    drop(conn);
+    let store = Store::open(&db).unwrap();
+    let timing = store.reminder_info(ask.message_id).unwrap().unwrap();
+    assert_eq!(timing.interval_ms, 1_200_000);
+    assert_eq!(timing.next_eligible_at_ms, Some(until + 1000));
+    assert_eq!(timing.snoozed_until_ms, Some(until));
 }

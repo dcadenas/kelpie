@@ -29,7 +29,7 @@ use crate::slice::{
 };
 use crate::store::{BoundaryReminder, DueReminder, DueRenew, PromptOperationReplay, StoreError};
 
-const DEFAULT_REMINDER_INTERVAL_MS: i64 = 300_000;
+use crate::store::DEFAULT_REMINDER_INTERVAL_MS;
 /// A client must finish sending its request line within this window.
 const CLIENT_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// Bound response writes so a stuck peer cannot freeze the loop.
@@ -4974,6 +4974,7 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
         "rename" => dispatch_rename(request.params, kelpie),
         "cancel" => dispatch_cancel(request.params, kelpie),
         "reminder.snooze" => dispatch_reminder_snooze(request.params, kelpie),
+        "reminder.interval" => dispatch_reminder_interval(request.params, kelpie),
         "reminder.disable" => dispatch_reminder_disable(request.params, kelpie),
         "notice.create" => serde_json::from_value::<NoticeParams>(request.params)
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))
@@ -5244,6 +5245,7 @@ fn dispatch_ask_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceE
         "created_at_ms": info.created_at_ms,
         "last_activity_at_ms": info.last_activity_at_ms,
         "cancellation_reason": info.cancellation_reason,
+        "reminder": info.reminder,
         "delivery": {
             "transport": info.delivery.transport,
             "outcome": info.delivery.outcome,
@@ -6706,19 +6708,53 @@ fn dispatch_cancel(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceErr
 fn dispatch_reminder_snooze(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<ReminderSnoozeParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-    kelpie.snooze_reminder(
+    let until_ms = reminder_snooze_deadline(
+        params.until_ms,
+        params.for_ms,
+        crate::store::store_clock_ms()?,
+    )?;
+    kelpie.snooze_reminder(params.requester_agent_id, params.ask_message_id, until_ms)?;
+    let reminder = kelpie.ask_info(params.ask_message_id)?.reminder;
+    Ok(serde_json::json!({"state": "snoozed", "until_ms": until_ms, "reminder": reminder}))
+}
+
+fn reminder_snooze_deadline(
+    until_ms: Option<i64>,
+    for_ms: Option<i64>,
+    now_ms: i64,
+) -> Result<i64, SliceError> {
+    let invalid = || {
+        SliceError::Store(StoreError::InvalidRecord(
+            "provide one future until_ms or positive for_ms without overflow".into(),
+        ))
+    };
+    match (until_ms, for_ms) {
+        (Some(until), None) if until > now_ms => Ok(until),
+        (None, Some(duration)) if duration > 0 => now_ms.checked_add(duration).ok_or_else(invalid),
+        _ => Err(invalid()),
+    }
+}
+
+fn dispatch_reminder_interval(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<ReminderIntervalParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    kelpie.increase_reminder_interval(
         params.requester_agent_id,
         params.ask_message_id,
-        params.until_ms,
+        params.every_ms,
     )?;
-    Ok(serde_json::json!({"state": "snoozed", "until_ms": params.until_ms}))
+    Ok(
+        serde_json::json!({"state": "interval_updated", "reminder": kelpie.ask_info(params.ask_message_id)?.reminder}),
+    )
 }
 
 fn dispatch_reminder_disable(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<ReminderDisableParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     kelpie.disable_reminder(params.requester_agent_id, params.ask_message_id)?;
-    Ok(serde_json::json!({"state": "disabled"}))
+    Ok(
+        serde_json::json!({"state": "disabled", "reminder": kelpie.ask_info(params.ask_message_id)?.reminder}),
+    )
 }
 
 fn classify_error(error: &SliceError) -> ClientError {
@@ -6816,7 +6852,15 @@ struct AskParams {
 struct ReminderSnoozeParams {
     requester_agent_id: LogicalAgentId,
     ask_message_id: MessageId,
-    until_ms: i64,
+    until_ms: Option<i64>,
+    for_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReminderIntervalParams {
+    requester_agent_id: LogicalAgentId,
+    ask_message_id: MessageId,
+    every_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7062,10 +7106,81 @@ mod tests {
     }
 
     #[test]
-    fn asks_default_to_five_minute_reminders_with_explicit_override_and_opt_out() {
+    fn reminder_mutations_return_effective_timing_and_enforce_receiver() {
+        let mut store = Store::in_memory().unwrap();
+        let sender = seed_ready(&mut store, "sender", "w:p1", "term-1", "sender");
+        let receiver = seed_ready(&mut store, "receiver", "w:p2", "term-2", "receiver");
+        let ask = store
+            .create_ask_with_schedule(
+                sender.logical_agent_id,
+                receiver.logical_agent_id,
+                receiver.incarnation_id,
+                "question",
+                "timing",
+                None,
+                Some(1_200_000),
+                false,
+            )
+            .unwrap();
+        store
+            .begin_attempt(ask.operation_id, receiver.incarnation_id, "ask")
+            .unwrap();
+        store.mark_submitted(ask.operation_id, 1, "ask").unwrap();
+        store
+            .accept_delivery(ask.operation_id, receiver.incarnation_id, "w:p2", "term-2")
+            .unwrap();
+        let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+        let params = serde_json::json!({"requester_agent_id": receiver.logical_agent_id,
+            "ask_message_id": ask.message_id, "for_ms": 7_200_000});
+        let before = crate::store::store_clock_ms().unwrap();
+        let receipt = dispatch_reminder_snooze(params, &mut kelpie).unwrap();
+        let until = receipt["until_ms"].as_i64().unwrap();
+        assert!(until >= before + 7_200_000);
+        assert_eq!(receipt["reminder"]["next_eligible_at_ms"], until);
+        let params = serde_json::json!({"requester_agent_id": receiver.logical_agent_id,
+            "ask_message_id": ask.message_id, "every_ms": 2_400_000});
+        let receipt = dispatch_reminder_interval(params.clone(), &mut kelpie).unwrap();
+        assert_eq!(receipt["reminder"]["interval_ms"], 2_400_000);
+        assert_eq!(receipt["reminder"]["snoozed_until_ms"], until);
+        assert_eq!(receipt["reminder"]["next_eligible_at_ms"], until);
+        let mut wrong = params;
+        wrong["requester_agent_id"] = serde_json::json!(sender.logical_agent_id);
+        assert!(dispatch_reminder_interval(wrong, &mut kelpie).is_err());
+        let info = dispatch_ask_info(
+            serde_json::json!({"ask_message_id": ask.message_id}),
+            &mut kelpie,
+        )
+        .unwrap();
+        assert_eq!(info["reminder"], receipt["reminder"]);
+    }
+
+    #[test]
+    fn snooze_duration_resolves_at_daemon_time_and_rejects_invalid_shapes() {
+        assert_eq!(
+            reminder_snooze_deadline(None, Some(7_200_000), 1_000).unwrap(),
+            7_201_000
+        );
+        assert_eq!(
+            reminder_snooze_deadline(Some(2_000), None, 1_000).unwrap(),
+            2_000
+        );
+        for (until, duration) in [
+            (None, None),
+            (Some(2_000), Some(1)),
+            (None, Some(0)),
+            (None, Some(-1)),
+            (None, Some(i64::MAX)),
+            (Some(999), None),
+        ] {
+            assert!(reminder_snooze_deadline(until, duration, 1_000).is_err());
+        }
+    }
+
+    #[test]
+    fn asks_default_to_twenty_minute_reminders_with_explicit_override_and_opt_out() {
         assert_eq!(
             ask_reminder_interval(&ask_params(None, false)).expect("default"),
-            Some(300_000)
+            Some(1_200_000)
         );
         assert_eq!(
             ask_reminder_interval(&ask_params(Some(600_000), false)).expect("override"),

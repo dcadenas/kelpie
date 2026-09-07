@@ -429,15 +429,23 @@ a second message beside it. An `unknown` delivery MUST NOT be resent, but it MUS
 NOT stop later intervals from materializing distinct messages.
 Kelpie MUST raise an operator notice when a schedule enters an unavailable run,
 but MUST NOT repeat that notice on every interval until a firing succeeds.
-Every ask creates a reply-reminder policy by default.
+Every ask, including a start ask, creates a reply-reminder policy with a twenty-minute default interval.
 The caller MAY explicitly disable reminders for one ask. The policy is armed
 only after the ask delivery is accepted. Reminder injection is `herdr_prompt`
 only. It MUST be injected only when a fresh Herdr snapshot proves the owing
 logical agent's exact Ready incarnation is `idle` or `done`. A `socket_inbox`
 owing agent has no Herdr pane; Kelpie MUST NOT require reminder injection for
-that owing agent. A first observed working-to-idle/done boundary MAY trigger the
-initial reminder before the interval when no reply activity has occurred.
-Progress and final-reply activity reset its interval. A recorded final reply
+that owing agent. Becoming idle MUST NOT trigger a reminder before its due time.
+Progress and final-reply activity reset its interval without shortening a later
+deadline or clearing a snooze. The owing receiver MAY snooze until an absolute
+deadline or for a positive relative duration resolved by the daemon. The receiver
+MAY increase the stored interval, but MUST NOT decrease it. An increase MUST
+schedule the next reminder no earlier than the new interval from now and MUST
+retain later deadlines and snoozes. Expired snoozes allow normal reminders at
+the stored interval. Mutation receipts and ask inspection MUST expose the
+effective interval, snooze deadline, and next eligible time. Disabled policies
+remain disabled. A snooze MUST NOT retract a submitted reminder; completion of
+that attempt MUST preserve timing changes made while it was in flight. A recorded final reply
 whose delivery is `queued`, `submitted`, `accepted`, or `unknown` MUST NOT
 receive reminder injection until that delivery terminals. Persist is not
 resolve: waiter ACK or Herdr accept remains the only resolve. Rejected and

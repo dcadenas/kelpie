@@ -16,7 +16,9 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
+/// Backstop interval for unanswered asks, including initial launch asks.
+pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 1_200_000;
 
 const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
     active_roots(logical_agent_id) AS (
@@ -413,6 +415,17 @@ pub struct AskInfo {
     pub cancellation_reason: Option<String>,
     pub delivery: MessageDeliveryInfo,
     pub replies: Vec<AskReplyInfo>,
+    pub reminder: Option<ReminderInfo>,
+}
+
+/// Stored reminder timing; eligibility still requires safe live delivery state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReminderInfo {
+    pub interval_ms: i64,
+    pub snoozed_until_ms: Option<i64>,
+    pub next_eligible_at_ms: Option<i64>,
+    pub disabled_at_ms: Option<i64>,
+    pub suspended_at_ms: Option<i64>,
 }
 
 type DeliveryRow = (String, String, i64, i64, Option<i64>, Option<i64>);
@@ -1933,6 +1946,10 @@ impl Store {
             .filter(|_| intent.kind == InitialMessageKind::Ask)
         {
             insert_obligation(&tx, message_id, recipient, sender, now)?;
+            tx.execute(
+                "INSERT INTO obligation_reminders (ask_message_id, interval_ms) VALUES (?1, ?2)",
+                params![message_id.to_string(), DEFAULT_REMINDER_INTERVAL_MS],
+            )?;
         }
         tx.execute(
             "INSERT INTO operations
@@ -5421,7 +5438,37 @@ impl Store {
             cancellation_reason: reason,
             delivery,
             replies,
+            reminder: self.reminder_info(ask_message_id)?,
         })
+    }
+
+    /// Inspect durable reminder timing without changing its obligation.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
+    pub fn reminder_info(&self, ask: MessageId) -> Result<Option<ReminderInfo>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT r.interval_ms, r.snoozed_until_ms,
+                    CASE WHEN r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
+                              AND o.state IN ('open','in_progress')
+                         THEN MAX(r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)) END,
+                    r.disabled_at_ms, r.suspended_at_ms
+             FROM obligation_reminders r JOIN obligations o ON o.ask_message_id = r.ask_message_id
+             WHERE r.ask_message_id = ?1",
+                [ask.to_string()],
+                |row| {
+                    Ok(ReminderInfo {
+                        interval_ms: row.get(0)?,
+                        snoozed_until_ms: row.get(1)?,
+                        next_eligible_at_ms: row.get(2)?,
+                        disabled_at_ms: row.get(3)?,
+                        suspended_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sql)
     }
 
     fn ask_replies(&self, ask_message_id: MessageId) -> Result<Vec<AskReplyInfo>, StoreError> {
@@ -5935,6 +5982,7 @@ impl Store {
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
                AND r.last_accepted_at_ms IS NULL
                AND r.boundary_check_at_ms IS NOT NULL AND r.boundary_check_at_ms <= ?1
+               AND r.next_due_at_ms <= ?1
                AND COALESCE(r.snoozed_until_ms, 0) <= ?1
                AND i.state = 'ready'
                AND NOT EXISTS (SELECT 1 FROM operations clear
@@ -6030,11 +6078,7 @@ impl Store {
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE r.ask_message_id = ?1 AND o.state IN ('open','in_progress')
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
-               AND (MAX(r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)) <= ?2
-                    OR (o.state = 'open' AND r.last_accepted_at_ms IS NULL
-                        AND r.saw_working_at_ms IS NOT NULL
-                        AND r.boundary_check_at_ms <= ?2
-                        AND COALESCE(r.snoozed_until_ms, 0) <= ?2))
+               AND MAX(r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)) <= ?2
                AND i.id = ?3 AND i.state = 'ready'
                {NO_IN_FLIGHT_FINAL})"
             ),
@@ -6133,9 +6177,8 @@ impl Store {
         } else {
             tx.execute(
                 "UPDATE obligation_reminders
-                 SET next_due_at_ms = ?1 + interval_ms,
+                 SET next_due_at_ms = MAX(COALESCE(next_due_at_ms, 0), ?1 + interval_ms),
                      last_accepted_at_ms = CASE WHEN ?2 = 'accepted' THEN ?1 ELSE last_accepted_at_ms END,
-                     snoozed_until_ms = NULL,
                      boundary_check_at_ms = NULL WHERE ask_message_id = ?3",
                 params![now_ms, outcome, ask],
             )?;
@@ -6234,6 +6277,43 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::Conflict(
                 "reminder is absent, disabled, terminal, or not owned by requester".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Increase reminder spacing while preserving later deadlines and snoozes.
+    ///
+    /// # Errors
+    /// Returns a conflict for invalid ownership, a decrease, or an inactive policy.
+    pub fn increase_reminder_interval(
+        &mut self,
+        requester: LogicalAgentId,
+        ask: MessageId,
+        every_ms: i64,
+    ) -> Result<(), StoreError> {
+        let now = now_millis()?;
+        let due = now
+            .checked_add(every_ms)
+            .filter(|_| every_ms > 0)
+            .ok_or_else(|| {
+                StoreError::InvalidRecord("interval must be positive without overflow".into())
+            })?;
+        let changed = self.connection.execute(
+            "UPDATE obligation_reminders
+             SET next_due_at_ms = CASE WHEN next_due_at_ms IS NULL THEN NULL
+                     WHEN interval_ms < ?1
+                     THEN MAX(COALESCE(next_due_at_ms, 0), COALESCE(snoozed_until_ms, 0), ?2)
+                     ELSE next_due_at_ms END,
+                 interval_ms = ?1
+             WHERE ask_message_id = ?3 AND interval_ms <= ?1 AND disabled_at_ms IS NULL
+               AND EXISTS (SELECT 1 FROM obligations o WHERE o.ask_message_id = ?3
+                           AND o.owing_agent_id = ?4 AND o.state IN ('open','in_progress'))",
+            params![every_ms, due, ask.to_string(), requester.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "reminder absent, disabled, terminal, not owned, or interval decreased".into(),
             ));
         }
         Ok(())
@@ -7941,7 +8021,7 @@ impl Store {
         self.connection
             .query_row(
                 &format!(
-                    "SELECT MIN(MAX(r.boundary_check_at_ms, COALESCE(r.snoozed_until_ms, 0)))
+                    "SELECT MIN(MAX(r.boundary_check_at_ms, r.next_due_at_ms, COALESCE(r.snoozed_until_ms, 0)))
                  FROM obligation_reminders r JOIN obligations o
                    ON o.ask_message_id = r.ask_message_id
                  WHERE o.state = 'open' AND r.last_accepted_at_ms IS NULL
@@ -9003,7 +9083,7 @@ fn refresh_reminder_activity(
 ) -> Result<(), StoreError> {
     tx.execute(
         "UPDATE obligation_reminders
-         SET next_due_at_ms = ?1 + interval_ms, snoozed_until_ms = NULL
+         SET next_due_at_ms = MAX(COALESCE(next_due_at_ms, 0), ?1 + interval_ms)
          WHERE ask_message_id = ?2 AND disabled_at_ms IS NULL AND suspended_at_ms IS NULL",
         params![now_ms, ask_message_id.to_string()],
     )?;
@@ -9271,6 +9351,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 27 {
         connection.execute_batch(include_str!("../migrations/028_repeating_schedules.sql"))?;
         version = 28;
+    }
+    if version == 28 {
+        connection.execute_batch(include_str!("../migrations/029_slower_reminders.sql"))?;
+        version = 29;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
