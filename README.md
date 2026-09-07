@@ -63,7 +63,7 @@ pre-release while Kelpie is alpha, so the version requirement is required —
 `cargo install` otherwise skips them.
 
 ```sh
-cargo install kelpie-herdr --version '^0.2.0-alpha.2'
+cargo install kelpie-herdr --version '^0.2.0-alpha.3'
 # or, from a checkout:
 cargo install --path .
 ```
