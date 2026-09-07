@@ -978,6 +978,13 @@ different alias, the agent is a socket waiter, or the incarnation is
 `retiring`, `retired`, or `superseded`. A same-seat session rotation is not
 continuation.
 
+kelpied MUST run that recover once Herdr's socket is reachable, then MUST retry
+it through the off-thread executor for a bounded window after bind so unique
+continue can see occupants that appear only after native restore (which waits
+for a Herdr client attach). The window is best-effort: if restore lands after
+it ends, an explicit `recover` still continues. The accept loop MUST NOT wait
+on Herdr for those retries. kelpied MUST NOT start agents.
+
 A long-lived direct Herdr socket subscription (for example `pane.agent_detected`
 and release events) MAY accelerate discovery, but MUST be bootstrapped and
 reconciled with `session.snapshot` after startup and reconnect. One-shot Herdr

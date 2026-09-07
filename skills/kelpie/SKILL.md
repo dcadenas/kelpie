@@ -662,7 +662,10 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   a different live name, a bare shell, a socket waiter, and
   retiring/retired/superseded rows fail closed. That is restoration of an
   identity Kelpie already bound, not fleet auto-adoption. Exact seat absence
-  is required to complete retirement.
+  is required to complete retirement. After bind, kelpied retries this recover
+  for two minutes so Herdr-restored agents that appear after a client attaches
+  can still unique-continue. If restore lands later, run `kelpie recover`.
+  kelpied never launches the backend.
 - `notice.create` and `notice.list`: write and inspect durable operator notices.
 
 Read `docs/client-protocol.md` and `SPEC.md` in the release for exact fields.

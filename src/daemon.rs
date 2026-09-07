@@ -38,6 +38,15 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_POLL: Duration = Duration::from_secs(1);
 const MAX_ACCEPTS_PER_POLL: usize = 16;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// How long after bind kelpied keeps retrying recover for Herdr-restored agents.
+/// Native resume often lands after a client attaches, which is later than the socket.
+const BOOT_CONTINUE_WINDOW: Duration = Duration::from_secs(120);
+/// Pause between boot recover snapshots. Recover is idempotent.
+const BOOT_CONTINUE_INTERVAL: Duration = Duration::from_secs(5);
+
+fn boot_continue_should_start(now: Instant, until: Instant, next: Instant, inflight: bool) -> bool {
+    !inflight && now < until && now >= next
+}
 
 /// One local client request. Sender fields are same-user attribution, not authentication.
 #[derive(Clone, Debug, Deserialize)]
@@ -267,6 +276,9 @@ pub struct Daemon {
     awaiting_adopts: Vec<AwaitingAdopt>,
     awaiting_renames: Vec<AwaitingRename>,
     awaiting_retires: Vec<AwaitingRetireClose>,
+    boot_continue_until: Instant,
+    boot_continue_job: Option<u64>,
+    next_boot_continue: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +292,7 @@ enum HerdrOwner {
     Adopt,
     Rename,
     Retire,
+    BootRecover,
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +484,9 @@ impl Daemon {
             awaiting_adopts: Vec::new(),
             awaiting_renames: Vec::new(),
             awaiting_retires: Vec::new(),
+            boot_continue_until: Instant::now() + BOOT_CONTINUE_WINDOW,
+            boot_continue_job: None,
+            next_boot_continue: Instant::now() + BOOT_CONTINUE_INTERVAL,
         })
     }
 
@@ -502,6 +518,8 @@ impl Daemon {
         let mut phase = PollTimer::start();
         self.drain_herdr_events();
         log_slow_phase("herdr_events", &mut phase);
+        self.schedule_boot_continue();
+        log_slow_phase("boot_continue", &mut phase);
         if let Err(error) = self.kelpie.fire_due_schedules() {
             let _ = self
                 .kelpie
@@ -600,7 +618,8 @@ impl Daemon {
             || !self.awaiting_renews.is_empty()
             || !self.awaiting_adopts.is_empty()
             || !self.awaiting_renames.is_empty()
-            || !self.awaiting_retires.is_empty())
+            || !self.awaiting_retires.is_empty()
+            || self.boot_continue_job.is_some())
     }
 
     fn accept_waiting(&mut self) -> Result<bool, DaemonError> {
@@ -2572,6 +2591,65 @@ impl Daemon {
         }
     }
 
+    fn schedule_boot_continue(&mut self) {
+        if !boot_continue_should_start(
+            Instant::now(),
+            self.boot_continue_until,
+            self.next_boot_continue,
+            self.boot_continue_job.is_some(),
+        ) {
+            return;
+        }
+        let job_id = self.alloc_job();
+        self.submit_owned(
+            HerdrJob::Snapshot {
+                job_id,
+                negotiate: true,
+            },
+            HerdrOwner::BootRecover,
+        );
+        self.boot_continue_job = Some(job_id);
+    }
+
+    fn on_boot_continue_done(&mut self, job_id: u64, result: Result<HerdrJobResult, HerdrError>) {
+        if self.boot_continue_job != Some(job_id) {
+            return;
+        }
+        self.boot_continue_job = None;
+        self.next_boot_continue = Instant::now() + BOOT_CONTINUE_INTERVAL;
+        match result {
+            Ok(HerdrJobResult::Snapshot(snapshot)) => {
+                match self.kelpie.recover_with_snapshot(&snapshot) {
+                    Ok(report) if report.incarnations_continued > 0 => {
+                        eprintln!(
+                            "kelpied: continued {} restored occupant(s)",
+                            report.incarnations_continued
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = self
+                            .kelpie
+                            .store_mut()
+                            .create_operator_notice(&format!("boot recover failed: {error}"));
+                    }
+                }
+            }
+            Ok(_) => {
+                let _ = self
+                    .kelpie
+                    .store_mut()
+                    .create_operator_notice("boot recover returned a non-snapshot Herdr result");
+            }
+            Err(error) => {
+                let _ = self
+                    .kelpie
+                    .store_mut()
+                    .create_operator_notice(&format!("boot recover failed: {error}"));
+            }
+        }
+    }
+
     fn schedule_reminders(&mut self) {
         if self.reminder_job.is_some() || !self.reminder_inflight.is_empty() {
             return;
@@ -2707,6 +2785,7 @@ impl Daemon {
                         Some(HerdrOwner::Adopt) => self.on_adopt_done(job_id, result),
                         Some(HerdrOwner::Rename) => self.on_rename_done(job_id, result),
                         Some(HerdrOwner::Retire) => self.on_retire_done(job_id, result),
+                        Some(HerdrOwner::BootRecover) => self.on_boot_continue_done(job_id, result),
                         None => {}
                     }
                 }
@@ -2736,6 +2815,9 @@ impl Daemon {
                     }
                     Some(HerdrOwner::Retire) => {
                         self.on_retire_failed(job_id, phase, error);
+                    }
+                    Some(HerdrOwner::BootRecover) => {
+                        self.on_boot_continue_done(job_id, Err(error));
                     }
                     None => {}
                 },
@@ -6930,6 +7012,17 @@ mod tests {
         };
 
         assert_eq!(elapsed.to_string(), "wall=1080ms cpu=unavailable");
+    }
+
+    #[test]
+    fn boot_continue_starts_only_inside_the_window_when_idle() {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(120);
+        let next = start + Duration::from_secs(5);
+        assert!(!boot_continue_should_start(start, until, next, false));
+        assert!(boot_continue_should_start(next, until, next, false));
+        assert!(!boot_continue_should_start(next, until, next, true));
+        assert!(!boot_continue_should_start(until, until, next, false));
     }
 
     #[test]
