@@ -792,3 +792,53 @@ fn migration_retains_later_deadline_and_snooze() {
     assert_eq!(timing.next_eligible_at_ms, Some(until + 1000));
     assert_eq!(timing.snoozed_until_ms, Some(until));
 }
+
+#[test]
+fn busy_snapshot_cannot_shorten_a_receiver_interval_increase() {
+    let mut store = Store::in_memory().unwrap();
+    let (ask, owing) = accepted_reminder_ask(&mut store, 1);
+    let due_at = store
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    let collected = store.due_reminders(due_at).unwrap();
+    assert_eq!(collected.len(), 1);
+    let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+    let before = store_clock_ms().unwrap();
+    kelpie
+        .increase_reminder_interval(owing.logical_agent_id, ask.message_id, 2_400_000)
+        .unwrap();
+    let deadline = kelpie
+        .store()
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    assert!(deadline >= before + 2_400_000);
+    // A missing/busy incarnation follows the busy deferral branch.
+    assert!(
+        kelpie
+            .reminders_after_snapshot(collected, vec![], &[])
+            .unwrap()
+            .is_empty()
+    );
+    let after = kelpie
+        .store()
+        .reminder_info(ask.message_id)
+        .unwrap()
+        .unwrap()
+        .next_eligible_at_ms
+        .unwrap();
+    assert_eq!(after, deadline);
+    assert!(
+        kelpie
+            .store()
+            .due_reminders(deadline - 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(kelpie.store().due_reminders(deadline).unwrap().len(), 1);
+}

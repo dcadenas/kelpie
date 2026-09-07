@@ -6199,7 +6199,7 @@ impl Store {
         recheck_ms: i64,
     ) -> Result<(), StoreError> {
         let changed = self.connection.execute(
-            "UPDATE obligation_reminders SET next_due_at_ms = ?1 + ?2
+            "UPDATE obligation_reminders SET next_due_at_ms = MAX(next_due_at_ms, ?1 + ?2)
              WHERE ask_message_id = ?3 AND disabled_at_ms IS NULL AND suspended_at_ms IS NULL
                AND EXISTS (SELECT 1 FROM obligations o WHERE o.ask_message_id = ?3
                            AND o.state IN ('open','in_progress'))",
