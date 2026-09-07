@@ -738,3 +738,72 @@ fn typed_start_exits_nonzero_when_initial_message_is_not_accepted() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("delivery=unknown"), "{stdout}");
 }
+
+#[test]
+fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let body = "line one\nline two\n";
+    let socket = spawn_canned_daemon(
+        directory.path(),
+        json!({
+            "result": {
+                "schedules": [
+                    {
+                        "schedule_id": "01a00000-0000-7000-8000-000000000010",
+                        "kind": "tell",
+                        "logical_agent_id": RECIPIENT,
+                        "incarnation_id": null,
+                        "interval_ms": 1_800_000,
+                        "clock": "wall",
+                        "next_fire_at_ms": 1,
+                        "cycle": 1,
+                        "state": "active",
+                        "last_outcome": null,
+                        "last_message_id": null,
+                        "requester_agent_id": SENDER,
+                        "body": body,
+                        "idempotency_key": "tell-intent-key"
+                    },
+                    {
+                        "schedule_id": "01a00000-0000-7000-8000-000000000011",
+                        "kind": "renew",
+                        "logical_agent_id": RECIPIENT,
+                        "incarnation_id": INCARNATION,
+                        "interval_ms": 2_700_000,
+                        "clock": "active",
+                        "next_fire_at_ms": 2,
+                        "cycle": 1,
+                        "state": "active",
+                        "last_outcome": null,
+                        "last_message_id": null,
+                        "requester_agent_id": SENDER,
+                        "body": null,
+                        "idempotency_key": null
+                    }
+                ]
+            }
+        }),
+    );
+    let output = run_cli(&[
+        "--socket",
+        socket.to_str().expect("sock"),
+        "--json",
+        "schedules",
+        "--sender-id",
+        SENDER,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("json");
+    let tell = &parsed["result"]["schedules"][0];
+    assert_eq!(tell["requester_agent_id"], SENDER);
+    assert_eq!(tell["body"], body);
+    assert_eq!(tell["idempotency_key"], "tell-intent-key");
+    let renew = &parsed["result"]["schedules"][1];
+    assert!(renew["body"].is_null());
+    assert!(renew["idempotency_key"].is_null());
+    assert_eq!(renew["requester_agent_id"], SENDER);
+}

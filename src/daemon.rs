@@ -4962,19 +4962,7 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
             .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))
             .and_then(|params| {
                 kelpie.store().schedules_for_agent(params.agent_id).map(|items| {
-                    serde_json::json!({"schedules": items.into_iter().map(|item| serde_json::json!({
-                        "schedule_id": item.id,
-                        "kind": item.kind,
-                        "logical_agent_id": item.logical_agent_id,
-                        "incarnation_id": item.incarnation_id,
-                        "interval_ms": item.interval_ms,
-                        "clock": item.clock,
-                        "next_fire_at_ms": item.next_fire_at_ms,
-                        "cycle": item.cycle,
-                        "state": item.state,
-                        "last_outcome": item.last_outcome,
-                        "last_message_id": item.last_message_id,
-                    })).collect::<Vec<_>>()})
+                    serde_json::json!({"schedules": items.iter().map(schedule_list_item).collect::<Vec<_>>()})
                 }).map_err(SliceError::Store)
             }),
         "reply" => dispatch_reply(request.params, kelpie),
@@ -6907,6 +6895,25 @@ struct ScheduleListParams {
     agent_id: LogicalAgentId,
 }
 
+fn schedule_list_item(item: &crate::store::ScheduleInfo) -> serde_json::Value {
+    serde_json::json!({
+        "schedule_id": item.id,
+        "kind": item.kind,
+        "logical_agent_id": item.logical_agent_id,
+        "incarnation_id": item.incarnation_id,
+        "interval_ms": item.interval_ms,
+        "clock": item.clock,
+        "next_fire_at_ms": item.next_fire_at_ms,
+        "cycle": item.cycle,
+        "state": item.state,
+        "last_outcome": item.last_outcome,
+        "last_message_id": item.last_message_id,
+        "requester_agent_id": item.requester_agent_id,
+        "body": item.body,
+        "idempotency_key": item.idempotency_key,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ReplyParams {
     reply_to: MessageId,
@@ -8777,10 +8784,20 @@ mod tests {
             },
             &mut kelpie,
         );
+        let row = &listed.result.expect("list result")["schedules"][0];
+        assert_eq!(row["schedule_id"], schedule_id);
+        assert_eq!(row["kind"], "tell");
         assert_eq!(
-            listed.result.expect("list result")["schedules"][0]["schedule_id"],
-            schedule_id
+            row["requester_agent_id"],
+            owner.logical_agent_id.to_string()
         );
+        assert_eq!(row["logical_agent_id"], owner.logical_agent_id.to_string());
+        assert_eq!(row["body"], "repeat");
+        assert_eq!(row["idempotency_key"], "schedule-rpc");
+        assert_eq!(row["state"], "active");
+        assert!(row["incarnation_id"].is_null());
+        assert!(row["last_outcome"].is_null());
+        assert!(row["last_message_id"].is_null());
         let refused = dispatch(
             ClientRequest {
                 id: "refused".into(),

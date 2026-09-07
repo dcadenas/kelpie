@@ -412,7 +412,12 @@ automatic next actions.
 
 A delivery due time is one-shot. A repeating tell schedule is bound to a logical
 agent, advances on the host wall clock, survives incarnation replacement, and is
-cancellable by its requester or target. Each firing MUST resolve the target's
+cancellable by its requester or target. `schedule.list` MUST expose stored
+repeating-tell intent for inspection: `requester_agent_id`, the exact tell
+`body`, and the creation `idempotency_key`, alongside the existing identity,
+clock, and latest-firing fields. For a renew schedule those two tell fields
+MUST be absent (`null`); the stored resume/prepare prompts MUST NOT appear as
+`body`. Listing MUST NOT create, fire, replay, or otherwise mutate a schedule. Each firing MUST resolve the target's
 current unique receive path. When none exists, the firing MUST record and report
 `target_unavailable`, MUST create no message, delivery, operation, pane,
 worktree, or runtime, and MUST continue to its next interval. Missed intervals

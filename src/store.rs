@@ -497,6 +497,12 @@ pub struct ScheduleInfo {
     pub state: String,
     pub last_outcome: Option<ScheduleFiringOutcome>,
     pub last_message_id: Option<MessageId>,
+    /// Stored requester. Present for tell and renew rows.
+    pub requester_agent_id: LogicalAgentId,
+    /// Exact stored tell prompt. `None` for renew; never a resume or prepare prompt.
+    pub body: Option<String>,
+    /// Stored creation key. `None` for renew, which has no tell idempotency key.
+    pub idempotency_key: Option<String>,
 }
 
 /// One overdue reminder whose owing agent has one exact Ready incarnation.
@@ -3307,7 +3313,8 @@ impl Store {
                     (SELECT f.outcome FROM schedule_firings f
                      WHERE f.schedule_id = s.id ORDER BY f.cycle DESC LIMIT 1),
                     (SELECT f.message_id FROM schedule_firings f
-                     WHERE f.schedule_id = s.id ORDER BY f.cycle DESC LIMIT 1)
+                     WHERE f.schedule_id = s.id ORDER BY f.cycle DESC LIMIT 1),
+                    s.requester_agent_id, s.body, s.idempotency_key
              FROM schedules s
              WHERE s.requester_agent_id = ?1 OR s.logical_agent_id = ?1
              ORDER BY s.created_at_ms, s.id",
@@ -3325,6 +3332,9 @@ impl Store {
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, Option<String>>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })?;
         rows.map(|row| {
@@ -3345,6 +3355,9 @@ impl Store {
                     .map(parse_schedule_firing_outcome)
                     .transpose()?,
                 last_message_id: row.10.as_deref().map(parse_message_id).transpose()?,
+                requester_agent_id: parse_logical_agent_id(&row.11)?,
+                body: row.12,
+                idempotency_key: row.13,
             })
         })
         .collect()
@@ -7339,7 +7352,7 @@ impl Store {
 
     /// Agents with a non-terminal newest incarnation, plus their ancestors.
     ///
-    /// The active subgraph is selected in SQLite so retired fleet history is
+    /// The active subgraph is selected in `SQLite` so retired fleet history is
     /// not decoded and discarded by the caller.
     ///
     /// # Errors
@@ -12078,6 +12091,153 @@ mod tests {
                 .due_tell_schedules(i64::MAX)
                 .expect("ended")
                 .is_empty()
+        );
+    }
+
+    fn schedule_ledger_fingerprint(store: &Store) -> (String, i64, i64, i64, i64) {
+        let ledger: String = store
+            .connection
+            .query_row(
+                "SELECT group_concat(
+                    id || ':' || kind || ':' || requester_agent_id || ':' || logical_agent_id
+                    || ':' || ifnull(body, '') || ':' || ifnull(idempotency_key, '')
+                    || ':' || interval_ms || ':' || next_fire_at_ms || ':' || cycle
+                    || ':' || state, '|'
+                 ) FROM (SELECT * FROM schedules ORDER BY id)",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("ledger")
+            .unwrap_or_default();
+        let counts: (i64, i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM messages),
+                        (SELECT COUNT(*) FROM deliveries),
+                        (SELECT COUNT(*) FROM operations),
+                        (SELECT COUNT(*) FROM obligations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("counts");
+        (ledger, counts.0, counts.1, counts.2, counts.3)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schedule_list_projects_persisted_tell_intent_without_mutation() {
+        let mut store = Store::in_memory().expect("store");
+        let sender = store
+            .declare_start(&intent("sender", "term-a", "list-sender"))
+            .expect("sender");
+        let recipient = store
+            .declare_start(&intent("recipient", "term-b", "list-recipient"))
+            .expect("recipient");
+        let stranger = store
+            .declare_start(&intent("stranger", "term-c", "list-stranger"))
+            .expect("stranger");
+        mark_ready(&mut store, recipient, "recipient", "term-b");
+        let now = store_clock_ms().expect("clock");
+        let body = "line one\nline two\n";
+        let outbound = store
+            .create_tell_schedule(
+                sender.logical_agent_id,
+                recipient.logical_agent_id,
+                body,
+                1_800_000,
+                now,
+                "tell-intent-key",
+            )
+            .expect("outbound tell");
+        let self_tell = store
+            .create_tell_schedule(
+                sender.logical_agent_id,
+                sender.logical_agent_id,
+                "self",
+                60_000,
+                now,
+                "self-tell-key",
+            )
+            .expect("self tell");
+        store
+            .cancel_schedule(self_tell.schedule_id, sender.logical_agent_id, "ended")
+            .expect("end self tell");
+        let policy = store
+            .create_renew(&RenewIntent {
+                logical_agent_id: recipient.logical_agent_id,
+                incarnation_id: recipient.incarnation_id,
+                requester_agent_id: sender.logical_agent_id,
+                prepare_prompt: "save progress to progress.md".into(),
+                resume_prompt: "read progress.md and continue".into(),
+                on_timeout: crate::domain::RenewTimeout::Abort,
+                prepare_timeout_ms: 60_000,
+                every_ms: Some(45 * 60 * 1_000),
+                scheduled_at_ms: now + 45 * 60 * 1_000,
+            })
+            .expect("renew");
+        let _ = policy;
+        let before = schedule_ledger_fingerprint(&store);
+
+        let as_sender = store
+            .schedules_for_agent(sender.logical_agent_id)
+            .expect("sender list");
+        assert_eq!(
+            as_sender.len(),
+            3,
+            "outbound tell, ended self-tell, renew requester"
+        );
+        let tell = as_sender
+            .iter()
+            .find(|item| item.id == outbound.schedule_id)
+            .expect("outbound row");
+        assert_eq!(tell.kind, "tell");
+        assert_eq!(tell.requester_agent_id, sender.logical_agent_id);
+        assert_eq!(tell.logical_agent_id, recipient.logical_agent_id);
+        assert_eq!(tell.body.as_deref(), Some(body));
+        assert_eq!(tell.idempotency_key.as_deref(), Some("tell-intent-key"));
+        assert_eq!(tell.state, "active");
+        let ended = as_sender
+            .iter()
+            .find(|item| item.id == self_tell.schedule_id)
+            .expect("ended row");
+        assert_eq!(ended.state, "cancelled");
+        assert_eq!(ended.body.as_deref(), Some("self"));
+        assert_eq!(ended.idempotency_key.as_deref(), Some("self-tell-key"));
+        let renew = as_sender
+            .iter()
+            .find(|item| item.kind == "renew")
+            .expect("renew row");
+        assert_eq!(renew.requester_agent_id, sender.logical_agent_id);
+        assert_eq!(renew.body, None, "renew prompts are not tell bodies");
+        assert_eq!(renew.idempotency_key, None);
+        assert_ne!(renew.body.as_deref(), Some("read progress.md and continue"));
+
+        let as_recipient = store
+            .schedules_for_agent(recipient.logical_agent_id)
+            .expect("recipient list");
+        assert!(
+            as_recipient
+                .iter()
+                .any(|item| item.id == outbound.schedule_id)
+        );
+        assert!(
+            as_recipient.iter().any(|item| item.kind == "renew"),
+            "renew targets the recipient"
+        );
+        assert!(
+            store
+                .schedules_for_agent(stranger.logical_agent_id)
+                .expect("stranger list")
+                .is_empty()
+        );
+
+        let _ = store
+            .schedules_for_agent(sender.logical_agent_id)
+            .expect("second list");
+        assert_eq!(
+            schedule_ledger_fingerprint(&store),
+            before,
+            "inspection must not create, fire, or rewrite schedules"
         );
     }
 

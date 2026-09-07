@@ -130,6 +130,9 @@ agent's current receive path; an unavailable firing reports and delivers
 nothing, and Kelpie never starts or revives an agent for it. End it with
 `schedule-cancel <schedule-id> --reason TEXT`.
 Use `schedules` to recover schedule ids and inspect the latest firing outcome.
+`kelpie --json schedules --sender-id ID` returns the stored tell `body` and
+`idempotency_key` so a matching repeating tell can be recognized without
+creating another one.
 
 For work that must pause until a known future time, compose the existing verbs:
 send `kelpie reply <ask-id> --progress` so the obligation visibly remains held,
@@ -495,6 +498,9 @@ Each request has `id`, `method`, and `params`. The daemon supports:
   Only its requester or target may cancel it.
 - `schedules [alias]`: list schedules requested by or targeting that logical
   agent, including ended schedules and the latest firing outcome.
+  `--json` also returns stored `requester_agent_id`. Tell rows include the
+  exact `body` and `idempotency_key`. Renew rows leave those two fields
+  `null`; they are not the resume prompt. Listing does not create a schedule.
 - `clear`: replace one Ready agent's backend-native conversation without a
   prepare ask or resume prompt. Same recipient shape as `tell`. Verified
   on-clear backends (`claude`, `codex`, `grok`, `pi`) return only after Herdr

@@ -230,6 +230,12 @@ requester or target may cancel it.
 `schedule.list` takes an `agent_id` and returns every schedule requested by or
 targeting that logical agent, including ended schedules and the latest firing
 outcome. This makes the cancellation handle recoverable after a lost receipt.
+Each item also carries stored `requester_agent_id`. For `kind=tell`, `body` is
+the exact stored tell prompt (newlines preserved) and `idempotency_key` is the
+creation key. For `kind=renew`, `body` and `idempotency_key` are JSON `null`;
+renew prepare/resume prompts live on the renew row and MUST NOT be projected as
+a tell body. Listing is read-only and MUST NOT create, fire, or rewrite a
+schedule.
 
 Every ask creates a correlated pending-reply reminder with a five-minute
 default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
