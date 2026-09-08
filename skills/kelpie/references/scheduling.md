@@ -2,115 +2,90 @@
 
 Read when performing scheduling operations beyond the entry procedure.
 
-Contents: [Method details](#method-details); [additional procedure](#writing-renew-prompts).
+Contents: [Method details](#method-details); [writing renew prompts](#writing-renew-prompts);
+[receiver envelopes](#receiver-envelopes).
 
 ## Method details
 
 - `schedule-cancel <schedule-id> --reason TEXT`: end a repeating tell schedule.
-  Only its requester or target may cancel it.
+  Only its requester or target can cancel it.
 - `schedules [alias]`: list schedules requested by or targeting that logical
-  agent, including ended schedules and the latest firing outcome.
-  `--json` also returns stored `requester_agent_id`. Tell rows include the
-  exact `body` and `idempotency_key`. Renew rows leave those two fields
-  `null`; they are not the resume prompt. Listing does not create a schedule.
-- `clear`: replace one Ready agent's backend-native conversation without a
-  prepare ask or resume prompt. Same recipient shape as `tell`. Verified
-  on-clear backends (`claude`, `codex`, `grok`, `pi`) return only after Herdr
-  exposes a different session reference. `opencode` returns after `/clear` is
-  accepted because its next prompt allocates the replacement conversation and
-  waiting first would deadlock. The caller stays connected during an on-clear
-  wait, but the daemon continues serving the fleet. Clear waits out the backend
-  settle gap after a preceding prompt and before the first following prompt,
-  even when the clear outcome is unknown or that next prompt was scheduled
-  earlier. It queues all prompt deliveries (including replies) while awaiting
-  rotation, persists their post-clear deadline across recovery, and conflicts
-  with an in-flight renew cycle.
-  Unknown kinds fail closed; no command is guessed. An ambiguous submitted
-  clear is never resent automatically.
-- `reminder-snooze`: only the owing receiver can postpone an open ask. Use
-  `--for 2h` or `--until-ms MS`, never both. Relative durations accept positive
-  integers in `s`, `m`, `h`, or `d`; the daemon resolves the deadline.
+  agent, including ended schedules and latest firing outcomes. `--json` exposes
+  `requester_agent_id`. Tell rows include stored `body` and `idempotency_key`;
+  renew rows leave these null. Listing creates no schedule.
+- `clear`: replace a Ready agent's native conversation without preparation or
+  a resume prompt. Use the same recipient form as `tell`. For `claude`, `codex`,
+  `grok`, and `pi`, completion requires a changed native-session reference.
+  For `opencode`, completion follows accepted `/clear`; the next prompt
+  allocates the replacement conversation. Unsupported backends fail closed.
+
+  The caller waits through rotation while the daemon serves other requests.
+  Clear respects backend settle gaps around prompts. While awaiting rotation,
+  all prompt deliveries, including replies, are queued. The post-clear deadline
+  survives recovery and applies after unknown clear outcomes and to previously
+  scheduled prompts. Clear conflicts with an in-flight renew. An ambiguous
+  submitted clear is never automatically resent.
+- `reminder-snooze`: the owing receiver can postpone an open ask with `--for 2h`
+  or `--until-ms MS`, never both. Relative durations are positive integers in
+  `s`, `m`, `h`, or `d`; the daemon resolves their deadlines.
 - `reminder-interval`: `--every 40m` increases an owned ask's stored interval;
-  decreases are rejected. An increase preserves later deadlines and snoozes.
-  Progress replies preserve snoozes; expiry resumes normal reminders. Receipts
-  and `ask-info` expose effective timing under `reminder`. Snoozing cannot retract
-  a reminder already submitted. Disabled policies stay disabled.
-- `renew`: bound one agent's context by clearing it and re-seeding it. Its
-  recurrence uses the shared schedule ledger with an overlap guard while
-  retaining renew's active-occupancy clock and exact incarnation binding. With no
-  recipient it arms on the caller; it accepts no alias, only `--recipient-id`
-  with `--recipient-incarnation` for a deliberate cross-target. Two phases: the
-  `--prepare-prompt` is delivered as
-  an ask ("save your progress to progress.md"), and only its accepted FINAL
-  REPLY authorises the clear. Then Kelpie sends the backend's clear command,
-  waits until the backend-native session reference actually changes, and injects
-  `--prompt`. Nothing is inferred from elapsed time or idle state.
-  `--on-timeout abort|proceed` is REQUIRED and has no default: `abort` leaves
-  the agent untouched when it never confirms (its context keeps growing);
-  `proceed` clears regardless (unsaved work is lost). A prepare timeout raises an
-  operator notice either way and never disarms a policy.
-  `--due-in`/`--due-at` renew once; `--every 45m` re-arms after every cycle and
-  ends only when the incarnation stops being Ready. `--every` accumulates only
-  while Herdr observes the incarnation as `working` or `blocked`; `idle` and
-  `done` do not advance `next-in`. A policy's first cycle is one interval of
-  that active time away, so arming one does not clear you on the spot. A cycle
-  already preparing or clearing is not paused because the agent went idle. Every
-  other ending re-arms — skipped, aborted, or abandoned unproven — so a policy never
-  stops quietly while the agent believes it is still supervised. Only backends with a
-  verified clear protocol are accepted — `claude`, `codex`, `opencode`, `grok`,
-  and `pi`; anything else fails closed as `incompatible_runtime` with code
-  `renew_unsupported_backend`, before any durable intent. `opencode` allocates
-  its replacement conversation on the next prompt rather than on the clear, so
-  there the resume prompt is sent first and the rotation is required afterwards;
-  the proof is the same, its position is not. It is also the one backend where a
-  failed clear puts the resume prompt into the context it was meant to replace:
-  if you receive `<kelpie-renew ... resumed>` and the conversation before it is
-  still there, the clear did NOT land — say so instead of re-reading your
-  checkpoint and re-planning work you can still see. A clear the backend never confirms
-  raises one operator notice and never completes the renew; the injection is
-  never abandoned, because the context is already gone. Long after that notice
-  the cycle is abandoned and the next one armed, rather than left running
-  forever on a proof that is not coming. Messages addressed to an agent mid-renew are held and
-  delivered after it is resumed, never into the context being discarded.
-  Obligations survive a renew: they live in Kelpie, not in a context window.
-  A policy ends when its incarnation stops being Ready, and only then. Being
-  adopted back afterwards restores addressing, not the policy, so an agent can
-  keep working with nothing bounding its context. That termination raises an
-  operator notice naming the agent, the incarnation, and the renew, and
-  `kelpie report` shows a live agent's armed cycle as
-  `renew=scheduled cycle=97 every=45m0s next-in=15m0s`. No renew on a long-lived
-  root means no policy is armed. Re-arming is a decision for whoever owns that
-  agent; Kelpie will not do it, and `renew` still refuses a second policy on an
-  incarnation that already has one. That refusal is per incarnation, which is
-  why arming one on yourself to see whether you are already supervised is safe
-  and arming one on somebody else is not.
-- `renew-cancel <renew-id> --reason TEXT`: end a policy before its incarnation
-  does. Only its requester or its target may cancel, so nobody can quietly
-  disarm another agent's supervision. Refused while a cycle is mid-clear — the
-  context is already gone and only the resume prompt brings it back — so wait
-  for that cycle to finish and cancel then. A cancel raises an operator notice
-  naming the policy, the target, whoever ended it, and the reason.
+  decreases are rejected. Increases preserve later deadlines and snoozes.
+  Progress replies preserve snoozes; expiry resumes the stored reminder cadence.
+  Mutation receipts and `ask-info` expose effective timing under `reminder`.
+  Snoozing cannot retract a submitted reminder. Disabled policies stay disabled.
+- `renew`: clear and re-seed one agent's context. With no recipient, it targets
+  the caller. For another agent, supply both `--recipient-id` and
+  `--recipient-incarnation`; aliases are not accepted. The recurrence uses the
+  shared schedule ledger with an overlap guard and exact incarnation binding.
+
+  First Kelpie sends `--prepare-prompt` as an ask. Its accepted final reply
+  authorizes the clear. Elapsed time and idle state do not confirm preparation.
+  Required `--on-timeout abort|proceed` determines an unconfirmed timeout:
+  `abort` leaves the context intact; `proceed` clears despite unsaved work.
+  Either timeout raises an operator notice without disarming the policy.
+
+  Kelpie clears, proves native-session rotation, and injects `--prompt`.
+  `opencode` requires injection before rotation proof because its next prompt
+  creates the conversation. Supported backends are `claude`, `codex`,
+  `opencode`, `grok`, and `pi`; others fail before durable intent with
+  `incompatible_runtime` / `renew_unsupported_backend`.
+
+  An unconfirmed clear raises one operator notice and cannot complete the cycle.
+  Resume injection is retried until accepted because a cleared agent needs its
+  continuation. After the proof deadline, an unproven cycle is abandoned and
+  the next cycle armed. Messages addressed mid-renew wait until resume.
+  Obligations survive the context replacement.
+
+  `--due-in` or `--due-at` creates a single renewal. `--every 45m` counts only
+  Herdr-observed `working` or `blocked` time; `idle` and `done` do not advance
+  `next-in`. The first cycle needs one full active interval. A cycle already
+  preparing or clearing continues when the agent becomes idle. Completed,
+  skipped, aborted, and abandoned cycles re-arm the recurring policy.
+
+  The policy ends when its incarnation stops being Ready or an authorized
+  cancellation ends it. Incarnation termination raises an operator notice naming
+  agent, incarnation, and renew. Adoption restores addressing, not the policy.
+  The agent's owner decides whether to re-arm. A second policy on the same
+  incarnation is refused. `kelpie report` shows an armed cycle as
+  `renew=scheduled cycle=97 every=45m0s next-in=15m0s`; no renew field means
+  no armed policy.
+- `renew-cancel <renew-id> --reason TEXT`: only the requester or target can end
+  the policy. Cancellation is refused mid-clear; wait for the cycle to finish
+  so its resume prompt can restore context. Cancellation raises an operator
+  notice naming the policy, target, requester, and reason.
 
 ## Writing renew prompts
 
-A renew has three layers, and putting an instruction in the wrong one is the
-main way renewals go wrong.
+Keep the three prompt layers separate:
 
 | Layer | Runs | Holds |
 | --- | --- | --- |
-| Start prompt (`start --tell/--ask`) | Once, ever | One-time bootstrap: clone the repo, create the branch, install deps |
-| Standing resume prompt (`renew --prompt`) | Every cycle, forever | Invariants only: who you are, where things live, how to work |
-| Checkpoint file (written by the prepare) | Rewritten each cycle | Non-recoverable intent, decisions, active safety/resource grants, and source pointers |
+| Start prompt (`start --tell/--ask`) | Once | One-time bootstrap |
+| Standing resume prompt (`renew --prompt`) | Each cycle | Identity, instruction paths, and continuation route |
+| Checkpoint file | Replaced by each prepare | Intent, decisions, active safety/resource grants, and source pointers unavailable from live sources |
 
-With `--every`, the resume prompt is a program that runs forever. It MUST be
-reentrant. Anything destructive, one-time, or order-dependent belongs in the
-start prompt or the checkpoint, never in the standing prompt. "Create the
-branch" creates it once and fails every cycle after. "Reset the scratch
-directory" silently destroys the previous cycle's work. "Continue where we left
-off in the migration" is stale on cycle two. The resume envelope carries
-`cycle=N`, so a resumed agent can see whether this is the first run.
-
-Prefer a standing prompt that only points at files:
+Make the standing prompt reentrant. Put destructive, one-time, and order-dependent
+work in the start prompt or checkpoint. `cycle=N` identifies the renewal cycle.
 
 ```text
 prepare.txt: Replace progress.md with the continuation a fresh reader cannot
@@ -128,35 +103,21 @@ kelpie renew \
   --on-timeout abort --every 45m
 ```
 
-With no recipient that arms the policy on YOU, which is almost always what you
-want. `renew` is the one verb that takes no live name: a name can belong to
-another agent by the time it resolves, and a policy aimed at the wrong agent
-clears its conversation once a cycle. To bound somebody else's context on
-purpose, name it exactly with `--recipient-id` and `--recipient-incarnation`.
+Kelpie reads and stores both prompts at policy creation. Later file edits do
+not change the stored prompts. Point the resume prompt at files the agent reads
+at runtime for instructions that need to evolve.
 
-Both prompts are read once, when the renew is created, and stored durably. A
-policy does not re-read those files, so editing `resume.txt` later changes
-nothing; the standing prompt keeps whatever text it was armed with. That is also
-why the standing prompt should point at files the AGENT reads at run time
-(`instructions.md`, `progress.md`) — those are the parts you can still change.
-
-The checkpoint's only reader is you with an empty context holding nothing but
-the resume prompt. Write it for that reader: absolute paths, no "the approach we
-discussed", no "the second option", decisions recorded with their reasoning
-rather than just their conclusions. The prepare envelope quotes the resume
-prompt so you can check your checkpoint actually satisfies it.
-
-Keep only continuation facts that live sources cannot reconstruct. Preserve the
-scope, owner, and release condition of active safety/resource grants, with their
-evidence pointers. Recover fleet membership, task status, and obligations from
-their current owners after resume. Replace superseded notes instead of appending
-another account of the same work. The checkpoint is a current continuation,
-not a transcript or a second inventory.
+Write the checkpoint for a reader with only the resume prompt: use absolute
+paths, explicit decisions and reasons, and each active grant's scope, owner,
+release condition, and evidence pointer. Replace superseded notes. Recover fleet
+membership, task status, and obligations from their live owners after resume.
+The prepare envelope quotes the stored resume prompt for checking checkpoint
+sufficiency.
 
 ## Receiver envelopes
 
-Prompt text delivered into an agent uses compact HTML-like envelopes. The
-machine client protocol remains NDJSON. Bodies escape `<`, `>`, and `&`.
+Agent prompts use HTML-like envelopes; the machine protocol remains NDJSON.
+Bodies escape `<`, `>`, and `&`.
 
 ```text
 <kelpie from=alice>
@@ -184,36 +145,21 @@ BODY
 </kelpie-renew>
 ```
 
-- Omit `to`, `kind`, body wrappers, and tell IDs. The receiver already knows it
-  is the target; tells create no reply obligation.
-- `reply-to` and `re` carry the durable message handle.
-- Bare `progress` and `final` are boolean flags.
-- `from` names the reply target. `from=operator` is the user with no agent in
-  between.
-- `<kelpie-renew ... prepare>` means your context is about to be cleared. It is
-  an ask: write your checkpoint, then `kelpie reply ID --final`. It quotes the
-  exact prompt you will receive after the clear inside `&lt;resume&gt;` tags —
-  that is a preview so you can make the checkpoint sufficient, NOT an
-  instruction to follow now. Following it now skips the checkpoint entirely.
-- `<kelpie-renew ... resumed>` means your context was just cleared and you are
-  continuing work a previous instance of you wrote down. Do not start over and
-  do not assume any conversation preceded it. `cycle=N` tells you how many times
-  this has already happened.
-- Envelopes arrive in the same role as a human's own messages, and nothing else
-  in the conversation tells them apart. A turn is the human only when it carries
-  no envelope. Every `<kelpie ...>` and `<kelpie-renew ...>` turn is another
-  agent, however conversational its body reads.
-- Answer an envelope with what the envelope cannot already contain: what you did
-  after reading it, what state changed, what you now understand. A human sharing
-  this pane is probably not present, so prose written to inform them inside an
-  envelope reply is lost.
-- When a turn without an envelope arrives, treat the human as having read none of
-  the envelopes and none of your replies to them. Answer what they asked, and
-  state inline whatever that answer depends on that arrived while they were away.
-  Do not summarize the gap; they did not ask what happened, and a recap buries
-  the answer.
+- Envelopes omit `to`, `kind`, body wrappers, and tell IDs. `reply-to` and `re`
+  carry durable message IDs; `progress` and `final` are boolean flags.
+- `from` names the reply target. `from=operator` identifies the user directly.
+  Other enveloped turns are agent messages even though they use the human role.
+- On `<kelpie-renew ... prepare>`, write the checkpoint, then send
+  `kelpie reply ID --final`. The escaped `&lt;resume&gt;` text previews the next
+  prompt; use it to check the checkpoint, not to resume work before saving.
+- On `<kelpie-renew ... resumed>`, follow the stored continuation. If the prior
+  conversation remains visible, report that clear did not land instead of
+  re-reading and re-planning visible work. Otherwise treat the context as fresh.
+- Replies report the result or changed state needed by the sender. For a human
+  question outside an envelope, answer directly with any necessary facts from
+  agent exchanges; assume the human has not read those exchanges.
 
-To answer an ask, reply with that ask's message ID only:
+Answer an ask using its message ID:
 
 ```sh
 kelpie reply <ask-message-id> --final --stdin <<'EOF'
@@ -221,6 +167,6 @@ done
 EOF
 ```
 
-A final reply resolves the obligation only when delivery is accepted. Rejected
-or unknown final deliveries leave the obligation open so you can send another
-final after reconciling; never resend an ambiguous submitted attempt.
+A final resolves only on accepted delivery. For rejected or unknown delivery,
+reconcile the durable outcome before another final; never resend an ambiguous
+submitted attempt.
