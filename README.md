@@ -81,14 +81,18 @@ npx skills add dcadenas/kelpie --skill kelpie -g -a claude-code -y
 ```
 
 Use `-a codex`, `-a opencode`, and so on for other agents, or drop `-a` and
-`-y` to be asked. That command installs from the git head. The installed binary
-carries the copy that matches its own version, which is the one to use if you
-pin Kelpie to a release:
+`-y` to be asked. That command installs from the git head. If you pin Kelpie to
+a release, obtain its matching source release and install the entire
+`skills/kelpie/` directory, including `references/`:
 
 ```sh
 mkdir -p ~/.claude/skills/kelpie
-kelpie --skill > ~/.claude/skills/kelpie/SKILL.md
+cp -R skills/kelpie/. ~/.claude/skills/kelpie/
 ```
+
+Run that copy from the matching source checkout. `kelpie --skill` prints only
+the embedded entry, which covers routine messaging; advanced operations also
+need the referenced procedures from the same release.
 
 Restart coding-agent sessions that were already open; they index skills at
 startup.

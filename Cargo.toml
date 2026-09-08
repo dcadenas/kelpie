@@ -13,6 +13,7 @@ include = [
     "src/**/*",
     "migrations/*.sql",
     "skills/kelpie/SKILL.md",
+    "skills/kelpie/references/*.md",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",

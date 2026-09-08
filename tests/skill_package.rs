@@ -17,6 +17,7 @@ fn package_metadata_includes_canonical_skill() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("read Cargo.toml");
     assert!(manifest.contains("\"skills/kelpie/SKILL.md\""));
+    assert!(manifest.contains("\"skills/kelpie/references/*.md\""));
     assert!(manifest.contains("\"README.md\""));
 }
 
@@ -75,7 +76,19 @@ fn documented_commands(skill: &str) -> Vec<String> {
 /// bytes as the file; it cannot catch a documented flag the parser rejects.
 #[test]
 fn every_documented_command_parses() {
-    let commands = documented_commands(CANONICAL);
+    let mut commands = documented_commands(CANONICAL);
+    let references = std::fs::read_dir(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/kelpie/references"
+    ))
+    .expect("read shipped skill references");
+    for entry in references {
+        let path = entry.expect("reference entry").path();
+        if path.extension().is_some_and(|extension| extension == "md") {
+            let reference = std::fs::read_to_string(&path).expect("read skill reference");
+            commands.extend(documented_commands(&reference));
+        }
+    }
     assert!(
         commands.len() > 10,
         "expected the skill to document commands, found {}",

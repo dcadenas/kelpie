@@ -160,9 +160,11 @@ Herdr, add the matching points and kill tests.
 
 ### Skill
 
-`skills/kelpie/SKILL.md` is the agent-facing usage guide, embedded in the binary via
-`include_str!` and printed by `kelpie --skill`. `tests/skill_package.rs` asserts the
-printed text matches the file byte-for-byte, so edit the file, not a copy.
+`skills/kelpie/SKILL.md` is the agent-facing entry, embedded in the binary via
+`include_str!` and printed by `kelpie --skill`. Its `references/*.md` files carry
+procedures loaded for the operation being performed. `tests/skill_package.rs`
+asserts the printed entry matches the file byte-for-byte and checks documented
+commands across the entry and references. Edit these canonical files, not copies.
 
 Its siblings are for working *on* Kelpie rather than using it, and ship with the
 repository instead of the crate: `skills/kelpie-deploy` puts a build in front of a
@@ -170,5 +172,7 @@ running fleet, and `skills/kelpie-diagnose` reads the durable record when an
 operation looks wrong. Install them for whatever agent you use with
 `npx skills add . -a '*' -s kelpie-deploy -s kelpie-diagnose`; the per-agent trees
 that creates are generated and git-ignored, and each one links back to
-`skills/<name>/`. Only `skills/kelpie/SKILL.md` is listed in `Cargo.toml`'s
-`include`, so adding a maintainer skill never changes what the crate publishes.
+`skills/<name>/`. `Cargo.toml` includes the Kelpie entry and its references;
+the maintainer skills remain outside the crate package. Copy or install the whole
+Kelpie skill directory so its relative references resolve. A binary-only
+`kelpie --skill` dump needs matching source-release references for advanced operations.
