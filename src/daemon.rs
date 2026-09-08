@@ -6766,7 +6766,9 @@ fn classify_error(error: &SliceError) -> ClientError {
         SliceError::Store(StoreError::InvalidRecord(_)) => "invalid_request",
         SliceError::Store(StoreError::UnsafeLocation(_) | StoreError::Sql(_))
         | SliceError::Herdr(HerdrError::Malformed(_) | HerdrError::Unexpected(_)) => "internal",
-        SliceError::Herdr(HerdrError::Incompatible { .. })
+        SliceError::Herdr(
+            HerdrError::Incompatible { .. } | HerdrError::IncompatibleEndpoint { .. },
+        )
         | SliceError::UnsupportedBackend { .. } => "incompatible_runtime",
         SliceError::Herdr(HerdrError::Unavailable(_)) => "unavailable",
         SliceError::Herdr(HerdrError::Rejected { code, .. }) if code.contains("not_found") => {

@@ -10,8 +10,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Exact Herdr protocol Kelpie supports.
+/// Exact legacy Herdr wire protocol Kelpie supports.
+///
+/// Herdr 0.9.0 made this number private to its own client, terminal, and
+/// direct-attach internals, so it moves whenever pane rendering or input
+/// encoding changes even though nothing Kelpie calls has changed. Only Herdr
+/// releases too old to advertise the endpoint contract are gated on it.
 pub const SUPPORTED_PROTOCOL: u32 = 20;
+
+/// Stable Herdr endpoint contract Kelpie speaks.
+///
+/// Herdr documents this generation as deliberately independent from the wire
+/// protocol, so it survives releases that renumber the wire. Prefer it, and
+/// fall back to [`SUPPORTED_PROTOCOL`] only when the server predates it.
+pub const SUPPORTED_ENDPOINT_GENERATION: u32 = 1;
 
 /// A minimal observed agent identity from Herdr.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,7 +89,6 @@ struct WireSnapshot {
 
 #[derive(Deserialize)]
 struct WireLifecycleSnapshot {
-    protocol: u32,
     agents: Vec<LifecycleObservation>,
 }
 
@@ -90,8 +101,14 @@ pub enum HerdrError {
     Malformed(#[source] serde_json::Error),
     #[error("Herdr rejected the request with {code}: {message}")]
     Rejected { code: String, message: String },
-    #[error("Herdr protocol {actual} is incompatible; supported protocol is {supported}")]
+    #[error(
+        "Herdr protocol {actual} is incompatible; supported protocol is {supported}. Install Herdr 0.9.0 or newer, which negotiates a stable endpoint contract instead"
+    )]
     Incompatible { actual: u32, supported: u32 },
+    #[error(
+        "Herdr endpoint generation {actual} is incompatible; Kelpie speaks generation {supported}"
+    )]
+    IncompatibleEndpoint { actual: u32, supported: u32 },
     #[error("Herdr returned unexpected result type {0}")]
     Unexpected(String),
     #[error("Herdr did not prove agent readiness before the {0:?} deadline")]
@@ -173,13 +190,28 @@ impl HerdrClient {
         }
     }
 
-    /// Negotiate exact protocol compatibility through `ping`.
+    /// Negotiate compatibility through `ping`.
+    ///
+    /// A server that advertises the endpoint contract is judged on that
+    /// generation alone, because Herdr renumbers the wire protocol for changes
+    /// to its own terminal internals that Kelpie never calls. A server that
+    /// advertises no generation predates the contract and is judged on the
+    /// exact wire protocol.
     ///
     /// # Errors
     ///
     /// Returns a classified transport, protocol, or Herdr error.
     pub fn negotiate(&self) -> Result<(), HerdrError> {
         let value = self.request("kelpie:ping", "ping", &Value::Object(Map::default()))?;
+        if let Some(generation) = value
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("endpoint_protocol_generation"))
+            .and_then(Value::as_u64)
+        {
+            let generation = u32::try_from(generation)
+                .map_err(|_| HerdrError::Unexpected("endpoint generation exceeds u32".into()))?;
+            return validate_endpoint_generation(generation);
+        }
         let protocol = value
             .get("protocol")
             .and_then(Value::as_u64)
@@ -205,12 +237,9 @@ impl HerdrClient {
             .ok_or_else(|| HerdrError::Unexpected("snapshot result without snapshot".into()))?;
         let snapshot: WireSnapshot =
             serde_json::from_value(snapshot.clone()).map_err(HerdrError::Malformed)?;
-        if snapshot.protocol != SUPPORTED_PROTOCOL {
-            return Err(HerdrError::Incompatible {
-                actual: snapshot.protocol,
-                supported: SUPPORTED_PROTOCOL,
-            });
-        }
+        // Compatibility is settled once at `negotiate`, which every caller runs
+        // before reading. Re-checking the wire number here would reject servers
+        // whose endpoint contract Kelpie has already accepted.
         Ok(Snapshot {
             protocol: snapshot.protocol,
             panes: snapshot.panes,
@@ -234,7 +263,7 @@ impl HerdrClient {
             .ok_or_else(|| HerdrError::Unexpected("snapshot result without snapshot".into()))?;
         let snapshot: WireLifecycleSnapshot =
             serde_json::from_value(snapshot.clone()).map_err(HerdrError::Malformed)?;
-        validate_protocol(snapshot.protocol)?;
+        // Settled at `negotiate`; see `snapshot`.
         Ok(snapshot.agents)
     }
 
@@ -420,6 +449,17 @@ fn validate_protocol(protocol: u32) -> Result<(), HerdrError> {
         Err(HerdrError::Incompatible {
             actual: protocol,
             supported: SUPPORTED_PROTOCOL,
+        })
+    }
+}
+
+fn validate_endpoint_generation(generation: u32) -> Result<(), HerdrError> {
+    if generation == SUPPORTED_ENDPOINT_GENERATION {
+        Ok(())
+    } else {
+        Err(HerdrError::IncompatibleEndpoint {
+            actual: generation,
+            supported: SUPPORTED_ENDPOINT_GENERATION,
         })
     }
 }
@@ -646,6 +686,51 @@ mod tests {
                 "expected incompatible for protocol {actual}"
             );
         }
+    }
+
+    fn negotiate_against_pong(pong: &'static str) -> Result<(), HerdrError> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).expect("bind fixture socket");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fixture client");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("read request");
+            let mut stream = stream;
+            stream.write_all(pong.as_bytes()).expect("write response");
+        });
+        let outcome = HerdrClient::new(&path, Duration::from_secs(1)).negotiate();
+        server.join().expect("fixture server");
+        outcome
+    }
+
+    #[test]
+    fn negotiate_accepts_renumbered_wire_behind_the_endpoint_contract() {
+        // Herdr 0.9.0 reports wire protocol 22 while holding endpoint
+        // generation 1. Nothing Kelpie calls changed, so this must connect.
+        negotiate_against_pong(
+            "{\"id\":\"kelpie:ping\",\"result\":{\"type\":\"pong\",\"version\":\"0.9.0\",\"protocol\":22,\"capabilities\":{\"endpoint_protocol_generation\":1}}}\n",
+        )
+        .expect("endpoint generation 1 is compatible regardless of wire protocol");
+    }
+
+    #[test]
+    fn negotiate_refuses_unknown_endpoint_generation() {
+        let error = negotiate_against_pong(
+            "{\"id\":\"kelpie:ping\",\"result\":{\"type\":\"pong\",\"version\":\"9.9.9\",\"protocol\":20,\"capabilities\":{\"endpoint_protocol_generation\":2}}}\n",
+        )
+        .expect_err("generation 2");
+        assert!(
+            matches!(
+                error,
+                HerdrError::IncompatibleEndpoint {
+                    actual: 2,
+                    supported: 1
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

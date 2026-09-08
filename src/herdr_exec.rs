@@ -311,6 +311,12 @@ fn clone_herdr_error(error: &HerdrError) -> HerdrError {
             actual: *actual,
             supported: *supported,
         },
+        HerdrError::IncompatibleEndpoint { actual, supported } => {
+            HerdrError::IncompatibleEndpoint {
+                actual: *actual,
+                supported: *supported,
+            }
+        }
         HerdrError::Unexpected(message) => HerdrError::Unexpected(message.clone()),
         HerdrError::ReadinessTimeout(duration) => HerdrError::ReadinessTimeout(*duration),
     }
