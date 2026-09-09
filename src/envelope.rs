@@ -99,19 +99,30 @@ pub fn render_final(
     ))
 }
 
-/// Render a protocol reminder for one unresolved ask, carrying the original
-/// question: the reminder is the amnesia protocol, and a renewed or restarted
-/// agent must be able to answer without asking the sender to repeat itself.
+/// Render a protocol reminder with commands for recovering or settling the ask.
 ///
 /// # Errors
 ///
 /// Returns an error when the waiting address or ask ID is unsafe.
-pub fn render_reminder(waiting: &str, reply_to: &str, body: &str) -> Result<String, EnvelopeError> {
+pub fn render_reminder(waiting: &str, reply_to: &str) -> Result<String, EnvelopeError> {
     let waiting = validated_attr("waiting", waiting)?;
     let reply_to = validated_attr("reply-to", reply_to)?;
     Ok(format!(
-        "<kelpie-reminder waiting={waiting} reply-to={reply_to}>\nPending final reply. Reply with: kelpie reply {reply_to} --final --file PATH\n\nThe question you owe an answer to:\n{}\n</kelpie-reminder>",
-        escape_body(body)
+        concat!(
+            "<kelpie-reminder waiting={waiting} reply-to={reply_to}>\n",
+            "You still owe {waiting} a final on this ask.\n\n",
+            "If the question is gone from context:\n",
+            "  kelpie ask-info {reply_to}\n\n",
+            "Still working:\n",
+            "  kelpie reminder-snooze {reply_to} --for 2h\n\n",
+            "Ready to answer:\n",
+            "  kelpie reply {reply_to} --final --file PATH\n\n",
+            "Drop the obligation:\n",
+            "  kelpie cancel {reply_to} --reason TEXT\n",
+            "</kelpie-reminder>"
+        ),
+        waiting = waiting,
+        reply_to = reply_to,
     ))
 }
 
@@ -309,12 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn reminder_names_exact_obligation_and_command_and_carries_the_question() {
-        let ask_id = "0193abcdef-0123-7890-abcd-ef0123456789";
+    fn reminder_names_exact_obligation_and_commands_without_the_question() {
+        let ask_id = "1847";
         assert_eq!(
-            render_reminder("coordinator", ask_id, "What changed in the API?").expect("reminder"),
+            render_reminder("coordinator", ask_id).expect("reminder"),
             format!(
-                "<kelpie-reminder waiting=coordinator reply-to={ask_id}>\nPending final reply. Reply with: kelpie reply {ask_id} --final --file PATH\n\nThe question you owe an answer to:\nWhat changed in the API?\n</kelpie-reminder>"
+                "<kelpie-reminder waiting=coordinator reply-to={ask_id}>\nYou still owe coordinator a final on this ask.\n\nIf the question is gone from context:\n  kelpie ask-info {ask_id}\n\nStill working:\n  kelpie reminder-snooze {ask_id} --for 2h\n\nReady to answer:\n  kelpie reply {ask_id} --final --file PATH\n\nDrop the obligation:\n  kelpie cancel {ask_id} --reason TEXT\n</kelpie-reminder>"
             )
         );
     }

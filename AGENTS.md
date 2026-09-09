@@ -89,7 +89,7 @@ explicitly. Do not rename them to match the package.
   parses Herdr CLI output, never touches Herdr's private rendering socket or
   persistence files. Supports **exactly protocol 20**; anything else is
   `incompatible_runtime` and no mutation is sent.
-- `domain.rs` — UUIDv7 newtype IDs and the state enums (`IncarnationState`,
+- `domain.rs` — positive integer newtype IDs and the state enums (`IncarnationState`,
   `OperationOutcome`, `ObligationState`, `DeliveryOutcome`, …).
 - `envelope.rs` — the agent-facing `<kelpie from=… >` / `<kelpie-reminder …>` text
   representation. Bodies escape `<`, `>`, `&` so untrusted message text cannot

@@ -23,6 +23,8 @@ Contents: [Method details](#method-details), [typed client examples](#typed-clie
 
 Read `docs/client-protocol.md` and `SPEC.md` in the release for exact fields.
 Responses contain the same request `id` and either `result` or a stable error.
+Kelpie durable IDs are positive JSON numbers. Typed CLI ID arguments are positive
+decimal integers; UUIDs and zero fail before the request is sent.
 
 
 

@@ -367,8 +367,7 @@ fn send_cancel(
     ask_message_id: MessageId,
 ) -> thread::JoinHandle<()> {
     let socket = socket.to_path_buf();
-    let requester = requester.to_string();
-    let ask = ask_message_id.to_string();
+    let requester = requester.parse::<u64>().expect("integer requester");
     thread::spawn(move || {
         let mut stream = UnixStream::connect(socket).expect("connect Kelpie client");
         serde_json::to_writer(
@@ -378,7 +377,7 @@ fn send_cancel(
                 "method":"cancel",
                 "params":{
                     "requester_agent_id":requester,
-                    "ask_message_id":ask,
+                    "ask_message_id":ask_message_id,
                     "reason":"superseded by a fresh round"
                 }
             }),

@@ -162,8 +162,8 @@ fn assert_start_receipt(response: &Value, request_id: &str) {
     assert!(result.contains_key("incarnation_id"), "{result:?}");
     assert_eq!(result["runtime_start"]["outcome"], "succeeded");
     assert_eq!(result["initial_message"]["outcome"], "accepted");
-    assert!(result["initial_message"]["message_id"].is_string());
-    assert!(result["runtime_start"]["operation_id"].is_string());
+    assert!(result["initial_message"]["message_id"].is_number());
+    assert!(result["runtime_start"]["operation_id"].is_number());
 }
 
 fn spawn_start_daemon(

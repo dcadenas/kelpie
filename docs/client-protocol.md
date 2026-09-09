@@ -237,7 +237,7 @@ renew prepare/resume prompts live on the renew row and MUST NOT be projected as
 a tell body. Listing is read-only and MUST NOT create, fire, or rewrite a
 schedule.
 
-Every ask creates a correlated pending-reply reminder with a twenty-minute
+Every ask creates a correlated pending-reply reminder with a forty-five-minute
 default interval. `--remind-after-ms MS` changes the interval and `--no-remind`
 disables automatic nudges for that ask. The interval begins only after Herdr
 accepts the ask. When overdue, `kelpied` obtains a fresh snapshot and injects
@@ -262,6 +262,10 @@ state. Eligibility is a timing threshold, not a promise of delivery: live
 readiness, in-flight finals, and delivery safeguards still apply. A submitted
 reminder cannot be retracted by snoozing.
 
+The reminder envelope names the ask and includes commands for `ask-info`,
+`reminder-snooze`, final `reply`, and `cancel`. It does not inline the original
+ask body; `ask-info` is the durable recovery read after context loss.
+
 On database upgrade, enabled five-minute policies migrate once to twenty
 minutes. Their next eligibility is no earlier than twenty minutes after the
 migration, retaining later deadlines and snoozes. Other intervals, disabled
@@ -278,6 +282,12 @@ BODY
 BODY
 </kelpie>
 ```
+
+Kelpie-owned IDs are positive per-table integers. The daemon allocates them in
+the row's insert transaction, JSON encodes them as numbers, and CLI arguments
+use positive decimal `u64` values. UUIDs and zero are invalid IDs. Migration 30
+renumbers existing rows oldest first while preserving references and stored
+operation intents.
 
 Bodies escape `<`, `>`, and `&`. Tell IDs, `to`, `kind`, and body wrappers are
 omitted from the envelope. Machine client-to-daemon traffic remains strict

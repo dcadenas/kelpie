@@ -2041,7 +2041,7 @@ fn render_name_info(result: &Value) -> String {
         let _ = write!(
             text,
             "\n  {} created={} {} transport={} unresolved={}",
-            claimant["logical_agent_id"].as_str().unwrap_or("?"),
+            field(claimant, "logical_agent_id"),
             claimant["created_at_ms"]
                 .as_i64()
                 .map_or("?".into(), format_utc_ms),
@@ -2058,14 +2058,14 @@ fn render_name_info(result: &Value) -> String {
             format!(
                 "{} ({}, {})",
                 side_value["name"].as_str().unwrap_or("?"),
-                side_value["agent_id"].as_str().unwrap_or("?"),
+                field(side_value, "agent_id"),
                 if live { "live" } else { "not-live" },
             )
         };
         let _ = write!(
             text,
             "\n  ask {} state={} created={} last-activity={}\n    asker {}\n    responder {}",
-            obligation["ask_message_id"].as_str().unwrap_or("?"),
+            field(obligation, "ask_message_id"),
             obligation["state"].as_str().unwrap_or("?"),
             obligation["created_at_ms"]
                 .as_i64()
@@ -2095,9 +2095,9 @@ fn render_ask_info(result: &Value) -> String {
         text,
         "\n  asked-by {} ({})\n  responder {} ({})\n  created={} last-activity={}",
         asker["name"].as_str().unwrap_or("?"),
-        asker["agent_id"].as_str().unwrap_or("?"),
+        field(asker, "agent_id"),
         responder["name"].as_str().unwrap_or("?"),
-        responder["agent_id"].as_str().unwrap_or("?"),
+        field(responder, "agent_id"),
         result["created_at_ms"]
             .as_i64()
             .map_or("?".into(), format_utc_ms),
@@ -2203,21 +2203,19 @@ fn render_report(result: &Value) -> String {
 
     // Roots are agents with no parent recorded, plus any whose parent is absent
     // from this report, so nothing is silently dropped from the tree.
-    let known: Vec<&str> = agents
-        .iter()
-        .filter_map(|agent| agent["agent_id"].as_str())
-        .collect();
+    let known: Vec<&Value> = agents.iter().map(|agent| &agent["agent_id"]).collect();
     let mut roots: Vec<&Value> = agents
         .iter()
         .filter(|agent| {
-            agent["parent_agent_id"]
-                .as_str()
-                .is_none_or(|parent| !known.contains(&parent))
+            agent["parent_agent_id"].is_null()
+                || !known
+                    .iter()
+                    .any(|known| **known == agent["parent_agent_id"])
         })
         .collect();
     roots.sort_by_key(|agent| agent["created_at_ms"].as_i64().unwrap_or_default());
 
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<&Value> = Vec::new();
     for root in roots {
         render_agent(&mut text, root, agents, obligations, now, 0, &mut seen);
     }
@@ -2252,6 +2250,7 @@ fn newest_state(agent: &Value) -> String {
 }
 
 /// Render a duration the way a reader reasons about it, not in epoch units.
+#[allow(clippy::too_many_lines)]
 fn render_agent<'a>(
     text: &mut String,
     agent: &'a Value,
@@ -2259,11 +2258,16 @@ fn render_agent<'a>(
     obligations: &'a [Value],
     now: i64,
     depth: usize,
-    seen: &mut Vec<&'a str>,
+    seen: &mut Vec<&'a Value>,
 ) {
-    let Some(id) = agent["agent_id"].as_str() else {
+    let id = &agent["agent_id"];
+    // A newly installed client captures the old daemon's report before the
+    // integer-ID cutover. Render those string IDs opaquely; command parsing
+    // still rejects them, and no UUID-to-integer mapping exists.
+    if !(id.is_number() || id.is_string()) {
         return;
-    };
+    }
+    let id_text = field(agent, "agent_id");
     // Parentage is data, and data can cycle; stop rather than recurse forever.
     if seen.contains(&id) {
         return;
@@ -2299,8 +2303,9 @@ fn render_agent<'a>(
     // incarnation and the operation that produced it. Settled rows stay terse.
     let unsettled = match state.as_str() {
         "starting" | "unknown" => newest.map_or(String::new(), |value| {
-            let operation = value["latest_operation"]["operation_id"]
-                .as_str()
+            let operation = value["latest_operation"]
+                .get("operation_id")
+                .filter(|operation| !operation.is_null())
                 .map_or(String::new(), |operation| format!(" operation={operation}"));
             format!(" incarnation={}{operation}", field(value, "incarnation_id"))
         }),
@@ -2344,23 +2349,24 @@ fn render_agent<'a>(
     };
     let _ = writeln!(
         text,
-        "{indent}{branch}{} agent={id} backend={backend} kelpie={state}{live} \
+        "{indent}{branch}{} agent={id_text} backend={backend} kelpie={state}{live} \
          incarnations={incarnations}{conversation}{renew}{unsettled}",
         field(agent, "public_name")
     );
 
     for obligation in obligations
         .iter()
-        .filter(|obligation| obligation["owing_agent_id"].as_str() == Some(id))
+        .filter(|obligation| obligation["owing_agent_id"] == *id)
         .filter(|obligation| matches!(obligation["state"].as_str(), Some("open" | "in_progress")))
     {
-        let waiting = obligation["waiting_agent_id"].as_str().unwrap_or("-");
+        let waiting = &obligation["waiting_agent_id"];
         let waiting_name = agents
             .iter()
-            .find(|candidate| candidate["agent_id"].as_str() == Some(waiting))
-            .map_or(waiting.to_string(), |candidate| {
-                field(candidate, "public_name")
-            });
+            .find(|candidate| candidate["agent_id"] == *waiting)
+            .map_or_else(
+                || waiting.to_string(),
+                |candidate| field(candidate, "public_name"),
+            );
         let open_ms = now - obligation["created_at_ms"].as_i64().unwrap_or(now);
         let _ = writeln!(
             text,
@@ -2373,7 +2379,7 @@ fn render_agent<'a>(
 
     let mut children: Vec<&Value> = agents
         .iter()
-        .filter(|candidate| candidate["parent_agent_id"].as_str() == Some(id))
+        .filter(|candidate| candidate["parent_agent_id"] == *id)
         .collect();
     children.sort_by_key(|child| child["created_at_ms"].as_i64().unwrap_or_default());
     for child in children {
@@ -2846,8 +2852,8 @@ mod tests {
             "sender",
             Some("ignored"),
             Some(&ExactRecipient {
-                recipient: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
-                incarnation: "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                recipient: "1".into(),
+                incarnation: "2".into(),
             }),
             "body",
             "key",
@@ -2862,10 +2868,10 @@ mod tests {
         let response = serde_json::json!({"result":{
             "name":"botserver",
             "claimants":[
-                {"logical_agent_id":"active","created_at_ms":1,
+                {"logical_agent_id":1,"created_at_ms":1,
                  "delivery_transport":"socket_inbox","live":false,"addressable":true,
                  "unresolved_count":0},
-                {"logical_agent_id":"retired","created_at_ms":2,
+                {"logical_agent_id":2,"created_at_ms":2,
                  "delivery_transport":"socket_inbox","live":false,"addressable":false,
                  "unresolved_count":0}
             ],
@@ -2894,21 +2900,21 @@ mod tests {
         let report = serde_json::json!({"result":{
             "generated_at_ms": now,
             "live_snapshot_at_ms": now,
-            "alias_collisions": {"reviewer": ["a", "b"]},
+            "alias_collisions": {"reviewer": [1, 2]},
             "agents": [
-                {"agent_id":"parent-id","public_name":"coordinator",
-                 "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i1","state":"ready",
-                    "backend_kind":"opencode","live":"idle"}]},
-                {"agent_id":"child-id","public_name":"reviewer",
-                 "parent_agent_id":"parent-id","explicitly_parentless":false,
-                 "created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i2","state":"ready",
-                    "backend_kind":"claude","live":"working"}]}
+                {"agent_id":1,"public_name":"coordinator",
+                  "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
+                  "incarnations":[{"incarnation_id":1,"state":"ready",
+                     "backend_kind":"opencode","live":"idle"}]},
+                {"agent_id":2,"public_name":"reviewer",
+                  "parent_agent_id":1,"explicitly_parentless":false,
+                  "created_at_ms":0,
+                  "incarnations":[{"incarnation_id":2,"state":"ready",
+                     "backend_kind":"claude","live":"working"}]}
             ],
             "obligations": [
-                {"ask_message_id":"ask-1","owing_agent_id":"child-id",
-                 "waiting_agent_id":"parent-id","state":"open",
+                {"ask_message_id":1,"owing_agent_id":2,
+                  "waiting_agent_id":1,"state":"open",
                  "created_at_ms": now - 5_400_000_i64}
             ]
         }});
@@ -2937,19 +2943,42 @@ mod tests {
     }
 
     #[test]
+    fn report_keeps_pre_cutover_string_ids_visible() {
+        let report = serde_json::json!({"result":{
+            "generated_at_ms": 0,
+            "alias_collisions": {},
+            "agents": [{
+                "agent_id":"019ff700-0000-7000-8000-000000000001",
+                "public_name":"coordinator",
+                "parent_agent_id":null,
+                "created_at_ms":0,
+                "incarnations":[{
+                    "incarnation_id":"019ff700-0000-7000-8000-000000000002",
+                    "state":"ready",
+                    "backend_kind":"opencode"
+                }]
+            }],
+            "obligations":[]
+        }});
+
+        let text = format_receipt("report", &report);
+        assert!(text.contains("coordinator agent=019ff700"), "{text}");
+    }
+
+    #[test]
     fn conversation_age_is_reported_only_when_it_was_actually_observed() {
         let now = parse_utc_rfc3339_ms("2026-08-16T00:00:00Z").expect("parse");
         let report = serde_json::json!({"result":{
             "generated_at_ms": now,
             "agents": [
-                {"agent_id":"measured-id","public_name":"measured",
-                 "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i1","state":"ready",
+                {"agent_id":1,"public_name":"measured",
+                  "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
+                  "incarnations":[{"incarnation_id":1,"state":"ready",
                     "backend_kind":"claude","created_at_ms": now - 259_200_000_i64,
                     "native_session_rotated_at_ms": now - 5_400_000_i64}]},
-                {"agent_id":"unseen-id","public_name":"unseen",
-                 "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i2","state":"ready",
+                {"agent_id":2,"public_name":"unseen",
+                  "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
+                  "incarnations":[{"incarnation_id":2,"state":"ready",
                     "backend_kind":"claude","created_at_ms": now - 259_200_000_i64,
                     "native_session_rotated_at_ms": null}]}
             ],
@@ -2977,17 +3006,17 @@ mod tests {
         let report = serde_json::json!({"result":{
             "generated_at_ms": now,
             "agents": [
-                {"agent_id":"armed-id","public_name":"armed",
-                 "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i1","state":"ready",
+                {"agent_id":1,"public_name":"armed",
+                  "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
+                  "incarnations":[{"incarnation_id":1,"state":"ready",
                     "backend_kind":"opencode","created_at_ms": now - 3_600_000_i64,
                     "native_session_rotated_at_ms": now - 600_000_i64,
-                    "renew":{"renew_id":"r1","phase":"scheduled","cycle":97,
+                    "renew":{"renew_id":1,"phase":"scheduled","cycle":97,
                              "every_ms":2_700_000_i64,
                              "cycle_due_at_ms": now + 900_000_i64}}]},
-                {"agent_id":"bare-id","public_name":"unarmed",
-                 "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
-                 "incarnations":[{"incarnation_id":"i2","state":"ready",
+                {"agent_id":2,"public_name":"unarmed",
+                  "parent_agent_id":null,"explicitly_parentless":true,"created_at_ms":0,
+                  "incarnations":[{"incarnation_id":2,"state":"ready",
                     "backend_kind":"opencode","created_at_ms": now - 3_600_000_i64,
                     "native_session_rotated_at_ms": now - 600_000_i64,
                     "renew": null}]}

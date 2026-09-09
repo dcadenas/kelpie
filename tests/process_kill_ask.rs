@@ -326,7 +326,7 @@ fn durable_ask_state(database: &Path) -> (String, String, String, String, String
     Connection::open(database)
         .expect("open state database")
         .query_row(
-            "SELECT m.id, o.outcome, a.phase, d.outcome, ob.state,
+            "SELECT CAST(m.id AS TEXT), o.outcome, a.phase, d.outcome, ob.state,
                     a.attempt_number, d.attempt_number
              FROM operations o
              JOIN operation_attempts a ON a.operation_id = o.id
@@ -431,7 +431,7 @@ fn kill_after_ask_submitted_recovers_unknown_without_resend_and_keeps_obligation
     assert_eq!(
         pending["result"],
         serde_json::json!([{
-            "ask_message_id":after_recovery.0,
+            "ask_message_id":after_recovery.0.parse::<u64>().expect("integer id"),
             "waiting_agent_id":waiting.logical_agent_id,
             "state":"open"
         }])
@@ -522,7 +522,7 @@ fn kill_after_ask_write_recovers_unknown_without_resend_and_keeps_obligation_ope
     assert_eq!(
         pending["result"],
         serde_json::json!([{
-            "ask_message_id":after_recovery.0,
+            "ask_message_id":after_recovery.0.parse::<u64>().expect("integer id"),
             "waiting_agent_id":waiting.logical_agent_id,
             "state":"open"
         }])
@@ -610,7 +610,7 @@ fn kill_after_ask_acceptance_recovers_unknown_without_resend_and_keeps_obligatio
     assert_eq!(
         pending["result"],
         serde_json::json!([{
-            "ask_message_id":after_recovery.0,
+            "ask_message_id":after_recovery.0.parse::<u64>().expect("integer id"),
             "waiting_agent_id":waiting.logical_agent_id,
             "state":"open"
         }])

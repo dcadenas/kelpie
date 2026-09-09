@@ -84,7 +84,7 @@ fn accepted_reminder_ask(
             waiting.logical_agent_id,
             owing.logical_agent_id,
             owing.incarnation_id,
-            "question",
+            "ORIGINAL ASK BODY",
             "reminder-ask",
             None,
             Some(interval_ms),
@@ -248,11 +248,14 @@ fn idle_exact_incarnation_receives_correlated_reminder() {
         let request: serde_json::Value = serde_json::from_str(&line).expect("prompt json");
         assert_eq!(request["method"], "agent.prompt");
         assert_eq!(request["params"]["target"], "w:p2");
+        let text = request["params"]["text"].as_str().expect("text");
+        assert!(text.contains("kelpie ask-info"), "{text}");
+        assert!(text.contains("kelpie reminder-snooze"), "{text}");
+        assert!(text.contains("kelpie reply"), "{text}");
+        assert!(text.contains("kelpie cancel"), "{text}");
         assert!(
-            request["params"]["text"]
-                .as_str()
-                .expect("text")
-                .contains("Pending final reply")
+            !text.contains("ORIGINAL ASK BODY"),
+            "ask body was inlined: {text}"
         );
         serde_json::to_writer(
             &mut prompt_stream,
@@ -472,7 +475,7 @@ fn receiver_increase_and_snooze_survive_progress_and_restart() {
     let db = dir.path().join("test.sqlite3");
     let mut store = Store::open(&db).unwrap();
     let (ask, owing) = accepted_reminder_ask(&mut store, 1_200_000);
-    let wrong = kelpie::domain::LogicalAgentId::new();
+    let wrong = kelpie::domain::LogicalAgentId::try_from(u64::MAX).expect("positive");
     let until = store_clock_ms().unwrap() + 7_200_000;
     assert!(store.snooze_reminder(wrong, ask.message_id, until).is_err());
     assert!(
@@ -650,7 +653,7 @@ fn disabled_and_terminal_policies_cannot_be_changed() {
 }
 
 #[test]
-fn initial_start_ask_arms_twenty_minute_default_on_acceptance() {
+fn initial_start_ask_arms_forty_five_minute_default_on_acceptance() {
     let mut store = Store::in_memory().unwrap();
     let sender = ready(&mut store, "sender", "w:p1", "term-1", "sender");
     let owing = ready(&mut store, "owing", "w:p2", "term-2", "owing");
@@ -667,7 +670,7 @@ fn initial_start_ask_arms_twenty_minute_default_on_acceptance() {
         )
         .unwrap();
     let timing = store.reminder_info(ask.message_id).unwrap().unwrap();
-    assert_eq!(timing.interval_ms, 1_200_000);
+    assert_eq!(timing.interval_ms, 2_700_000);
     assert!(timing.next_eligible_at_ms.is_none());
     store
         .begin_attempt(ask.operation_id, owing.incarnation_id, "initial-request")
@@ -685,7 +688,7 @@ fn initial_start_ask_arms_twenty_minute_default_on_acceptance() {
         .unwrap()
         .next_eligible_at_ms
         .unwrap();
-    assert!(due >= before + 1_200_000);
+    assert!(due >= before + 2_700_000);
     assert!(store.due_reminders(due - 1).unwrap().is_empty());
 }
 

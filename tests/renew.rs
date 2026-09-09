@@ -218,7 +218,7 @@ fn serve_briefly(
     mut respond: impl FnMut(&serde_json::Value) -> serde_json::Value,
 ) -> Vec<serde_json::Value> {
     listener.set_nonblocking(true).expect("nonblocking");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
     while std::time::Instant::now() < deadline {
         let Ok((mut stream, _)) = listener.accept() else {
@@ -1384,7 +1384,7 @@ fn the_report_rpc_carries_renew_state_over_the_socket() {
         })
         .expect("the armed policy crosses the socket");
 
-    assert_eq!(renew["renew_id"], policy.to_string());
+    assert_eq!(renew["renew_id"], serde_json::json!(policy));
     assert_eq!(renew["phase"], "scheduled");
     assert_eq!(renew["cycle"], 1);
     assert_eq!(renew["every_ms"], every_ms);
@@ -1668,15 +1668,15 @@ fn the_cancel_rpc_ends_a_policy_over_the_socket() {
             "id": "c",
             "method": "renew.cancel",
             "params": {
-                "renew_id": policy.to_string(),
-                "requester_agent_id": worker.logical_agent_id.to_string(),
+                "renew_id": policy,
+                "requester_agent_id": worker.logical_agent_id,
                 "reason": "armed on the wrong agent"
             }
         }),
     );
-    assert_eq!(cancelled["result"]["renew_id"], policy.to_string());
+    assert_eq!(cancelled["result"]["renew_id"], serde_json::json!(policy));
     assert!(
-        cancelled["result"]["notice_id"].is_string(),
+        cancelled["result"]["notice_id"].is_number(),
         "the cancel is announced: {cancelled}"
     );
 
@@ -1732,7 +1732,7 @@ fn the_renew_rpc_will_not_resolve_an_alias() {
             "id": "r",
             "method": "renew",
             "params": {
-                "requester": worker.logical_agent_id.to_string(),
+                "requester": worker.logical_agent_id,
                 "recipient_alias": "worker",
                 "prepare_prompt": "checkpoint",
                 "prompt": "resume",
@@ -1783,9 +1783,9 @@ fn the_renew_rpc_refuses_every_combined_with_a_due_time() {
             "id": "r",
             "method": "renew",
             "params": {
-                "requester": worker.logical_agent_id.to_string(),
-                "recipient": worker.logical_agent_id.to_string(),
-                "recipient_incarnation": worker.incarnation_id.to_string(),
+                "requester": worker.logical_agent_id,
+                "recipient": worker.logical_agent_id,
+                "recipient_incarnation": worker.incarnation_id,
                 "prepare_prompt": "checkpoint",
                 "prompt": "resume",
                 "on_timeout": "abort",

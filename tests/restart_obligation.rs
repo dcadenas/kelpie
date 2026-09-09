@@ -239,7 +239,7 @@ fn open_ask_survives_kelpie_and_herdr_restart_then_resolves() {
     assert_eq!(reply["result"]["obligation_state"], "resolved");
     assert_eq!(
         reply["result"]["recipient_incarnation"],
-        waiting.incarnation_id.to_string()
+        serde_json::json!(waiting.incarnation_id)
     );
     second_server.join().expect("second daemon generation");
     second_herdr.join().expect("second Herdr generation");

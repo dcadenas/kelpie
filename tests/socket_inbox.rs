@@ -376,7 +376,7 @@ fn occupant_ask_envelope_uses_waiter_from_and_reply_to() {
     let prompt = parsed_rx.recv().expect("prompt");
     assert_eq!(prompt["method"], "agent.prompt");
     let envelope = prompt["params"]["text"].as_str().expect("text");
-    let ask_id = asked["result"]["message_id"].as_str().expect("ask id");
+    let ask_id = asked["result"]["message_id"].to_string();
     assert!(
         envelope.starts_with("<kelpie from=inbox msg="),
         "envelope: {envelope}"
@@ -635,7 +635,7 @@ fn reconnect_drains_one_waiter_and_refuses_another() {
         &serde_json::json!({
             "id": "claim-gone",
             "method": "inbox.claim",
-            "params": {"logical_agent_id": LogicalAgentId::new()}
+            "params": {"logical_agent_id": LogicalAgentId::try_from(u64::MAX).expect("positive")}
         }),
     );
     assert_eq!(foreign["error"]["class"], "conflict");
@@ -665,12 +665,12 @@ fn waiter_retire_cancels_open_ask_and_refuses_later_final_as_not_open() {
     assert!(retired["error"].is_null(), "{retired}");
     assert_eq!(
         retired["result"]["logical_agent_id"],
-        waiter.logical_agent_id.to_string()
+        serde_json::json!(waiter.logical_agent_id)
     );
     assert_eq!(retired["result"]["targeting_ended"], true);
     assert_eq!(
         retired["result"]["cancelled_ask_ids"],
-        serde_json::json!([ask.to_string()])
+        serde_json::json!([ask])
     );
     let prompt = prompt_rx
         .recv_timeout(Duration::from_secs(5))

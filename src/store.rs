@@ -5,7 +5,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::types::Type;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use thiserror::Error;
 
 use crate::domain::{
@@ -16,9 +17,48 @@ use crate::domain::{
 };
 use crate::herdr::Snapshot;
 
-const SCHEMA_VERSION: i64 = 29;
+macro_rules! last_insert_id {
+    ($connection:expr, $type:ident) => {
+        $type::from_rowid($connection.last_insert_rowid()).ok_or_else(|| {
+            StoreError::InvalidRecord(format!(
+                "SQLite returned an invalid {} row id",
+                stringify!($type)
+            ))
+        })?
+    };
+}
+
+fn id_text(row: &Row<'_>, index: usize) -> rusqlite::Result<String> {
+    let value = row.get::<_, i64>(index)?;
+    if value <= 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            Type::Integer,
+            "durable ids must be positive integers".into(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_id_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            if value <= 0 {
+                Err(rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    Type::Integer,
+                    "durable ids must be positive integers".into(),
+                ))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
+}
+
+const SCHEMA_VERSION: i64 = 30;
 /// Backstop interval for unanswered asks, including initial launch asks.
-pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 1_200_000;
+pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 2_700_000;
 
 const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
     active_roots(logical_agent_id) AS (
@@ -528,10 +568,6 @@ pub struct DueReminder {
     pub pane_id: String,
     pub terminal_id: String,
     pub interval_ms: i64,
-    /// The ask's original question. The reminder is the amnesia protocol: a
-    /// renewed or restarted agent may owe an answer it can no longer remember,
-    /// so the reminder always carries what it was asked.
-    pub body: String,
 }
 
 /// An unanswered ask eligible for stopped-boundary observation.
@@ -788,8 +824,6 @@ impl Store {
     /// Returns a conflict for a reused idempotency key, missing continue target,
     /// or invalid parent.
     pub fn declare_start(&mut self, intent: &StartIntent) -> Result<DeclaredStart, StoreError> {
-        let incarnation_id = IncarnationId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         refuse_reused_non_prompt_idempotency_key(&tx, &intent.idempotency_key)?;
@@ -799,7 +833,7 @@ impl Store {
                 .query_row(
                     "SELECT id FROM logical_agents WHERE id = ?1",
                     [existing.to_string()],
-                    |row| row.get(0),
+                    |row| id_text(row, 0),
                 )
                 .optional()?;
             if found.is_none() {
@@ -815,26 +849,22 @@ impl Store {
             )?;
             existing
         } else {
-            let logical_agent_id = LogicalAgentId::new();
             insert_logical_agent(
                 &tx,
-                logical_agent_id,
                 &intent.public_name,
                 intent.parent,
                 DeliveryTransport::HerdrPrompt,
                 now,
-            )?;
-            logical_agent_id
+            )?
         };
         tx.execute(
             "INSERT INTO incarnations (
-                id, logical_agent_id, herdr_session, intended_pane_id,
+                logical_agent_id, herdr_session, intended_pane_id,
                 expected_terminal_id, backend_kind, backend_args_json,
                 working_directory, created_at_ms, state,
                 requested_model, requested_provider, requested_effort
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'declared', ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'declared', ?9, ?10, ?11)",
             params![
-                incarnation_id.to_string(),
                 logical_agent_id.to_string(),
                 intent.herdr_session,
                 intent.pane_id,
@@ -849,13 +879,13 @@ impl Store {
                 empty_to_none(intent.requested_effort.as_deref()),
             ],
         )?;
+        let incarnation_id = last_insert_id!(tx, IncarnationId);
         tx.execute(
             "INSERT INTO operations (
-                id, idempotency_key, kind, target_incarnation_id, intent_json,
+                idempotency_key, kind, target_incarnation_id, intent_json,
                 created_at_ms, outcome
-             ) VALUES (?1, ?2, 'start', ?3, ?4, ?5, 'pending')",
+             ) VALUES (?1, 'start', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 intent.idempotency_key,
                 incarnation_id.to_string(),
                 serde_json::to_string(intent).map_err(|error| invalid_json(&error))?,
@@ -863,6 +893,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.commit()?;
         Ok(DeclaredStart {
             logical_agent_id,
@@ -963,8 +994,6 @@ impl Store {
             .native_agent_session
             .as_ref()
             .map(ToString::to_string);
-        let incarnation_id = IncarnationId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         refuse_reused_non_prompt_idempotency_key(&tx, &intent.idempotency_key)?;
@@ -975,7 +1004,7 @@ impl Store {
                    AND observed_pane_id = ?1
                    AND observed_terminal_id = ?2",
                 params![evidence.pane_id, evidence.terminal_id],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if let Some(existing) = conflict {
@@ -989,7 +1018,7 @@ impl Store {
                  JOIN logical_agents l ON l.id = i.logical_agent_id
                  WHERE i.state = 'ready' AND l.public_name = ?1",
                 [&public_name],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if let Some(existing) = alias_conflict {
@@ -1040,7 +1069,7 @@ impl Store {
                 .query_row(
                     "SELECT id FROM logical_agents WHERE id = ?1",
                     [existing.to_string()],
-                    |row| row.get(0),
+                    |row| id_text(row, 0),
                 )
                 .optional()?;
             if found.is_none() {
@@ -1055,16 +1084,13 @@ impl Store {
             )?;
             existing
         } else {
-            let logical_agent_id = LogicalAgentId::new();
             insert_logical_agent(
                 &tx,
-                logical_agent_id,
                 &public_name,
                 intent.parent,
                 DeliveryTransport::HerdrPrompt,
                 now,
-            )?;
-            logical_agent_id
+            )?
         };
         let intent_json = serde_json::json!({
             "adopt": intent,
@@ -1082,14 +1108,13 @@ impl Store {
         });
         tx.execute(
             "INSERT INTO incarnations (
-                id, logical_agent_id, herdr_session, intended_pane_id,
+                logical_agent_id, herdr_session, intended_pane_id,
                 expected_terminal_id, observed_pane_id, observed_terminal_id,
                 backend_kind, backend_args_json, working_directory, created_at_ms, state,
                 name_authority, observed_native_session_json,
                 requested_model, requested_provider, requested_effort
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
-                incarnation_id.to_string(),
                 logical_agent_id.to_string(),
                 intent.herdr_session,
                 evidence.pane_id,
@@ -1109,14 +1134,14 @@ impl Store {
                 empty_to_none(intent.requested_effort.as_deref()),
             ],
         )?;
+        let incarnation_id = last_insert_id!(tx, IncarnationId);
         let resolved_at = resolved.then_some(now);
         tx.execute(
             "INSERT INTO operations (
-                id, idempotency_key, kind, target_incarnation_id, intent_json,
+                idempotency_key, kind, target_incarnation_id, intent_json,
                 created_at_ms, resolved_at_ms, outcome
-             ) VALUES (?1, ?2, 'adopt', ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES (?1, 'adopt', ?2, ?3, ?4, ?5, ?6)",
             params![
-                operation_id.to_string(),
                 intent.idempotency_key,
                 incarnation_id.to_string(),
                 intent_json.to_string(),
@@ -1126,6 +1151,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.commit()?;
         Ok(DeclaredStart {
             logical_agent_id,
@@ -1181,7 +1207,7 @@ impl Store {
                AND targeting_ended_at_ms IS NULL
              ORDER BY created_at_ms, id",
         )?;
-        let rows = statement.query_map([public_name], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map([public_name], |row| id_text(row, 0))?;
         let ids = rows.collect::<Result<Vec<_>, _>>()?;
         match ids.as_slice() {
             [] => Ok(None),
@@ -1286,7 +1312,7 @@ impl Store {
                  JOIN incarnations i ON i.id = o.target_incarnation_id
                  WHERE o.idempotency_key = ?1 AND o.kind IN ('start', 'adopt')",
                 [idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, id_text(row, 2)?)),
             )
             .optional()?;
         row.map(|(operation, incarnation, logical)| {
@@ -1322,7 +1348,7 @@ impl Store {
             .query_row(
                 "SELECT target_incarnation_id FROM operations WHERE id = ?1 AND outcome = 'pending'",
                 [operation_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if owner.as_deref() != Some(&incarnation_id.to_string()) {
@@ -1623,7 +1649,7 @@ impl Store {
             .query_row(
                 "SELECT target_incarnation_id FROM operations WHERE id = ?1 AND outcome = 'pending'",
                 [operation_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if owner.as_deref() != Some(&incarnation_id.to_string()) {
@@ -1852,7 +1878,7 @@ impl Store {
                  JOIN deliveries d ON d.message_id = m.id
                  WHERE d.operation_id = ?1 AND m.kind = 'reply' AND m.disposition = 'final'",
                 [operation_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?)),
             )
             .optional()?;
         if let Some((ask_message_id, resolving_message_id)) = final_reply {
@@ -1894,15 +1920,13 @@ impl Store {
                 "an operator-attributed initial ask needs an agent waiting identity".into(),
             ));
         }
-        let message_id = MessageId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         let owner: Option<String> = tx
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1 AND state = 'ready'",
                 [recipient_incarnation.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if owner.as_deref() != Some(&recipient.to_string()) {
@@ -1929,10 +1953,9 @@ impl Store {
         let creates_obligation = i64::from(intent.kind == InitialMessageKind::Ask);
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                message_id.to_string(),
                 intent.sender.map(|id| id.to_string()),
                 recipient.to_string(),
                 kind,
@@ -1941,6 +1964,7 @@ impl Store {
                 creates_obligation
             ],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         if let Some(sender) = intent
             .sender
             .filter(|_| intent.kind == InitialMessageKind::Ask)
@@ -1953,11 +1977,10 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json,
+             (idempotency_key, kind, target_incarnation_id, intent_json,
               created_at_ms, outcome)
-             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+             VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 recipient_incarnation.to_string(),
                 serde_json::json!({"message_id": message_id}).to_string(),
@@ -1965,6 +1988,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.execute(
             "INSERT INTO deliveries
              (message_id, recipient_incarnation_id, attempt_number, scheduled_at_ms,
@@ -2011,7 +2035,7 @@ impl Store {
             .query_row(
                 "SELECT logical_agent_id FROM socket_waiter_keys WHERE idempotency_key = ?1",
                 [idempotency_key],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if let Some(existing) = replay {
@@ -2027,7 +2051,14 @@ impl Store {
                 "SELECT public_name, parent_agent_id, explicitly_parentless, targeting_ended_at_ms
                  FROM logical_agents WHERE id = ?1",
                 [logical_agent_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        optional_id_text(row, 1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
             )?;
             let parent_matches = match parent {
                 Parent::Parentless => stored_parentless == 1 && stored_parent.is_none(),
@@ -2060,10 +2091,8 @@ impl Store {
                 ));
             }
         }
-        let logical_agent_id = LogicalAgentId::new();
-        insert_logical_agent(
+        let logical_agent_id = insert_logical_agent(
             &tx,
-            logical_agent_id,
             public_name,
             parent,
             DeliveryTransport::SocketInbox,
@@ -2116,9 +2145,7 @@ impl Store {
              WHERE waiting_agent_id = ?1 AND state IN ('open', 'in_progress')
              ORDER BY creation_sequence",
         )?;
-        let rows = statement.query_map([waiting_agent_id.to_string()], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = statement.query_map([waiting_agent_id.to_string()], |row| id_text(row, 0))?;
         let mut asks = Vec::new();
         for row in rows {
             asks.push(parse_message_id(&row?)?);
@@ -2166,7 +2193,7 @@ impl Store {
                  ORDER BY creation_sequence",
             )?;
             let rows = statement.query_map([logical_agent_id.to_string()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((id_text(row, 0)?, id_text(row, 1)?))
             })?;
             let mut asks = Vec::new();
             for row in rows {
@@ -2373,13 +2400,13 @@ impl Store {
         let now = now_millis()?;
         let rows = statement.query_map(params![recipient_agent_id.to_string(), now], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                optional_id_text(row, 3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                optional_id_text(row, 6)?,
                 row.get::<_, Option<String>>(7)?,
             ))
         })?;
@@ -2481,7 +2508,7 @@ impl Store {
         disposition: Option<ReplyDisposition>,
     ) -> Result<MessageId, StoreError> {
         let now = now_millis()?;
-        let message_id = MessageId::new();
+        let message_id = MessageId::test();
         let kind_name = match kind {
             MessageKind::Tell => "tell",
             MessageKind::Ask => "ask",
@@ -2634,8 +2661,6 @@ impl Store {
                 operation_id: replay.operation_id,
             });
         }
-        let message_id = MessageId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let schedule = delivery_schedule(now, due_at_ms)?;
         let tx = self.connection.transaction()?;
@@ -2643,7 +2668,7 @@ impl Store {
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1",
                 [recipient_incarnation.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if incarnation_owner.as_deref() != Some(&recipient.to_string()) {
@@ -2669,10 +2694,11 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
-             VALUES (?1, ?2, ?3, 'ask', ?4, ?5, 1)",
-            params![message_id.to_string(), message_sender, recipient.to_string(), body, now],
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
+             VALUES (?1, ?2, 'ask', ?3, ?4, 1)",
+            params![message_sender, recipient.to_string(), body, now],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         insert_obligation(&tx, message_id, recipient, sender, now)?;
         if let Some(interval_ms) = remind_after_ms {
             tx.execute(
@@ -2687,10 +2713,9 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json, created_at_ms, outcome)
-             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+             (idempotency_key, kind, target_incarnation_id, intent_json, created_at_ms, outcome)
+             VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 recipient_incarnation.to_string(),
                 intent.to_string(),
@@ -2698,6 +2723,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.execute(
             "INSERT INTO deliveries
              (message_id, recipient_incarnation_id, attempt_number, scheduled_at_ms, outcome, operation_id)
@@ -2762,8 +2788,6 @@ impl Store {
                 operation_id: replay.operation_id,
             });
         }
-        let message_id = MessageId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let schedule = delivery_schedule(now, due_at_ms)?;
         let tx = self.connection.transaction()?;
@@ -2771,7 +2795,7 @@ impl Store {
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1 AND state = 'ready'",
                 [recipient_incarnation.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if incarnation_owner.as_deref() != Some(&recipient.to_string()) {
@@ -2791,27 +2815,21 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
-             VALUES (?1, ?2, ?3, 'tell', ?4, ?5, 0)",
-            params![
-                message_id.to_string(),
-                sender.to_string(),
-                recipient.to_string(),
-                body,
-                now
-            ],
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
+             VALUES (?1, ?2, 'tell', ?3, ?4, 0)",
+            params![sender.to_string(), recipient.to_string(), body, now],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         let mut intent = serde_json::json!({"message_id": message_id});
         if let Some(due_at_ms) = due_at_ms {
             intent["due_at_ms"] = serde_json::json!(due_at_ms);
         }
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json,
-              created_at_ms, outcome)
-             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+             (idempotency_key, kind, target_incarnation_id, intent_json,
+               created_at_ms, outcome)
+             VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 recipient_incarnation.to_string(),
                 intent.to_string(),
@@ -2819,6 +2837,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.execute(
             "INSERT INTO deliveries
              (message_id, recipient_incarnation_id, attempt_number, scheduled_at_ms,
@@ -2856,7 +2875,6 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<CreatedSocketTell, StoreError> {
-        let message_id = MessageId::new();
         let now = now_millis()?;
         let schedule = delivery_schedule(now, due_at_ms)?;
         let tx = self.connection.transaction()?;
@@ -2873,16 +2891,11 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
-             VALUES (?1, ?2, ?3, 'tell', ?4, ?5, 0)",
-            params![
-                message_id.to_string(),
-                sender.to_string(),
-                recipient.to_string(),
-                body,
-                now
-            ],
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
+             VALUES (?1, ?2, 'tell', ?3, ?4, 0)",
+            params![sender.to_string(), recipient.to_string(), body, now],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         queue_socket_inbox_delivery_at(&tx, message_id, recipient, schedule.scheduled_at_ms)?;
         tx.execute(
             "INSERT INTO socket_inbox_keys (idempotency_key, message_id) VALUES (?1, ?2)",
@@ -2925,11 +2938,11 @@ impl Store {
                 [idempotency_key],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        id_text(row, 0)?,
+                        id_text(row, 1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        id_text(row, 4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                     ))
@@ -2954,7 +2967,6 @@ impl Store {
                 state: row.6,
             });
         }
-        let schedule_id = ScheduleId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         for (id, label) in [(sender, "sender"), (recipient, "recipient")] {
@@ -2971,11 +2983,10 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO schedules
-             (id, kind, logical_agent_id, requester_agent_id, body, interval_ms,
-              clock, next_fire_at_ms, cycle, state, idempotency_key, created_at_ms)
-             VALUES (?1, 'tell', ?2, ?3, ?4, ?5, 'wall', ?6, 1, 'active', ?7, ?8)",
+             (kind, logical_agent_id, requester_agent_id, body, interval_ms,
+               clock, next_fire_at_ms, cycle, state, idempotency_key, created_at_ms)
+             VALUES ('tell', ?1, ?2, ?3, ?4, 'wall', ?5, 1, 'active', ?6, ?7)",
             params![
-                schedule_id.to_string(),
                 recipient.to_string(),
                 sender.to_string(),
                 body,
@@ -2986,6 +2997,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let schedule_id = last_insert_id!(tx, ScheduleId);
         tx.commit()?;
         Ok(CreatedSchedule {
             schedule_id,
@@ -3016,11 +3028,11 @@ impl Store {
                 [idempotency_key],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        id_text(row, 0)?,
+                        id_text(row, 1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        id_text(row, 4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                     ))
@@ -3059,9 +3071,9 @@ impl Store {
         )?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
+                id_text(row, 2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
@@ -3180,11 +3192,9 @@ impl Store {
                 ],
             )?;
             if previous_outcome.as_deref() != Some("target_unavailable") {
-                let notice_id = OperatorNoticeId::new();
                 tx.execute(
-                    "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO operator_notices (body, created_at_ms) VALUES (?1, ?2)",
                     params![
-                        notice_id.to_string(),
                         format!(
                             "schedule {} cycle {} target {} unavailable; no message delivered",
                             item.schedule_id, item.cycle, item.recipient
@@ -3201,25 +3211,27 @@ impl Store {
                 message_id: None,
             });
         }
-        let message_id = MessageId::new();
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
-             VALUES (?1, ?2, ?3, 'tell', ?4, ?5, 0)",
-            params![message_id.to_string(), item.sender.to_string(), item.recipient.to_string(),
-                item.body, now_ms],
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms, creates_obligation)
+             VALUES (?1, ?2, 'tell', ?3, ?4, 0)",
+            params![
+                item.sender.to_string(),
+                item.recipient.to_string(),
+                item.body,
+                now_ms
+            ],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         if socket {
             queue_socket_inbox_delivery_at(&tx, message_id, item.recipient, now_ms)?;
         } else if let Some(incarnation) = ready {
-            let operation_id = OperationId::new();
             tx.execute(
                 "INSERT INTO operations
-                 (id, idempotency_key, kind, target_incarnation_id, intent_json,
-                  created_at_ms, outcome)
-                 VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+                 (idempotency_key, kind, target_incarnation_id, intent_json,
+                   created_at_ms, outcome)
+                 VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
                 params![
-                    operation_id.to_string(),
                     format!("kelpie:schedule:{}:{}", item.schedule_id, item.cycle),
                     incarnation.to_string(),
                     serde_json::json!({
@@ -3231,6 +3243,7 @@ impl Store {
                     now_ms
                 ],
             )?;
+            let operation_id = last_insert_id!(tx, OperationId);
             tx.execute(
                 "INSERT INTO deliveries
                  (message_id, recipient_incarnation_id, attempt_number, scheduled_at_ms,
@@ -3338,18 +3351,18 @@ impl Store {
         )?;
         let rows = statement.query_map([agent_id.to_string()], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                id_text(row, 2)?,
+                optional_id_text(row, 3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, String>(11)?,
+                optional_id_text(row, 10)?,
+                id_text(row, 11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
             ))
@@ -3446,15 +3459,13 @@ impl Store {
                 })?,
             });
         }
-        let message_id = MessageId::new();
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         let owners: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT owing_agent_id, waiting_agent_id, state FROM obligations WHERE ask_message_id = ?1",
                 [reply_to.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?)),
             )
             .optional()?;
         let Some((owing, waiting, state)) = owners else {
@@ -3483,11 +3494,10 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO messages
-             (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
-              reply_to_message_id, disposition, creates_obligation)
-             VALUES (?1, ?2, ?3, 'reply', ?4, ?5, ?6, ?7, 0)",
+             (sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
+               reply_to_message_id, disposition, creates_obligation)
+             VALUES (?1, ?2, 'reply', ?3, ?4, ?5, ?6, 0)",
             params![
-                message_id.to_string(),
                 owing,
                 waiting,
                 body,
@@ -3496,6 +3506,7 @@ impl Store {
                 disposition_name(disposition),
             ],
         )?;
+        let message_id = last_insert_id!(tx, MessageId);
         match waiting_identity.transport {
             DeliveryTransport::SocketInbox => {
                 queue_socket_inbox_delivery(&tx, message_id, waiting_agent, now)?;
@@ -3525,10 +3536,9 @@ impl Store {
         });
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json, created_at_ms, outcome)
-             VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+             (idempotency_key, kind, target_incarnation_id, intent_json, created_at_ms, outcome)
+             VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 recipient_incarnation.to_string(),
                 intent.to_string(),
@@ -3536,6 +3546,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         let delivery_outcome = if due_at_ms.is_some() {
             "queued"
         } else {
@@ -3580,7 +3591,7 @@ impl Store {
                 "SELECT waiting_agent_id, owing_agent_id FROM obligations
                  WHERE ask_message_id = ?1 AND state IN ('open','in_progress')",
                 [reply_to.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?)),
             )
             .optional()?;
         let Some((waiting, owing)) = parties else {
@@ -3632,7 +3643,7 @@ impl Store {
                 "SELECT reply_to_message_id, disposition FROM messages
                  WHERE id = ?1 AND kind = 'reply'",
                 [message_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((id_text(row, 0)?, row.get(1)?)),
             )
             .optional()?;
         let (reply_to, disposition) = values.ok_or_else(|| {
@@ -3665,9 +3676,7 @@ impl Store {
              WHERE logical_agent_id = ?1 AND state = 'ready'
              ORDER BY created_at_ms ASC",
         )?;
-        let rows = statement.query_map([logical_agent_id.to_string()], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = statement.query_map([logical_agent_id.to_string()], |row| id_text(row, 0))?;
         let mut matches = Vec::new();
         for row in rows {
             matches.push(row?);
@@ -3718,7 +3727,7 @@ impl Store {
             let transport = row.get::<_, String>(3)?;
             let active_socket_waiter = row.get::<_, i64>(4)? != 0;
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, i64>(1)?,
                 transport,
                 has_ready_incarnation,
@@ -3763,14 +3772,14 @@ impl Store {
         )?;
         let rows = statement.query_map([public_name], |row| {
             Ok(NameObligation {
-                ask_message_id: row.get(0)?,
+                ask_message_id: id_text(row, 0)?,
                 state: row.get(1)?,
                 created_at_ms: row.get(2)?,
                 last_activity_at_ms: row.get(3)?,
-                asker_agent_id: row.get(4)?,
+                asker_agent_id: id_text(row, 4)?,
                 asker_name: row.get(5)?,
                 asker_live: row.get::<_, i64>(6)? != 0,
-                responder_agent_id: row.get(7)?,
+                responder_agent_id: id_text(row, 7)?,
                 responder_name: row.get(8)?,
                 responder_live: row.get::<_, i64>(9)? != 0,
             })
@@ -3960,7 +3969,7 @@ impl Store {
              ORDER BY i.created_at_ms ASC",
         )?;
         let rows = statement.query_map([public_name], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((id_text(row, 0)?, id_text(row, 1)?))
         })?;
         let mut matches = Vec::new();
         for row in rows {
@@ -3998,7 +4007,7 @@ impl Store {
              ORDER BY attempt_number ASC
              LIMIT 1",
             [message_id.to_string()],
-            |row| row.get(0),
+            |row| id_text(row, 0),
         )?;
         IncarnationId::parse(&value).ok_or_else(|| {
             StoreError::InvalidRecord(format!("invalid delivery incarnation {value}"))
@@ -4017,7 +4026,7 @@ impl Store {
         let (sender, recipient): (String, String) = self.connection.query_row(
             "SELECT sender_agent_id, recipient_agent_id FROM messages WHERE id = ?1",
             [message_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((id_text(row, 0)?, id_text(row, 1)?)),
         )?;
         let sender = LogicalAgentId::parse(&sender).ok_or_else(|| {
             StoreError::InvalidRecord(format!("invalid sender agent id {sender}"))
@@ -4100,19 +4109,19 @@ impl Store {
                 [idempotency_key],
                 |row| {
                     Ok((
-                        row.get(0)?,
+                        id_text(row, 0)?,
                         row.get(1)?,
                         row.get(2)?,
                         row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
+                        id_text(row, 4)?,
+                        optional_id_text(row, 5)?,
                         row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
+                        optional_id_text(row, 7)?,
+                        optional_id_text(row, 8)?,
+                        optional_id_text(row, 9)?,
                         row.get(10)?,
                         row.get(11)?,
-                        row.get(12)?,
+                        optional_id_text(row, 12)?,
                         row.get(13)?,
                         row.get(14)?,
                     ))
@@ -4240,7 +4249,6 @@ impl Store {
         prompt_settle_delay_ms: i64,
         idempotency_key: &str,
     ) -> Result<OperationId, StoreError> {
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         refuse_reused_non_prompt_idempotency_key(&tx, idempotency_key)?;
@@ -4248,7 +4256,7 @@ impl Store {
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1 AND state = 'ready'",
                 [recipient_incarnation.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if owner.as_deref() != Some(&recipient.to_string()) {
@@ -4280,11 +4288,10 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json,
+             (idempotency_key, kind, target_incarnation_id, intent_json,
               created_at_ms, outcome)
-             VALUES (?1, ?2, 'clear', ?3, ?4, ?5, 'pending')",
+             VALUES (?1, 'clear', ?2, ?3, ?4, 'pending')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 recipient_incarnation.to_string(),
                 serde_json::json!({
@@ -4298,6 +4305,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.commit()?;
         Ok(operation_id)
     }
@@ -4368,8 +4376,8 @@ impl Store {
                      FROM operation_attempts a
                      JOIN operations o ON o.id = a.operation_id
                      WHERE o.kind = 'clear' AND o.target_incarnation_id = ?1
-                       AND o.outcome = 'unknown' AND a.phase != 'prepared'
-                 )",
+                        AND o.outcome = 'unknown' AND a.phase != 'prepared'
+                  )",
                 [incarnation_id.to_string()],
                 |row| row.get(0),
             )
@@ -4449,11 +4457,11 @@ impl Store {
                  WHERE o.kind = 'clear' AND o.target_incarnation_id = ?1
                    AND o.outcome = 'unknown'
                    AND COALESCE(i.native_session_rotated_at_ms, 0)
-                       <= COALESCE(o.resolved_at_ms, o.created_at_ms)
-                 ORDER BY COALESCE(o.resolved_at_ms, o.created_at_ms) DESC
-                 LIMIT 1",
+                        <= COALESCE(o.resolved_at_ms, o.created_at_ms)
+                  ORDER BY COALESCE(o.resolved_at_ms, o.created_at_ms) DESC
+                  LIMIT 1",
                 [incarnation_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         blocking
@@ -4560,11 +4568,13 @@ impl Store {
     ///
     /// Returns an error if the durable inbox write fails.
     pub fn create_operator_notice(&mut self, body: &str) -> Result<OperatorNoticeId, StoreError> {
-        let id = OperatorNoticeId::new();
-        self.connection.execute(
-            "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
-            params![id.to_string(), body, now_millis()?],
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO operator_notices (body, created_at_ms) VALUES (?1, ?2)",
+            params![body, now_millis()?],
         )?;
+        let id = last_insert_id!(tx, OperatorNoticeId);
+        tx.commit()?;
         Ok(id)
     }
 
@@ -4578,7 +4588,6 @@ impl Store {
         incarnation_id: IncarnationId,
         idempotency_key: &str,
     ) -> Result<OperationId, StoreError> {
-        let operation_id = OperationId::new();
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         refuse_reused_non_prompt_idempotency_key(&tx, idempotency_key)?;
@@ -4593,11 +4602,10 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO operations
-             (id, idempotency_key, kind, target_incarnation_id, intent_json,
+             (idempotency_key, kind, target_incarnation_id, intent_json,
               created_at_ms, outcome)
-             VALUES (?1, ?2, 'retire', ?3, ?4, ?5, 'accepted')",
+             VALUES (?1, 'retire', ?2, ?3, ?4, 'accepted')",
             params![
-                operation_id.to_string(),
                 idempotency_key,
                 incarnation_id.to_string(),
                 serde_json::json!({"incarnation_id": incarnation_id}).to_string(),
@@ -4605,6 +4613,7 @@ impl Store {
             ],
         )
         .map_err(map_constraint)?;
+        let operation_id = last_insert_id!(tx, OperationId);
         tx.commit()?;
         Ok(operation_id)
     }
@@ -4620,12 +4629,7 @@ impl Store {
              FROM operator_notices ORDER BY created_at_ms, id",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-            ))
+            Ok((id_text(row, 0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         let mut notices = Vec::new();
         for row in rows {
@@ -4725,7 +4729,7 @@ impl Store {
                    AND state = 'ready' AND id != ?3
                  ORDER BY created_at_ms DESC LIMIT 1",
                 params![pane_id, terminal_id, id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         holder
@@ -4750,7 +4754,7 @@ impl Store {
                  WHERE target_incarnation_id = ?1 AND kind = 'retire' AND outcome = 'accepted'
                  ORDER BY created_at_ms DESC LIMIT 1",
                 [id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let recorded = recorded.ok_or_else(|| {
@@ -4771,7 +4775,7 @@ impl Store {
             .query_row(
                 "SELECT logical_agent_id FROM incarnations WHERE id = ?1",
                 [id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let owner =
@@ -4857,7 +4861,7 @@ impl Store {
               ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = statement.query_map(params![pane_id, terminal_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((id_text(row, 0)?, row.get::<_, String>(1)?))
         })?;
         let mut occupants = Vec::new();
         for row in rows {
@@ -4922,8 +4926,8 @@ impl Store {
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
@@ -5008,11 +5012,7 @@ impl Store {
              ORDER BY creation_sequence",
         )?;
         let rows = statement.query_map([owing_agent_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((id_text(row, 0)?, id_text(row, 1)?, row.get::<_, String>(2)?))
         })?;
         let mut pending = Vec::new();
         for row in rows {
@@ -5104,7 +5104,7 @@ impl Store {
             .query_row(
                 "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
                 [ask_message_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let Some(waiting) = waiting else {
@@ -5133,8 +5133,7 @@ impl Store {
              WHERE logical_agent_id = ?1 AND state = 'ready'
              ORDER BY created_at_ms ASC",
         )?;
-        let rows =
-            statement.query_map([waiting_agent.to_string()], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map([waiting_agent.to_string()], |row| id_text(row, 0))?;
         let mut ready = Vec::new();
         for row in rows {
             ready.push(row?);
@@ -5167,7 +5166,7 @@ impl Store {
             .query_row(
                 "SELECT owing_agent_id FROM obligations WHERE ask_message_id = ?1",
                 [ask_message_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let Some(owing) = owing else {
@@ -5180,7 +5179,7 @@ impl Store {
              WHERE logical_agent_id = ?1 AND state = 'ready'
              ORDER BY created_at_ms ASC",
         )?;
-        let rows = statement.query_map([owing_agent.to_string()], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map([owing_agent.to_string()], |row| id_text(row, 0))?;
         let mut ready = Vec::new();
         for row in rows {
             ready.push(row?);
@@ -5237,7 +5236,7 @@ impl Store {
                 "SELECT waiting_agent_id, owing_agent_id, state
                  FROM obligations WHERE ask_message_id = ?1",
                 [ask_message_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?)),
             )
             .optional()?;
         let Some((waiting, owing, state)) = obligation else {
@@ -5331,14 +5330,11 @@ impl Store {
         )?;
         let value: serde_json::Value =
             serde_json::from_str(&intent).map_err(|error| invalid_json(&error))?;
-        let ask = value
-            .pointer("/cancelled_ask")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                StoreError::InvalidRecord(
-                    "cancellation operation intent is missing cancelled_ask".into(),
-                )
-            })?;
+        let ask = value.pointer("/cancelled_ask").cloned().ok_or_else(|| {
+            StoreError::InvalidRecord(
+                "cancellation operation intent is missing cancelled_ask".into(),
+            )
+        })?;
         let reason = value
             .pointer("/reason")
             .and_then(serde_json::Value::as_str)
@@ -5357,8 +5353,9 @@ impl Store {
                 )));
             }
         };
-        let ask_id = MessageId::parse(ask)
-            .ok_or_else(|| StoreError::InvalidRecord(format!("invalid ask message id {ask}")))?;
+        let ask_id: MessageId = serde_json::from_value(ask).map_err(|error| {
+            StoreError::InvalidRecord(format!("invalid ask message id: {error}"))
+        })?;
         Ok((ask_id, reason.to_string(), audience))
     }
 
@@ -5395,9 +5392,9 @@ impl Store {
                 |row| {
                     Ok((
                         row.get(0)?,
-                        row.get(1)?,
+                        id_text(row, 1)?,
                         row.get(2)?,
-                        row.get(3)?,
+                        id_text(row, 3)?,
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
@@ -5486,7 +5483,7 @@ impl Store {
         )?;
         let rows = statement.query_map([ask_message_id.to_string()], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
@@ -5621,9 +5618,9 @@ impl Store {
         )?;
         let rows = statement.query_map([waiting_agent_id.to_string()], |row| {
             Ok(CancelledWhileAway {
-                ask_message_id: row.get(0)?,
+                ask_message_id: id_text(row, 0)?,
                 reason: row.get(1)?,
-                cancelled_by: row.get(2)?,
+                cancelled_by: optional_id_text(row, 2)?,
                 cancelled_at_ms: row.get(3)?,
             })
         })?;
@@ -5680,9 +5677,9 @@ impl Store {
         )?;
         let rows = statement.query_map([owing_agent_id.to_string()], |row| {
             Ok(CancelledWhileAway {
-                ask_message_id: row.get(0)?,
+                ask_message_id: id_text(row, 0)?,
                 reason: row.get(1)?,
-                cancelled_by: row.get(2)?,
+                cancelled_by: optional_id_text(row, 2)?,
                 cancelled_at_ms: row.get(3)?,
             })
         })?;
@@ -5723,7 +5720,14 @@ impl Store {
                  JOIN deliveries d ON d.message_id = m.id
                  WHERE m.id = ?1",
                 [message_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        optional_id_text(row, 1)?,
+                        row.get(2)?,
+                        id_text(row, 3)?,
+                    ))
+                },
             )
             .optional()?;
         let Some((kind, sender, outcome, operation_id)) = row else {
@@ -5861,12 +5865,12 @@ impl Store {
         )?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
+                optional_id_text(row, 3)?,
+                id_text(row, 4)?,
+                id_text(row, 5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
             ))
@@ -5914,11 +5918,9 @@ impl Store {
     pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<DueReminder>, StoreError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
-                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
-                    m.body
+                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
-             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state IN ('open','in_progress')
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -5937,19 +5939,18 @@ impl Store {
         ))?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
+                id_text(row, 2)?,
+                id_text(row, 3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, String>(7)?,
             ))
         })?;
         let mut due = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, body) = row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms) = row?;
             due.push(DueReminder {
                 ask_message_id: parse_message_id(&ask)?,
                 owing_agent_id: parse_logical_agent_id(&owing)?,
@@ -5958,7 +5959,6 @@ impl Store {
                 pane_id: pane,
                 terminal_id: terminal,
                 interval_ms,
-                body,
             });
         }
         Ok(due)
@@ -5973,10 +5973,9 @@ impl Store {
         let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
                     i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
-                    r.saw_working_at_ms IS NOT NULL, m.body
+                    r.saw_working_at_ms IS NOT NULL
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
-             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state = 'open'
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -5997,21 +5996,19 @@ impl Store {
         ))?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
+                id_text(row, 2)?,
+                id_text(row, 3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, bool>(7)?,
-                row.get::<_, String>(8)?,
             ))
         })?;
         let mut reminders = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working, body) =
-                row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working) = row?;
             reminders.push(BoundaryReminder {
                 reminder: DueReminder {
                     ask_message_id: parse_message_id(&ask)?,
@@ -6021,7 +6018,6 @@ impl Store {
                     pane_id: pane,
                     terminal_id: terminal,
                     interval_ms,
-                    body,
                 },
                 saw_working,
             });
@@ -6151,7 +6147,7 @@ impl Store {
                 "SELECT ask_message_id FROM reminder_attempts
              WHERE request_id = ?1 AND phase = 'submitted'",
                 [request_id],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let Some(ask) = ask else {
@@ -6230,7 +6226,7 @@ impl Store {
                 "SELECT DISTINCT ask_message_id FROM reminder_attempts WHERE phase = 'submitted'",
             )?;
             statement
-                .query_map([], |row| row.get(0))?
+                .query_map([], |row| id_text(row, 0))?
                 .collect::<Result<_, _>>()?
         };
         let changed = tx.execute(
@@ -6393,8 +6389,6 @@ impl Store {
                 "incarnation already has an active clear".into(),
             ));
         }
-        let renew_id = RenewId::new();
-        let schedule_id = intent.every_ms.map(|_| ScheduleId::new());
         let now = now_millis()?;
         let (active_remaining_ms, occupancy_sampled_at_ms) = match intent.every_ms {
             Some(_) => (
@@ -6403,17 +6397,16 @@ impl Store {
             ),
             None => (None, None),
         };
-        if let (Some(schedule_id), Some(every_ms), Some(active_remaining_ms)) =
-            (schedule_id, intent.every_ms, active_remaining_ms)
+        let schedule_id = if let (Some(every_ms), Some(active_remaining_ms)) =
+            (intent.every_ms, active_remaining_ms)
         {
             tx.execute(
                 "INSERT INTO schedules
-                 (id, kind, logical_agent_id, incarnation_id, requester_agent_id,
-                  interval_ms, clock, next_fire_at_ms, active_remaining_ms,
-                  occupancy_sampled_at_ms, cycle, state, created_at_ms)
-                 VALUES (?1, 'renew', ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, 1, 'active', ?9)",
+                 (kind, logical_agent_id, incarnation_id, requester_agent_id,
+                   interval_ms, clock, next_fire_at_ms, active_remaining_ms,
+                   occupancy_sampled_at_ms, cycle, state, created_at_ms)
+                 VALUES ('renew', ?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, 1, 'active', ?8)",
                 params![
-                    schedule_id.to_string(),
                     intent.logical_agent_id.to_string(),
                     intent.incarnation_id.to_string(),
                     intent.requester_agent_id.to_string(),
@@ -6424,16 +6417,18 @@ impl Store {
                     now
                 ],
             )?;
-        }
+            Some(last_insert_id!(tx, ScheduleId))
+        } else {
+            None
+        };
         tx.execute(
             "INSERT INTO renews
-             (id, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
+             (logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
               resume_prompt, on_timeout, prepare_timeout_ms, every_ms, cycle,
               scheduled_at_ms, phase, created_at_ms, active_remaining_ms,
                occupancy_sampled_at_ms, schedule_id)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'scheduled', ?11, ?12, ?13, ?14)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, 'scheduled', ?10, ?11, ?12, ?13)",
             params![
-                renew_id.to_string(),
                 intent.logical_agent_id.to_string(),
                 intent.incarnation_id.to_string(),
                 intent.requester_agent_id.to_string(),
@@ -6449,6 +6444,7 @@ impl Store {
                 schedule_id.map(|id| id.to_string())
             ],
         )?;
+        let renew_id = last_insert_id!(tx, RenewId);
         tx.commit()?;
         Ok(renew_id)
     }
@@ -6493,10 +6489,10 @@ impl Store {
         )?;
         let rows = statement.query_map([now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
+                id_text(row, 2)?,
+                id_text(row, 3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
@@ -6506,7 +6502,7 @@ impl Store {
                 row.get::<_, i64>(10)?,
                 row.get::<_, Option<i64>>(11)?,
                 row.get::<_, i64>(12)?,
-                row.get::<_, Option<String>>(13)?,
+                optional_id_text(row, 13)?,
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<i64>>(15)?,
                 row.get::<_, Option<i64>>(16)?,
@@ -6580,7 +6576,7 @@ impl Store {
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
@@ -6677,7 +6673,7 @@ impl Store {
                                WHERE i.id = r.incarnation_id AND i.state = 'ready')
              ORDER BY r.created_at_ms",
         )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map([], |row| id_text(row, 0))?;
         let mut ids = Vec::new();
         for row in rows {
             ids.push(parse_renew_id(&row?)?);
@@ -6703,8 +6699,8 @@ impl Store {
                 [renew_id.to_string()],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        id_text(row, 0)?,
+                        id_text(row, 1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
                     ))
@@ -7006,11 +7002,11 @@ impl Store {
                AND state = 'active'",
             params![now, reason, renew_id.to_string()],
         )?;
-        let notice_id = OperatorNoticeId::new();
         tx.execute(
-            "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
-            params![notice_id.to_string(), notice, now],
+            "INSERT INTO operator_notices (body, created_at_ms) VALUES (?1, ?2)",
+            params![notice, now],
         )?;
+        let notice_id = last_insert_id!(tx, OperatorNoticeId);
         tx.commit()?;
         Ok(notice_id)
     }
@@ -7065,11 +7061,11 @@ impl Store {
                AND state = 'active'",
             params![now, reason, renew_id.to_string()],
         )?;
-        let notice_id = OperatorNoticeId::new();
         tx.execute(
-            "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
-            params![notice_id.to_string(), notice, now],
+            "INSERT INTO operator_notices (body, created_at_ms) VALUES (?1, ?2)",
+            params![notice, now],
         )?;
+        let notice_id = last_insert_id!(tx, OperatorNoticeId);
         tx.commit()?;
         Ok(notice_id)
     }
@@ -7303,7 +7299,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM incarnations WHERE id = ?1",
                 [incarnation_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if exists.is_none() {
@@ -7472,9 +7468,9 @@ impl Store {
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                id_text(row, 0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                optional_id_text(row, 2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
             ))
@@ -7536,8 +7532,8 @@ impl Store {
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
@@ -7554,10 +7550,10 @@ impl Store {
                 row.get::<_, Option<i64>>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, Option<i64>>(17)?,
-                row.get::<_, Option<String>>(18)?,
+                optional_id_text(row, 18)?,
                 row.get::<_, Option<String>>(19)?,
                 row.get::<_, Option<String>>(20)?,
-                row.get::<_, Option<String>>(21)?,
+                optional_id_text(row, 21)?,
                 row.get::<_, Option<String>>(22)?,
                 row.get::<_, Option<i64>>(23)?,
                 row.get::<_, Option<i64>>(24)?,
@@ -7627,13 +7623,13 @@ impl Store {
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                id_text(row, 0)?,
+                id_text(row, 1)?,
+                id_text(row, 2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                optional_id_text(row, 6)?,
             ))
         })?;
         let mut obligations = Vec::new();
@@ -7694,7 +7690,7 @@ impl Store {
                 "SELECT id FROM incarnations WHERE logical_agent_id = ?1
                  ORDER BY created_at_ms DESC, id DESC LIMIT 1",
                 [agent_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let newest = newest.ok_or_else(|| {
@@ -7739,7 +7735,7 @@ impl Store {
                 [incarnation_id.to_string()],
                 |row| {
                     Ok((
-                        row.get(0)?,
+                        id_text(row, 0)?,
                         row.get(1)?,
                         row.get(2)?,
                         row.get(3)?,
@@ -7836,7 +7832,7 @@ impl Store {
                  JOIN logical_agents l ON l.id = i.logical_agent_id
                  WHERE i.state = 'ready' AND l.public_name = ?1 AND i.id != ?2",
                 params![new_name, incarnation_id.to_string()],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         if let Some(existing) = taken {
@@ -7879,7 +7875,7 @@ impl Store {
                 "SELECT logical_agent_id FROM incarnations
                  WHERE id = ?1 AND state = 'ready' AND pending_rename_to = ?2",
                 params![incarnation_id.to_string(), new_name],
-                |row| row.get(0),
+                |row| id_text(row, 0),
             )
             .optional()?;
         let Some(agent_id) = owner else {
@@ -8048,7 +8044,7 @@ impl Store {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(ReadyBindingRow {
-                    id: row.get(0)?,
+                    id: id_text(row, 0)?,
                     pane_id: row.get(1)?,
                     terminal_id: row.get(2)?,
                     public_name: row.get(3)?,
@@ -8190,7 +8186,7 @@ impl Store {
                  JOIN logical_agents l ON l.id = i.logical_agent_id
                  WHERE i.state = 'ready' AND l.public_name = ?1",
                 [public_name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((id_text(row, 0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         let Some((incarnation_id, pane_id, terminal_id)) = bound else {
@@ -8460,18 +8456,16 @@ impl Store {
                 )?;
                 continue;
             }
-            let incarnation_id = IncarnationId::new();
             let native_session_json = agent.agent_session.as_ref().map(ToString::to_string);
             tx.execute(
                 "INSERT INTO incarnations (
-                    id, logical_agent_id, herdr_session, intended_pane_id,
+                    logical_agent_id, herdr_session, intended_pane_id,
                     expected_terminal_id, observed_pane_id, observed_terminal_id,
                     backend_kind, backend_args_json, working_directory, created_at_ms, state,
                     name_authority, observed_native_session_json,
                     requested_model, requested_provider, requested_effort
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ready', 'observed', ?12, ?13, ?14, ?15)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ready', 'observed', ?11, ?12, ?13, ?14)",
                 params![
-                    incarnation_id.to_string(),
                     logical_agent_id,
                     source.herdr_session,
                     agent.pane_id,
@@ -8488,6 +8482,7 @@ impl Store {
                     source.requested_effort,
                 ],
             )?;
+            let incarnation_id = last_insert_id!(tx, IncarnationId);
             insert_restore_notice(
                 &tx,
                 now,
@@ -8518,8 +8513,8 @@ impl Store {
         let rows = statement.query_map([], |row| {
             let session_json: Option<String> = row.get(12)?;
             Ok(ContinuableSessionRow {
-                incarnation_id: row.get(0)?,
-                logical_agent_id: row.get(1)?,
+                incarnation_id: id_text(row, 0)?,
+                logical_agent_id: id_text(row, 1)?,
                 public_name: row.get(2)?,
                 delivery_transport: row.get(3)?,
                 herdr_session: row.get(4)?,
@@ -8564,8 +8559,8 @@ impl Store {
         let rows = statement.query_map([], |row| {
             let session_json: Option<String> = row.get(12)?;
             Ok(ContinuableSessionRow {
-                incarnation_id: row.get(0)?,
-                logical_agent_id: row.get(1)?,
+                incarnation_id: id_text(row, 0)?,
+                logical_agent_id: id_text(row, 1)?,
                 public_name: row.get(2)?,
                 delivery_transport: row.get(3)?,
                 herdr_session: row.get(4)?,
@@ -8608,7 +8603,7 @@ impl Store {
              JOIN logical_agents l ON l.id = i.logical_agent_id
              WHERE i.state = 'ready' AND i.pending_rename_to IS NOT NULL",
         )?;
-        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, id_text(row, 1)?)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -8631,7 +8626,7 @@ impl Store {
             "SELECT DISTINCT logical_agent_id FROM incarnations
                  WHERE state IN ('starting', 'ready')",
         )?;
-        let rows = statement.query_map([], |row| row.get(0))?;
+        let rows = statement.query_map([], |row| id_text(row, 0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -8664,8 +8659,8 @@ impl Store {
                  WHERE o.outcome IN ('pending', 'accepted')",
             )?;
             let rows = statement.query_map([], |row| {
-                let operation: String = row.get(0)?;
-                let incarnation: String = row.get(1)?;
+                let operation = id_text(row, 0)?;
+                let incarnation = id_text(row, 1)?;
                 Ok((
                     operation,
                     incarnation,
@@ -8828,9 +8823,8 @@ impl Store {
                                      AND clear.target_incarnation_id = d.recipient_incarnation_id
                                      AND clear.outcome IN ('pending','accepted'))",
             )?;
-            let rows = statement.query_map([now_ms], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
+            let rows =
+                statement.query_map([now_ms], |row| Ok((id_text(row, 0)?, id_text(row, 1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut marked = 0;
@@ -8865,7 +8859,7 @@ fn refuse_renew_prepare_ask_cancel(
             "SELECT id FROM renews WHERE ask_message_id = ?1
              AND phase NOT IN ('done', 'aborted', 'terminated')",
             [ask_message_id.to_string()],
-            |row| row.get(0),
+            |row| id_text(row, 0),
         )
         .optional()?;
     let Some(renew_id) = renew else {
@@ -8891,13 +8885,7 @@ fn cancel_renew_refusal(
         .query_row(
             "SELECT phase, requester_agent_id, logical_agent_id FROM renews WHERE id = ?1",
             [renew_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, id_text(row, 1)?, id_text(row, 2)?)),
         )
         .optional()?;
     let Some((phase, requester, target)) = found else {
@@ -8940,7 +8928,7 @@ fn cancel_unanswered_prepare(
         .query_row(
             "SELECT ask_message_id, requester_agent_id FROM renews WHERE id = ?1",
             [renew_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((optional_id_text(row, 0)?, id_text(row, 1)?)),
         )
         .optional()?;
     let Some((Some(ask_message_id), requester_agent_id)) = renew else {
@@ -8965,7 +8953,7 @@ fn arm_next_renew_cycle(
         .query_row(
             "SELECT every_ms, cycle, schedule_id FROM renews WHERE id = ?1",
             [renew_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, optional_id_text(row, 2)?)),
         )
         .optional()?;
     let Some((every_ms, cycle, schedule_id)) = policy else {
@@ -8995,7 +8983,6 @@ fn arm_next_renew_cycle(
             "recurring renew {renew_id} disagrees with shared schedule {schedule_id}"
         )));
     }
-    let next_id = RenewId::new();
     tx.execute(
         "INSERT OR IGNORE INTO schedule_firings
          (schedule_id, cycle, due_at_ms, fired_at_ms, outcome, renew_id)
@@ -9024,16 +9011,15 @@ fn arm_next_renew_cycle(
     )?;
     tx.execute(
         "INSERT INTO renews
-         (id, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
-          resume_prompt, on_timeout, prepare_timeout_ms, every_ms, cycle,
-          scheduled_at_ms, phase, created_at_ms, active_remaining_ms,
-           occupancy_sampled_at_ms, schedule_id)
-         SELECT ?1, logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
-                resume_prompt, on_timeout, prepare_timeout_ms, every_ms, ?2,
-                 ?3, 'scheduled', ?4, ?5, ?4, schedule_id
-         FROM renews WHERE id = ?6",
+         (logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
+           resume_prompt, on_timeout, prepare_timeout_ms, every_ms, cycle,
+           scheduled_at_ms, phase, created_at_ms, active_remaining_ms,
+            occupancy_sampled_at_ms, schedule_id)
+         SELECT logical_agent_id, incarnation_id, requester_agent_id, prepare_prompt,
+                resume_prompt, on_timeout, prepare_timeout_ms, every_ms, ?1,
+                 ?2, 'scheduled', ?3, ?4, ?3, schedule_id
+         FROM renews WHERE id = ?5",
         params![
-            next_id.to_string(),
             cycle + 1,
             now.saturating_add(every_ms),
             now,
@@ -9041,6 +9027,7 @@ fn arm_next_renew_cycle(
             renew_id.to_string()
         ],
     )?;
+    let next_id = last_insert_id!(tx, RenewId);
     Ok(Some(next_id))
 }
 
@@ -9356,6 +9343,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         connection.execute_batch(include_str!("../migrations/029_slower_reminders.sql"))?;
         version = 29;
     }
+    if version == 29 {
+        connection.execute_batch(include_str!("../migrations/030_integer_ids.sql"))?;
+        version = 30;
+    }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
             "unsupported schema version {version}"
@@ -9373,9 +9364,7 @@ fn ready_incarnation_for_agent(
          WHERE logical_agent_id = ?1 AND state = 'ready'
          ORDER BY created_at_ms ASC",
     )?;
-    let rows = statement.query_map([logical_agent_id.to_string()], |row| {
-        row.get::<_, String>(0)
-    })?;
+    let rows = statement.query_map([logical_agent_id.to_string()], |row| id_text(row, 0))?;
     let mut matches = Vec::new();
     for row in rows {
         matches.push(row?);
@@ -9482,8 +9471,8 @@ fn insert_restore_notice(tx: &Transaction<'_>, now: i64, body: &str) -> Result<(
         return Ok(());
     }
     tx.execute(
-        "INSERT INTO operator_notices (id, body, created_at_ms) VALUES (?1, ?2, ?3)",
-        params![OperatorNoticeId::new().to_string(), body, now],
+        "INSERT INTO operator_notices (body, created_at_ms) VALUES (?1, ?2)",
+        params![body, now],
     )?;
     Ok(())
 }
@@ -9570,11 +9559,7 @@ fn find_ready_identity_query(
 ) -> Result<Option<ReadyIdentity>, StoreError> {
     let mut statement = store.connection.prepare(sql)?;
     let rows = statement.query_map([key], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((id_text(row, 0)?, id_text(row, 1)?, row.get::<_, String>(2)?))
     })?;
     let mut matches = Vec::new();
     for row in rows {
@@ -9599,22 +9584,20 @@ fn find_ready_identity_query(
 
 fn insert_logical_agent(
     tx: &Transaction<'_>,
-    id: LogicalAgentId,
     name: &str,
     parent: Parent,
     delivery_transport: DeliveryTransport,
     now: i64,
-) -> Result<(), StoreError> {
+) -> Result<LogicalAgentId, StoreError> {
     let parent_id = match parent {
         Parent::Parentless => None,
         Parent::Agent(id) => Some(id.to_string()),
     };
     tx.execute(
         "INSERT INTO logical_agents
-         (id, public_name, parent_agent_id, explicitly_parentless, created_at_ms, delivery_transport)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (public_name, parent_agent_id, explicitly_parentless, created_at_ms, delivery_transport)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            id.to_string(),
             name,
             parent_id,
             i64::from(matches!(parent, Parent::Parentless)),
@@ -9622,7 +9605,7 @@ fn insert_logical_agent(
             delivery_transport.as_str()
         ],
     )?;
-    Ok(())
+    Ok(last_insert_id!(tx, LogicalAgentId))
 }
 
 fn refuse_pane_bind_of_socket_inbox(
@@ -9652,7 +9635,7 @@ fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), 
              WHERE l.public_name = ?1
                AND i.state IN ('starting','ready')",
             [name],
-            |row| row.get(0),
+            |row| id_text(row, 0),
         )
         .optional()?;
     if let Some(existing) = held {
@@ -9665,7 +9648,7 @@ fn refuse_live_or_pending_alias(tx: &Transaction<'_>, name: &str) -> Result<(), 
             "SELECT id FROM incarnations
              WHERE pending_rename_to = ?1 AND state = 'ready'",
             [name],
-            |row| row.get(0),
+            |row| id_text(row, 0),
         )
         .optional()?;
     if let Some(existing) = pending {
@@ -9707,7 +9690,7 @@ fn refuse_name_held_by_socket_waiter(tx: &Transaction<'_>, name: &str) -> Result
                AND delivery_transport = 'socket_inbox'
                AND targeting_ended_at_ms IS NULL",
             [name],
-            |row| row.get(0),
+            |row| id_text(row, 0),
         )
         .optional()?;
     if let Some(existing) = held {
@@ -9796,9 +9779,7 @@ fn optional_ready_incarnation(
          WHERE logical_agent_id = ?1 AND state = 'ready'
          ORDER BY created_at_ms ASC",
     )?;
-    let rows = statement.query_map([logical_agent_id.to_string()], |row| {
-        row.get::<_, String>(0)
-    })?;
+    let rows = statement.query_map([logical_agent_id.to_string()], |row| id_text(row, 0))?;
     let mut ready = Vec::new();
     for row in rows {
         ready.push(row?);
@@ -9826,7 +9807,6 @@ fn insert_cancellation_prompt(
     due_at_ms: Option<i64>,
     now: i64,
 ) -> Result<OperationId, StoreError> {
-    let operation_id = OperationId::new();
     let audience_label = match audience {
         CancellationAudience::Waiting => "waiting",
         CancellationAudience::Owing => "owing",
@@ -9844,11 +9824,10 @@ fn insert_cancellation_prompt(
     };
     tx.execute(
         "INSERT INTO operations
-         (id, idempotency_key, kind, target_incarnation_id, intent_json,
+         (idempotency_key, kind, target_incarnation_id, intent_json,
           created_at_ms, outcome)
-         VALUES (?1, ?2, 'prompt', ?3, ?4, ?5, 'pending')",
+         VALUES (?1, 'prompt', ?2, ?3, ?4, 'pending')",
         params![
-            operation_id.to_string(),
             idempotency,
             recipient_incarnation.to_string(),
             intent.to_string(),
@@ -9856,6 +9835,7 @@ fn insert_cancellation_prompt(
         ],
     )
     .map_err(map_constraint)?;
+    let operation_id = last_insert_id!(tx, OperationId);
     tx.execute(
         "INSERT INTO deliveries
          (message_id, recipient_incarnation_id, attempt_number,
@@ -9888,7 +9868,7 @@ fn supersede_unsubmitted_ask_delivery(
             "SELECT outcome, operation_id FROM deliveries
              WHERE message_id = ?1 AND delivery_transport = 'herdr_prompt'",
             [ask_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, optional_id_text(row, 1)?)),
         )
         .optional()?;
     let Some((outcome, Some(operation_id))) = row else {
@@ -9940,19 +9920,14 @@ fn record_cancellation_side(
     now: i64,
     ambiguous_ready: &str,
 ) -> Result<(MessageId, Option<(OperationId, IncarnationId)>), StoreError> {
-    let message_id = MessageId::new();
     tx.execute(
         "INSERT INTO messages
-         (id, sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
-          creates_obligation)
-         VALUES (?1, NULL, ?2, 'cancellation', ?3, ?4, 0)",
-        params![
-            message_id.to_string(),
-            recipient_agent.to_string(),
-            body,
-            now
-        ],
+         (sender_agent_id, recipient_agent_id, kind, body, created_at_ms,
+           creates_obligation)
+         VALUES (NULL, ?1, 'cancellation', ?2, ?3, 0)",
+        params![recipient_agent.to_string(), body, now],
     )?;
+    let message_id = last_insert_id!(tx, MessageId);
     let identity = waiter_identity(tx, recipient_agent)?;
     let delivery = match identity.transport {
         DeliveryTransport::SocketInbox => {
@@ -10020,7 +9995,7 @@ fn resolve_socket_inbox_final_reply(
             "SELECT reply_to_message_id, id FROM messages
              WHERE id = ?1 AND kind = 'reply' AND disposition = 'final'",
             [message_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((id_text(row, 0)?, id_text(row, 1)?)),
         )
         .optional()?;
     let Some((ask_message_id, resolving_message_id)) = final_reply else {
@@ -10172,7 +10147,7 @@ fn refuse_reused_non_prompt_idempotency_key(
              ORDER BY (kind != 'prompt' OR outcome != 'failed') DESC, created_at_ms DESC, id DESC
              LIMIT 1",
             [idempotency_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((id_text(row, 0)?, row.get(1)?)),
         )
         .optional()?;
     if let Some((operation_id, outcome)) = prior {
@@ -10791,7 +10766,7 @@ mod tests {
 
         // An absent incarnation is a conflict, not an empty answer.
         let absent = store
-            .attribution_evidence(IncarnationId::new())
+            .attribution_evidence(IncarnationId::test())
             .expect_err("absent incarnation");
         assert!(matches!(absent, StoreError::Conflict(_)));
     }
@@ -10846,7 +10821,7 @@ mod tests {
             second.incarnation_id
         );
         let absent = store
-            .newest_incarnation_for_agent(LogicalAgentId::new())
+            .newest_incarnation_for_agent(LogicalAgentId::test())
             .expect_err("absent agent");
         assert!(matches!(absent, StoreError::Conflict(_)));
     }
@@ -11095,9 +11070,9 @@ mod tests {
     fn version_five_store_migrates_operations_to_adopt_kind() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("v5.sqlite3");
-        let agent_id = LogicalAgentId::new();
-        let incarnation_id = IncarnationId::new();
-        let operation_id = OperationId::new();
+        let agent_id = LogicalAgentId::test();
+        let incarnation_id = IncarnationId::test();
+        let operation_id = OperationId::test();
         {
             let connection = Connection::open(&path).expect("db");
             for migration in [
@@ -11146,6 +11121,7 @@ mod tests {
                 .expect("attempt");
         }
         let mut store = Store::open(&path).expect("open migrates to v9");
+        let operation_id = OperationId::try_from(1).expect("positive");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -11204,10 +11180,10 @@ mod tests {
     fn version_twenty_five_store_migrates_prompt_idempotency_constraint() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("v25.sqlite3");
-        let agent_id = LogicalAgentId::new();
-        let incarnation_id = IncarnationId::new();
-        let prompt_id = OperationId::new();
-        let renew_id = RenewId::new();
+        let agent_id = LogicalAgentId::test();
+        let incarnation_id = IncarnationId::test();
+        let prompt_id = OperationId::test();
+        let renew_id = RenewId::test();
         {
             let connection = Connection::open(&path).expect("db");
             for migration in [
@@ -11293,6 +11269,9 @@ mod tests {
         }
 
         let mut store = Store::open(&path).expect("open migrates to current");
+        let agent_id = LogicalAgentId::try_from(1).expect("positive");
+        let incarnation_id = IncarnationId::try_from(1).expect("positive");
+        let renew_id = RenewId::try_from(1).expect("positive");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -11312,7 +11291,7 @@ mod tests {
                  FROM renews r JOIN schedules s ON s.id = r.schedule_id
                  WHERE r.id = ?1",
                 [renew_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((id_text(row, 0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("recurring renew schedule backfilled");
         assert_eq!(backfilled.0, renew_id.to_string());
@@ -11351,7 +11330,7 @@ mod tests {
                     id, idempotency_key, kind, target_incarnation_id, intent_json,
                     created_at_ms, outcome
                  ) VALUES (?1, 'failed-prompt', 'prompt', ?2, '{}', 3, 'pending')",
-                params![OperationId::new().to_string(), incarnation_id.to_string()],
+                params![OperationId::test().to_string(), incarnation_id.to_string()],
             )
             .expect("failed prompt frees key");
         store
@@ -11361,7 +11340,7 @@ mod tests {
                     id, idempotency_key, kind, target_incarnation_id, intent_json,
                     created_at_ms, resolved_at_ms, outcome
                  ) VALUES (?1, 'failed-start', 'start', ?2, '{}', 4, 5, 'failed')",
-                params![OperationId::new().to_string(), incarnation_id.to_string()],
+                params![OperationId::test().to_string(), incarnation_id.to_string()],
             )
             .expect("first failed start");
         let duplicate_start = store.connection.execute(
@@ -11369,7 +11348,7 @@ mod tests {
                 id, idempotency_key, kind, target_incarnation_id, intent_json,
                 created_at_ms, outcome
              ) VALUES (?1, 'failed-start', 'start', ?2, '{}', 6, 'pending')",
-            params![OperationId::new().to_string(), incarnation_id.to_string()],
+            params![OperationId::test().to_string(), incarnation_id.to_string()],
         );
         assert!(
             duplicate_start.is_err(),
@@ -11378,12 +11357,184 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn version_twenty_nine_renumbers_ids_oldest_first_and_rewrites_intents() {
+        let connection = Connection::open_in_memory().expect("database");
+        for migration in [
+            include_str!("../migrations/001_initial.sql"),
+            include_str!("../migrations/002_operator_notices.sql"),
+            include_str!("../migrations/003_operator_message_sender.sql"),
+            include_str!("../migrations/004_obligation_creation_sequence.sql"),
+            include_str!("../migrations/005_obligation_cancellation.sql"),
+            include_str!("../migrations/006_adopt_operation.sql"),
+            include_str!("../migrations/007_name_authority.sql"),
+            include_str!("../migrations/008_scheduled_delivery.sql"),
+            include_str!("../migrations/009_observed_attribution.sql"),
+            include_str!("../migrations/010_obligation_reminders.sql"),
+            include_str!("../migrations/011_pending_rename.sql"),
+            include_str!("../migrations/012_renew.sql"),
+            include_str!("../migrations/013_conversation_age.sql"),
+            include_str!("../migrations/014_renew_clear_stall.sql"),
+            include_str!("../migrations/015_lazy_rotation.sql"),
+            include_str!("../migrations/016_clear_operation.sql"),
+            include_str!("../migrations/017_settle_stranded_prepare_asks.sql"),
+            include_str!("../migrations/018_cancellation_message.sql"),
+            include_str!("../migrations/019_cancellation_response_link.sql"),
+            include_str!("../migrations/020_socket_waiter.sql"),
+            include_str!("../migrations/021_socket_inbox_keys.sql"),
+            include_str!("../migrations/022_owing_cancellation.sql"),
+            include_str!("../migrations/023_renew_active_clock.sql"),
+            include_str!("../migrations/024_reminder_scan_indexes.sql"),
+            include_str!("../migrations/025_inflight_final_indexes.sql"),
+            include_str!("../migrations/026_active_report_indexes.sql"),
+            include_str!("../migrations/027_operation_idempotency_outcome.sql"),
+            include_str!("../migrations/028_repeating_schedules.sql"),
+            include_str!("../migrations/029_slower_reminders.sql"),
+        ] {
+            connection.execute_batch(migration).expect("migration");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO logical_agents
+                    (id, public_name, parent_agent_id, explicitly_parentless, created_at_ms)
+                 VALUES ('agent-b', 'b', NULL, 1, 10),
+                        ('agent-a', 'a', 'agent-b', 0, 20);
+                 INSERT INTO incarnations
+                    (id, logical_agent_id, herdr_session, intended_pane_id,
+                     expected_terminal_id, backend_kind, backend_args_json,
+                     working_directory, created_at_ms, state)
+                 VALUES ('inc-old', 'agent-a', 's', 'p2', 't2', 'codex', '[]', '/tmp', 20, 'ready'),
+                        ('inc-young', 'agent-b', 's', 'p1', 't1', 'codex', '[]', '/tmp', 10, 'ready');
+                 INSERT INTO messages
+                    (id, sender_agent_id, recipient_agent_id, kind, body,
+                     created_at_ms, creates_obligation)
+                 VALUES ('msg-old', 'agent-a', 'agent-b', 'ask', 'question', 20, 1),
+                        ('msg-young', 'agent-b', 'agent-a', 'tell', 'hello', 10, 0);
+                 INSERT INTO obligations
+                    (ask_message_id, owing_agent_id, waiting_agent_id,
+                     creation_sequence, created_at_ms, last_activity_at_ms, state)
+                 VALUES ('msg-old', 'agent-b', 'agent-a', 1, 20, 20, 'open');
+                 INSERT INTO obligation_reminders (ask_message_id, interval_ms)
+                 VALUES ('msg-old', 1200000);
+                 INSERT INTO schedules
+                    (id, kind, logical_agent_id, requester_agent_id, body,
+                     interval_ms, clock, next_fire_at_ms, cycle, state, created_at_ms)
+                 VALUES ('sch-old', 'tell', 'agent-a', 'agent-b', 'repeat',
+                         60000, 'wall', 100, 1, 'active', 20);
+                 INSERT INTO renews
+                    (id, logical_agent_id, incarnation_id, requester_agent_id,
+                     prepare_prompt, resume_prompt, on_timeout, prepare_timeout_ms,
+                     every_ms, cycle, scheduled_at_ms, phase, created_at_ms)
+                 VALUES ('ren-old', 'agent-a', 'inc-old', 'agent-b',
+                         'save', 'resume', 'abort', 60000, NULL, 1, 100, 'scheduled', 20);
+                 INSERT INTO operations
+                    (id, idempotency_key, kind, target_incarnation_id, intent_json,
+                     created_at_ms, outcome)
+                 VALUES ('op-clear', 'clear', 'clear', 'inc-young',
+                         '{\"recipient\":\"agent-b\",\"prompt_settle_delay_ms\":100}', 10, 'pending'),
+                        ('op-prompt', 'prompt', 'prompt', 'inc-old',
+                         '{\"message_id\":\"msg-old\",\"recipient_incarnation_id\":\"inc-old\",\"schedule_id\":\"sch-old\"}', 20, 'pending'),
+                        ('op-start', 'start', 'start', 'inc-old',
+                         '{\"logical_agent_id\":\"agent-a\",\"parent\":{\"kind\":\"agent\",\"agent_id\":\"agent-b\"},\"initial_message\":{\"sender\":\"agent-b\",\"kind\":\"tell\",\"body\":\"resume\"},\"supersedes\":\"inc-young\"}', 30, 'pending');
+                 INSERT INTO deliveries
+                    (message_id, recipient_incarnation_id, attempt_number,
+                     scheduled_at_ms, outcome, operation_id)
+                 VALUES ('msg-old', 'inc-old', 1, 20, 'pending', 'op-prompt');
+                 INSERT INTO operator_notices (id, body, created_at_ms)
+                 VALUES ('notice-old', 'later', 20), ('notice-young', 'earlier', 10);",
+            )
+            .expect("version 29 data");
+
+        migrate(&connection).expect("integer migration");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            30
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("foreign keys"),
+            0
+        );
+        let agents: Vec<(i64, String, Option<i64>)> = connection
+            .prepare("SELECT id, public_name, parent_agent_id FROM logical_agents ORDER BY id")
+            .expect("agents")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("agent rows")
+            .collect::<Result<_, _>>()
+            .expect("agent values");
+        assert_eq!(
+            agents,
+            vec![(1, "b".into(), None), (2, "a".into(), Some(1))]
+        );
+        for table in [
+            "logical_agents",
+            "incarnations",
+            "operations",
+            "messages",
+            "operator_notices",
+            "renews",
+            "schedules",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE typeof(id) != 'integer'");
+            assert_eq!(
+                connection
+                    .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                    .expect("types"),
+                0,
+                "{table} ids"
+            );
+        }
+        let intents: Vec<String> = connection
+            .prepare("SELECT intent_json FROM operations ORDER BY id")
+            .expect("intents")
+            .query_map([], |row| row.get(0))
+            .expect("intent rows")
+            .collect::<Result<_, _>>()
+            .expect("intent values");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&intents[0]).expect("clear")["recipient"],
+            1
+        );
+        let prompt: serde_json::Value = serde_json::from_str(&intents[1]).expect("prompt");
+        assert_eq!(prompt["message_id"], 2);
+        assert_eq!(prompt["recipient_incarnation_id"], 2);
+        assert_eq!(prompt["schedule_id"], 1);
+        let start: serde_json::Value = serde_json::from_str(&intents[2]).expect("start");
+        assert_eq!(start["logical_agent_id"], 2);
+        assert_eq!(start["parent"]["agent_id"], 1);
+        assert_eq!(start["initial_message"]["sender"], 1);
+        assert_eq!(start["supersedes"], 1);
+
+        let mut store = Store { connection };
+        assert_eq!(
+            store
+                .register_socket_waiter("next", Parent::Parentless, "next-agent")
+                .expect("next agent")
+                .logical_agent_id
+                .to_string(),
+            "3"
+        );
+        assert_eq!(
+            store
+                .create_operator_notice("next")
+                .expect("next notice")
+                .to_string(),
+            "3"
+        );
+    }
+
+    #[test]
     fn version_three_store_backfills_deterministic_obligation_order() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("legacy.sqlite3");
-        let agent_id = LogicalAgentId::new();
-        let message_id = MessageId::new();
-        let second_message_id = MessageId::new();
+        let agent_id = LogicalAgentId::test();
+        let message_id = MessageId::test();
+        let second_message_id = MessageId::test();
         {
             let connection = Connection::open(&path).expect("legacy database");
             connection
@@ -11442,6 +11593,8 @@ mod tests {
             }
         }
         let store = Store::open(&path).expect("migrated store");
+        let message_id = MessageId::try_from(1).expect("positive");
+        let second_message_id = MessageId::try_from(2).expect("positive");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -11464,7 +11617,7 @@ mod tests {
                 .prepare("SELECT ask_message_id FROM obligations ORDER BY creation_sequence")
                 .expect("statement");
             statement
-                .query_map([], |row| row.get(0))
+                .query_map([], |row| id_text(row, 0))
                 .expect("obligations")
                 .collect::<Result<_, _>>()
                 .expect("obligation rows")
@@ -11665,7 +11818,7 @@ mod tests {
             }]
         );
         let wrong_target = store.create_reply(
-            MessageId::new(),
+            MessageId::test(),
             owing.logical_agent_id,
             "wrong target",
             ReplyDisposition::Final,
@@ -11888,7 +12041,7 @@ mod tests {
         let (requester, reason): (String, String) = store
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id, cancellation_reason
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT), cancellation_reason
                  FROM deliveries WHERE operation_id = ?1",
                 [tell.operation_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -11934,7 +12087,7 @@ mod tests {
         let first_target: String = store
             .connection
             .query_row(
-                "SELECT d.recipient_incarnation_id FROM deliveries d
+                "SELECT CAST(d.recipient_incarnation_id AS TEXT) FROM deliveries d
                  JOIN schedule_firings f ON f.message_id = d.message_id
                  WHERE f.schedule_id = ?1 AND f.cycle = 1",
                 [schedule.schedule_id.to_string()],
@@ -11945,7 +12098,7 @@ mod tests {
         let first_operation: String = store
             .connection
             .query_row(
-                "SELECT d.operation_id FROM deliveries d
+                "SELECT CAST(d.operation_id AS TEXT) FROM deliveries d
                  JOIN schedule_firings f ON f.message_id = d.message_id
                  WHERE f.schedule_id = ?1 AND f.cycle = 1",
                 [schedule.schedule_id.to_string()],
@@ -12019,7 +12172,7 @@ mod tests {
         let second_target: String = store
             .connection
             .query_row(
-                "SELECT d.recipient_incarnation_id FROM deliveries d
+                "SELECT CAST(d.recipient_incarnation_id AS TEXT) FROM deliveries d
                  JOIN schedule_firings f ON f.message_id = d.message_id
                  WHERE f.schedule_id = ?1 AND f.cycle = 2",
                 [schedule.schedule_id.to_string()],
@@ -12052,7 +12205,7 @@ mod tests {
         let second_operation: String = store
             .connection
             .query_row(
-                "SELECT operation_id FROM deliveries WHERE message_id = ?1",
+                "SELECT CAST(operation_id AS TEXT) FROM deliveries WHERE message_id = ?1",
                 [second_firing
                     .message_id
                     .expect("second message")
@@ -12700,7 +12853,7 @@ mod tests {
             .expect("ask");
         for conflict in [
             store.cancel_obligation(waiting.logical_agent_id, ask.message_id, "  "),
-            store.cancel_obligation(waiting.logical_agent_id, MessageId::new(), "absent"),
+            store.cancel_obligation(waiting.logical_agent_id, MessageId::RESERVED, "absent"),
         ] {
             assert!(matches!(conflict, Err(StoreError::Conflict(_))));
         }
@@ -12721,7 +12874,7 @@ mod tests {
         let (requester, reason): (String, String) = store
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id, cancellation_reason
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT), cancellation_reason
                  FROM obligations WHERE ask_message_id = ?1",
                 [ask.message_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -12794,7 +12947,7 @@ mod tests {
         let (requester, reason): (String, String) = reopened
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id, cancellation_reason
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT), cancellation_reason
                  FROM obligations WHERE ask_message_id = ?1",
                 [ask_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -14514,7 +14667,7 @@ mod tests {
         );
         assert!(matches!(stale, Err(StoreError::Conflict(_))));
         let missing = store.create_reply(
-            MessageId::new(),
+            MessageId::test(),
             owing.logical_agent_id,
             "nope",
             ReplyDisposition::Progress,
@@ -15124,9 +15277,9 @@ mod tests {
     /// liveness, per-claimant counts, and both parties of each ask.
     fn claimed_name_fixture(store: &Store) -> (String, String, String) {
         let connection = &store.connection;
-        let asker = LogicalAgentId::new();
-        let second_claimant = LogicalAgentId::new();
-        let responder = LogicalAgentId::new();
+        let asker = LogicalAgentId::test();
+        let second_claimant = LogicalAgentId::test();
+        let responder = LogicalAgentId::test();
         for (agent_id, name, created_at_ms) in [
             (&asker, "worker-x", 1),
             (&second_claimant, "worker-x", 2),
@@ -15149,15 +15302,15 @@ mod tests {
                         working_directory, created_at_ms, state
                      ) VALUES (?1, ?2, 's', 'w1:p1', 't1', 'claude', '[]', '/tmp', 1, ?3)",
                     params![
-                        IncarnationId::new().to_string(),
+                        IncarnationId::test().to_string(),
                         agent_id.to_string(),
                         state
                     ],
                 )
                 .expect("incarnation");
         }
-        let open_ask = MessageId::new();
-        let progress_ask = MessageId::new();
+        let open_ask = MessageId::test();
+        let progress_ask = MessageId::test();
         for (sequence, ask, owing, waiting, state) in [
             (1, &open_ask, &responder, &asker, "open"),
             (
@@ -15289,8 +15442,8 @@ mod tests {
         let store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
         claimed_name_fixture(&store);
         // One more name whose only holder is lost and owes an ask.
-        let gone = LogicalAgentId::new();
-        let gone_ask = MessageId::new();
+        let gone = LogicalAgentId::test();
+        let gone_ask = MessageId::test();
         store
             .connection
             .execute(
@@ -15382,7 +15535,7 @@ mod tests {
         // A third party is refused identically.
         let third_reply = store.create_reply_with_due(
             ask.message_id,
-            LogicalAgentId::new(),
+            LogicalAgentId::test(),
             "unrelated commentary",
             ReplyDisposition::Progress,
             "third-reply",
@@ -15589,7 +15742,7 @@ mod tests {
                     working_directory, created_at_ms, state
                  ) VALUES (?1, ?2, 's', 'w1:p1', 'term-waiting', 'codex', '[]', '/tmp', ?3, 'ready')",
                 params![
-                    IncarnationId::new().to_string(),
+                    IncarnationId::test().to_string(),
                     waiting.logical_agent_id.to_string(),
                     cancelled_at + 1
                 ],
@@ -15667,7 +15820,7 @@ mod tests {
                     working_directory, created_at_ms, state
                  ) VALUES (?1, ?2, 's', 'w1:p2', 'term-owing', 'codex', '[]', '/tmp', ?3, 'ready')",
                 params![
-                    IncarnationId::new().to_string(),
+                    IncarnationId::test().to_string(),
                     owing.logical_agent_id.to_string(),
                     cancelled_at + 1
                 ],
@@ -15728,7 +15881,7 @@ mod tests {
                     working_directory, created_at_ms, state
                  ) VALUES (?1, ?2, 's', 'w1:p2', 'term-owing', 'codex', '[]', '/tmp', ?3, 'ready')",
                 params![
-                    IncarnationId::new().to_string(),
+                    IncarnationId::test().to_string(),
                     owing.logical_agent_id.to_string(),
                     cancelled_at + 1
                 ],
@@ -15818,7 +15971,7 @@ mod tests {
         let requester: String = store
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id FROM obligations
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT) FROM obligations
                  WHERE ask_message_id = ?1",
                 [ask.message_id.to_string()],
                 |row| row.get(0),
@@ -16206,9 +16359,9 @@ mod tests {
     fn version_six_store_migrates_to_observed_name_authority() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("v6.sqlite3");
-        let agent_id = LogicalAgentId::new();
-        let incarnation_id = IncarnationId::new();
-        let operation_id = OperationId::new();
+        let agent_id = LogicalAgentId::test();
+        let incarnation_id = IncarnationId::test();
+        let operation_id = OperationId::test();
         let session = serde_json::json!({"agent":"codex","kind":"id","value":"sess-coord"});
         {
             let connection = Connection::open(&path).expect("db");
@@ -16276,6 +16429,7 @@ mod tests {
                 .expect("operation");
         }
         let mut store = Store::open(&path).expect("open migrates to v9");
+        let incarnation_id = IncarnationId::try_from(1).expect("positive");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -16309,10 +16463,10 @@ mod tests {
     fn version_sixteen_store_settles_prepare_asks_of_ended_cycles() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("v16.sqlite3");
-        let agent_id = LogicalAgentId::new();
-        let incarnation_id = IncarnationId::new();
-        let ended_ask = MessageId::new();
-        let live_ask = MessageId::new();
+        let agent_id = LogicalAgentId::test();
+        let incarnation_id = IncarnationId::test();
+        let ended_ask = MessageId::test();
+        let live_ask = MessageId::test();
         {
             let connection = Connection::open(&path).expect("db");
             for migration in [
@@ -16394,7 +16548,7 @@ mod tests {
                          VALUES (?1, ?2, ?3, ?2, 'save', 'resume', 'abort', 1000,
                                  3600000, ?4, 1, ?5, ?6, 1, ?7)",
                         params![
-                            RenewId::new().to_string(),
+                            RenewId::test().to_string(),
                             agent_id.to_string(),
                             incarnation_id.to_string(),
                             cycle,
@@ -16407,6 +16561,9 @@ mod tests {
             }
         }
         let store = Store::open(&path).expect("open migrates to v17");
+        let agent_id = LogicalAgentId::try_from(1).expect("positive");
+        let ended_ask = MessageId::try_from(1).expect("positive");
+        let live_ask = MessageId::try_from(2).expect("positive");
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -16422,7 +16579,7 @@ mod tests {
         let (requester, reason): (String, String) = store
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id, cancellation_reason
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT), cancellation_reason
                  FROM obligations WHERE ask_message_id = ?1",
                 [ended_ask.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -16570,7 +16727,7 @@ mod tests {
         let waiting: String = store
             .connection
             .query_row(
-                "SELECT waiting_agent_id FROM obligations WHERE ask_message_id = ?1",
+                "SELECT CAST(waiting_agent_id AS TEXT) FROM obligations WHERE ask_message_id = ?1",
                 [ask.message_id.to_string()],
                 |row| row.get(0),
             )
@@ -16600,7 +16757,8 @@ mod tests {
         let (transport, incarnation, agent): (String, Option<String>, String) = store
             .connection
             .query_row(
-                "SELECT delivery_transport, recipient_incarnation_id, recipient_agent_id
+                "SELECT delivery_transport, CAST(recipient_incarnation_id AS TEXT),
+                        CAST(recipient_agent_id AS TEXT)
                  FROM deliveries
                  WHERE message_id = ?1 AND delivery_transport = 'socket_inbox'",
                 [ask.message_id.to_string()],
@@ -16637,7 +16795,7 @@ mod tests {
                 .contains("operator attribution does not make operator the waiter"),
             "{error}"
         );
-        let missing = LogicalAgentId::new();
+        let missing = LogicalAgentId::RESERVED;
         let absent = store
             .create_ask(
                 missing,
@@ -16749,7 +16907,7 @@ mod tests {
         let requester: String = store
             .connection
             .query_row(
-                "SELECT cancellation_requester_agent_id FROM obligations
+                "SELECT CAST(cancellation_requester_agent_id AS TEXT) FROM obligations
                  WHERE ask_message_id = ?1",
                 [ask.message_id.to_string()],
                 |row| row.get(0),
@@ -16871,7 +17029,7 @@ mod tests {
                 .expect("idempotent"),
             DeliveryOutcome::Accepted
         );
-        let missing = LogicalAgentId::new();
+        let missing = LogicalAgentId::RESERVED;
         assert!(
             store
                 .claim_socket_waiter(missing)
