@@ -1,33 +1,57 @@
 //! Strong domain types for durable coordination state.
 
 use std::fmt;
+use std::num::NonZeroU64;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
-        pub struct $name(Uuid);
+        pub struct $name(NonZeroU64);
 
         impl $name {
-            /// Create a time-ordered opaque identifier.
-            #[must_use]
-            pub fn new() -> Self {
-                Self(Uuid::now_v7())
+            #[cfg(test)]
+            #[allow(dead_code)]
+            pub(crate) fn test() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(i64::MAX as u64 / 2);
+                Self(NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("positive"))
+            }
+
+            pub(crate) fn from_rowid(rowid: i64) -> Option<Self> {
+                u64::try_from(rowid)
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .map(Self)
+            }
+
+            pub(crate) fn parse(value: &str) -> Option<Self> {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .map(Self)
             }
         }
 
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
+        impl TryFrom<u64> for $name {
+            type Error = &'static str;
+
+            fn try_from(value: u64) -> Result<Self, Self::Error> {
+                NonZeroU64::new(value)
+                    .map(Self)
+                    .ok_or("durable ids must be positive integers")
             }
         }
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
+                self.0.get().fmt(f)
             }
         }
     };
@@ -41,46 +65,18 @@ id_type!(OperatorNoticeId);
 id_type!(RenewId);
 id_type!(ScheduleId);
 
-impl IncarnationId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
-}
-
 impl OperationId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
+    pub(crate) const RESERVED: Self = Self(NonZeroU64::MAX);
 }
 
-impl MessageId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
-}
-
+#[cfg(test)]
 impl LogicalAgentId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
+    pub(crate) const RESERVED: Self = Self(NonZeroU64::MAX);
 }
 
-impl OperatorNoticeId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
-}
-
-impl RenewId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
-}
-
-impl ScheduleId {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Uuid::parse_str(value).ok().map(Self)
-    }
+#[cfg(test)]
+impl MessageId {
+    pub(crate) const RESERVED: Self = Self(NonZeroU64::MAX);
 }
 
 /// Outcome of one repeating schedule firing.
@@ -381,5 +377,43 @@ pub(crate) fn format_duration_ms(ms: i64) -> String {
         format!("{minutes}m{}s", seconds % 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_positive_json_numbers_and_decimal_text() {
+        let id = MessageId::try_from(1847).expect("positive");
+        assert_eq!(
+            serde_json::to_value(id).expect("serialize"),
+            serde_json::json!(1847)
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageId>(serde_json::json!(1847)).expect("parse"),
+            id
+        );
+        assert_eq!(id.to_string(), "1847");
+    }
+
+    #[test]
+    fn ids_reject_zero_signs_prefixes_and_uuids() {
+        for invalid in [
+            "",
+            "0",
+            "+1",
+            "-1",
+            "0x1",
+            "019ff700-0000-7000-8000-000000000001",
+        ] {
+            assert!(LogicalAgentId::parse(invalid).is_none(), "{invalid}");
+        }
+        assert!(serde_json::from_value::<LogicalAgentId>(serde_json::json!(0)).is_err());
+        assert!(
+            serde_json::from_value::<LogicalAgentId>(serde_json::json!("1")).is_err(),
+            "the JSON protocol accepts numbers, not decimal strings"
+        );
     }
 }

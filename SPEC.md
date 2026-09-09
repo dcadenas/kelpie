@@ -177,6 +177,15 @@ MUST refuse a logical agent whose `delivery_transport` is `socket_inbox`.
 
 The names below describe semantic records, not a required database schema.
 
+Every Kelpie-owned ID MUST be a positive integer unique within its record type.
+The daemon MUST allocate each ID in the same transaction that inserts its row,
+using a per-table sequence that starts at 1. Clients MUST NOT allocate durable
+IDs. The JSON protocol MUST encode IDs as numbers. CLI arguments MUST accept
+only positive decimal `u64` values; zero, signs, prefixes, and UUIDs MUST be
+rejected. A schema migration from textual IDs MUST renumber each table oldest
+first, update every foreign key and stored typed intent atomically, and preserve
+all durable rows and live addressability.
+
 ### LogicalAgent
 
 A `LogicalAgent` is a durable Kelpie identity.
@@ -429,7 +438,7 @@ a second message beside it. An `unknown` delivery MUST NOT be resent, but it MUS
 NOT stop later intervals from materializing distinct messages.
 Kelpie MUST raise an operator notice when a schedule enters an unavailable run,
 but MUST NOT repeat that notice on every interval until a firing succeeds.
-Every ask, including a start ask, creates a reply-reminder policy with a twenty-minute default interval.
+Every ask, including a start ask, creates a reply-reminder policy with a forty-five-minute default interval.
 The caller MAY explicitly disable reminders for one ask. The policy is armed
 only after the ask delivery is accepted. Reminder injection is `herdr_prompt`
 only. It MUST be injected only when a fresh Herdr snapshot proves the owing
@@ -452,11 +461,10 @@ resolve: waiter ACK or Herdr accept remains the only resolve. Rejected and
 `target_unavailable` finals leave the obligation open; reminders MAY resume.
 An unknown reminder delivery MUST suspend automatic retries. Snoozing or disabling
 a reminder MUST NOT resolve its obligation. Reminders are not cron and MUST NOT
-require receiver acknowledgement. Every reminder MUST carry the original ask
-body: the obligation is durable while the owing agent's context may have been
-replaced by a renew, a restart, or a clear, so the reminder is the amnesia
-protocol — the agent must be able to answer what it was asked without asking
-the sender to repeat itself. Cancel of a scheduled delivery is legal only
+require receiver acknowledgement. Every reminder MUST name the ask and tell the
+owing agent how to recover it with `ask-info`, snooze it, send a final reply, and
+cancel it. A reminder MUST NOT inline the original ask body. `ask-info` is the
+amnesia read after a renew, restart, or clear. Cancel of a scheduled delivery is legal only
 before the first Herdr write. After submit, existing no-resend and unknown
 rules apply. The due clock is Unix epoch milliseconds from the host
 `SystemTime`. A delivery is due when `now_ms >= scheduled_at_ms`. A due time

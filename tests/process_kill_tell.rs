@@ -333,7 +333,7 @@ fn durable_tell_state(database: &Path) -> (String, String, String, String, i64, 
     Connection::open(database)
         .expect("open state database")
         .query_row(
-            "SELECT m.id, o.outcome, a.phase, d.outcome,
+            "SELECT CAST(m.id AS TEXT), o.outcome, a.phase, d.outcome,
                     a.attempt_number, d.attempt_number,
                     (SELECT COUNT(*) FROM obligations ob WHERE ob.ask_message_id = m.id)
              FROM operations o

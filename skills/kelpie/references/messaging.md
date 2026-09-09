@@ -28,7 +28,7 @@ Contents: [Method details](#method-details); [ask vs tell](#ask-vs-tell).
   `idempotency_key` for recognizing an existing schedule.
 - `ask`: request a durable answer using the same recipient shape as `tell`.
   Delivery is immediate; due-time flags are refused. The returned message ID
-  identifies the obligation. Pending-reply reminders default to twenty minutes;
+  identifies the obligation. Pending-reply reminders default to forty-five minutes;
   use `remind_after_ms` to override or `no_remind: true` to disable them.
   Becoming idle never bypasses the due time.
 - `ask-info`: read an ask by message ID, including original body, parties,
@@ -98,4 +98,5 @@ Handle received envelopes as follows:
 - `<kelpie-system cancellation owing=… cancelled-ask=…>` cancels your work on
   that ask. Stop; no reply is owed.
 - An unfamiliar `<kelpie-reminder …>` carries a real outstanding question.
-  Recover details with `kelpie ask-info <ask-id>`, then answer or cancel it.
+  Its body is intentionally absent. Follow its commands to recover details with
+  `kelpie ask-info <ask-id>`, snooze while working, answer final, or cancel it.

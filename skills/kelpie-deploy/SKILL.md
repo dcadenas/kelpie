@@ -90,6 +90,37 @@ export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/kelpie-target"
 
 ## Restart and prove it came back
 
+### Integer-ID cutover
+
+If the pending migration changes UUID IDs to integers, do not use a single
+restart. Capture the currently Ready aliases, then stop the old daemon, migrate
+with the newly installed binary, start it, and notify every incarnation that is
+Ready after recovery:
+
+```sh
+kelpie report --live
+systemctl --user stop kelpied
+kelpied --database <database> --socket <socket> --herdr-socket <herdr-socket> --migrate-only
+sqlite3 -readonly <database> "PRAGMA user_version;"
+systemctl --user start kelpied
+kelpie report --live
+```
+
+The pre-stop report is a reconciliation aid, not the notification target. The
+post-start report owns the target set: send this text once to every exact Ready
+incarnation through its current alias, and record each delivery outcome:
+
+```text
+Kelpie IDs are now positive integers. UUID IDs no longer work. Run `kelpie who`
+and `kelpie pending` for current IDs. Open asks survived the migration under new
+integer IDs. If you only retained a UUID for an ask, ask its sender to send the
+ask again.
+```
+
+An accepted tell is the notification receipt. A rejected, unavailable, or
+unknown delivery does not prove that Ready incarnation was notified; report it
+for explicit reconciliation and do not blindly resend an unknown delivery.
+
 ```sh
 systemctl --user restart kelpied
 ```

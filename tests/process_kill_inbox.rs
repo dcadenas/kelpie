@@ -258,7 +258,7 @@ fn reply_message_id(database: &Path) -> String {
     Connection::open(database)
         .expect("open state database")
         .query_row(
-            "SELECT m.id FROM messages m
+            "SELECT CAST(m.id AS TEXT) FROM messages m
              JOIN deliveries d ON d.message_id = m.id
              WHERE m.kind = 'reply' AND d.delivery_transport = 'socket_inbox'",
             [],
@@ -295,11 +295,11 @@ fn recover_daemon(
     recovered
 }
 
-fn ack_until_resolved(kelpie_socket: &Path, waiter: LogicalAgentId, expected_reply: &str) {
+fn ack_until_resolved(kelpie_socket: &Path, waiter: LogicalAgentId, expected_reply: &Value) {
     let mut inbox = claim_inbox(kelpie_socket, waiter, "recover-claim");
     let delivery = read_json(&mut inbox.reader);
     assert_eq!(delivery["method"], "inbox.delivery");
-    assert_eq!(delivery["params"]["message_id"], expected_reply);
+    assert_eq!(&delivery["params"]["message_id"], expected_reply);
     ack_delivery(
         &mut inbox.stream,
         &delivery["params"]["message_id"],
@@ -371,7 +371,11 @@ fn kill_before_inbox_write_keeps_queued_without_bytes_or_resend() {
         ("queued", "open", 1)
     );
     let reply_id = reply_message_id(&database);
-    ack_until_resolved(&kelpie_socket, waiter.logical_agent_id, &reply_id);
+    ack_until_resolved(
+        &kelpie_socket,
+        waiter.logical_agent_id,
+        &serde_json::json!(reply_id.parse::<u64>().expect("integer id")),
+    );
     assert_eq!(
         Store::open(&database)
             .expect("reopen")
@@ -413,10 +417,7 @@ fn kill_after_inbox_write_drains_the_same_queued_attempt() {
     assert_eq!(delivery["method"], "inbox.delivery");
     assert_eq!(delivery["params"]["kind"], "reply");
     assert_eq!(delivery["params"]["disposition"], "final");
-    let reply_id = delivery["params"]["message_id"]
-        .as_str()
-        .expect("id")
-        .to_string();
+    let reply_id = delivery["params"]["message_id"].clone();
     kill_daemon(first_daemon);
     drop(written);
     let before = durable_inbox_state(&database);
@@ -496,11 +497,7 @@ fn kill_after_inbox_ack_before_resolve_leaves_obligation_open() {
         &fault_socket,
         &fault_listener,
     );
-    ack_until_resolved(
-        &kelpie_socket,
-        waiter.logical_agent_id,
-        reply_id.as_str().expect("id"),
-    );
+    ack_until_resolved(&kelpie_socket, waiter.logical_agent_id, &reply_id);
     assert_eq!(
         Store::open(&database)
             .expect("reopen")
@@ -579,7 +576,7 @@ fn kill_after_waiter_retire_owing_submitted_settles_before_write() {
     bound.write_all(b"x").expect("release");
     let client = {
         let socket = kelpie_socket.clone();
-        let waiter = waiter.logical_agent_id.to_string();
+        let waiter = waiter.logical_agent_id;
         thread::spawn(move || {
             let mut stream = UnixStream::connect(socket).expect("connect");
             serde_json::to_writer(

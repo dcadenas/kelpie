@@ -12,7 +12,7 @@ use kelpie::slice::Kelpie;
 use kelpie::store::Store;
 
 const USAGE: &str = "\
-kelpied [--database PATH] [--socket PATH] [--herdr-socket PATH] [--herdr-wait-ms MS]
+kelpied [--database PATH] [--socket PATH] [--herdr-socket PATH] [--herdr-wait-ms MS] [--migrate-only]
 kelpied --version
 
 Defaults:
@@ -32,6 +32,7 @@ struct Options {
     socket: Option<PathBuf>,
     herdr_socket: Option<PathBuf>,
     herdr_wait_ms: Option<u64>,
+    migrate_only: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +82,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     kelpie::daemon::claim_socket_path(&kelpie_socket)?;
 
     let store = Store::open(&database)?;
+    if options.migrate_only {
+        return Ok(());
+    }
     let herdr = HerdrClient::new(herdr_socket.clone(), Duration::from_secs(5));
     // Herdr's socket appears when Herdr starts, which can be well after this
     // service does. Waiting keeps a boot race from becoming a permanent failure.
@@ -126,9 +130,17 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocatio
         }
         if !matches!(
             flag,
-            "--database" | "--socket" | "--herdr-socket" | "--herdr-wait-ms"
+            "--database" | "--socket" | "--herdr-socket" | "--herdr-wait-ms" | "--migrate-only"
         ) {
             return Err(format!("unknown argument {flag}\n{USAGE}"));
+        }
+        if flag == "--migrate-only" {
+            if options.migrate_only {
+                return Err("--migrate-only specified more than once".into());
+            }
+            options.migrate_only = true;
+            index += 1;
+            continue;
         }
         let flag = flag.to_string();
         index += 1;
@@ -209,6 +221,7 @@ mod tests {
                 socket: Some(PathBuf::from("/run/kelpie.sock")),
                 herdr_socket: Some(PathBuf::from("/run/herdr.sock")),
                 herdr_wait_ms: Some(30_000),
+                migrate_only: false,
             })
         );
     }
@@ -237,5 +250,17 @@ mod tests {
             parse_args([]).expect("parse"),
             Invocation::Run(Options::default())
         );
+    }
+
+    #[test]
+    fn migrate_only_is_a_flag_and_cannot_be_repeated() {
+        assert_eq!(
+            parse_args(args(&["--migrate-only"])).expect("parse"),
+            Invocation::Run(Options {
+                migrate_only: true,
+                ..Options::default()
+            })
+        );
+        assert!(parse_args(args(&["--migrate-only", "--migrate-only"])).is_err());
     }
 }

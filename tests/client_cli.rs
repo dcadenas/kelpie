@@ -157,9 +157,9 @@ fn run_cli(args: &[&str]) -> std::process::Output {
         .expect("run kelpie")
 }
 
-const SENDER: &str = "019ff700-0000-7000-8000-000000000001";
-const RECIPIENT: &str = "019ff700-0000-7000-8000-000000000002";
-const INCARNATION: &str = "019ff700-0000-7000-8000-000000000003";
+const SENDER: &str = "11";
+const RECIPIENT: &str = "12";
+const INCARNATION: &str = "13";
 
 #[test]
 fn typed_tell_file_body_preserves_metacharacters_and_does_not_need_jq() {
@@ -355,7 +355,7 @@ fn typed_who_defaults_to_the_calling_pane_and_finds_a_waiter_by_name() {
         serde_json::from_slice(&waiter_output.stdout).expect("waiter JSON");
     assert_eq!(
         waiter_response["result"]["logical_agent_id"],
-        waiter.logical_agent_id.to_string()
+        serde_json::json!(waiter.logical_agent_id)
     );
     assert_eq!(
         waiter_response["result"]["delivery_transport"],
@@ -409,9 +409,9 @@ fn typed_cli_receipts_show_outcomes_and_exit_nonzero() {
             name: "accepted",
             response: json!({
                 "result": {
-                    "message_id": "m",
-                    "operation_id": "o",
-                    "recipient": RECIPIENT,
+                    "message_id": 21,
+                    "operation_id": 22,
+                    "recipient": 12,
                     "delivery_outcome": "accepted"
                 }
             }),
@@ -440,9 +440,9 @@ fn typed_cli_receipts_show_outcomes_and_exit_nonzero() {
             name: "result-rejected",
             response: json!({
                 "result": {
-                    "message_id": "m",
-                    "operation_id": "o",
-                    "recipient": RECIPIENT,
+                    "message_id": 21,
+                    "operation_id": 22,
+                    "recipient": 12,
                     "delivery_outcome": "rejected"
                 }
             }),
@@ -495,17 +495,17 @@ fn typed_tell_exact_ids_do_not_require_an_alias() {
             .expect("read");
         let request: Value = serde_json::from_str(&line).expect("json");
         assert_eq!(request["method"], "tell");
-        assert_eq!(request["params"]["recipient"], RECIPIENT);
-        assert_eq!(request["params"]["recipient_incarnation"], INCARNATION);
+        assert_eq!(request["params"]["recipient"], 12);
+        assert_eq!(request["params"]["recipient_incarnation"], 13);
         assert!(request["params"].get("recipient_alias").is_none());
         serde_json::to_writer(
             &mut stream,
             &json!({
                 "id": request["id"],
                 "result": {
-                    "message_id": "m",
-                    "operation_id": "o",
-                    "recipient": RECIPIENT,
+                    "message_id": 21,
+                    "operation_id": 22,
+                    "recipient": 12,
                     "delivery_outcome": "accepted"
                 }
             }),
@@ -547,8 +547,8 @@ fn typed_clear_builds_the_exact_recipient_request() {
             .expect("read");
         let request: Value = serde_json::from_str(&line).expect("json");
         assert_eq!(request["method"], "clear");
-        assert_eq!(request["params"]["recipient"], RECIPIENT);
-        assert_eq!(request["params"]["recipient_incarnation"], INCARNATION);
+        assert_eq!(request["params"]["recipient"], 12);
+        assert_eq!(request["params"]["recipient_incarnation"], 13);
         assert!(request["params"].get("recipient_alias").is_none());
         assert!(request["params"]["idempotency_key"].is_string());
         serde_json::to_writer(
@@ -556,9 +556,9 @@ fn typed_clear_builds_the_exact_recipient_request() {
             &json!({
                 "id": request["id"],
                 "result": {
-                    "operation_id": "o",
-                    "recipient": RECIPIENT,
-                    "recipient_incarnation": INCARNATION,
+                    "operation_id": 22,
+                    "recipient": 12,
+                    "recipient_incarnation": 13,
                     "outcome": "succeeded"
                 }
             }),
@@ -580,7 +580,7 @@ fn typed_clear_builds_the_exact_recipient_request() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("clear operation=o"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("clear operation=22"));
     server.join().expect("server");
 }
 
@@ -618,6 +618,20 @@ fn typed_cli_rejects_unknown_and_conflicting_process_args() {
 }
 
 #[test]
+fn typed_cli_rejects_uuid_and_zero_durable_ids_before_connecting() {
+    for invalid in ["019ff700-0000-7000-8000-000000000001", "0"] {
+        let output = run_cli(&["reply", invalid, "--final", "--body", "done"]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("reply_to must be a positive decimal integer"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn typed_start_builds_existing_start_intent_without_live_launch() {
     let directory = tempfile::tempdir().expect("tempdir");
     let socket = directory.path().join("kelpie.sock");
@@ -651,10 +665,10 @@ fn typed_start_builds_existing_start_intent_without_live_launch() {
             &json!({
                 "id": request["id"],
                 "result": {
-                    "logical_agent_id": RECIPIENT,
-                    "incarnation_id": INCARNATION,
-                    "runtime_start": {"operation_id": "o", "outcome": "succeeded"},
-                    "initial_message": {"message_id": "m", "operation_id": "i", "outcome": "accepted"}
+                    "logical_agent_id": 12,
+                    "incarnation_id": 13,
+                    "runtime_start": {"operation_id": 22, "outcome": "succeeded"},
+                    "initial_message": {"message_id": 21, "operation_id": 23, "outcome": "accepted"}
                 }
             }),
         )
@@ -705,10 +719,10 @@ fn typed_start_exits_nonzero_when_initial_message_is_not_accepted() {
         directory.path(),
         json!({
             "result": {
-                "logical_agent_id": RECIPIENT,
-                "incarnation_id": INCARNATION,
-                "runtime_start": {"operation_id": "o", "outcome": "succeeded"},
-                "initial_message": {"message_id": "m", "operation_id": "i", "outcome": "unknown"}
+                "logical_agent_id": 12,
+                "incarnation_id": 13,
+                "runtime_start": {"operation_id": 22, "outcome": "succeeded"},
+                "initial_message": {"message_id": 21, "operation_id": 23, "outcome": "unknown"}
             }
         }),
     );
@@ -749,9 +763,9 @@ fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
             "result": {
                 "schedules": [
                     {
-                        "schedule_id": "01a00000-0000-7000-8000-000000000010",
+                        "schedule_id": 31,
                         "kind": "tell",
-                        "logical_agent_id": RECIPIENT,
+                        "logical_agent_id": 12,
                         "incarnation_id": null,
                         "interval_ms": 1_800_000,
                         "clock": "wall",
@@ -760,15 +774,15 @@ fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
                         "state": "active",
                         "last_outcome": null,
                         "last_message_id": null,
-                        "requester_agent_id": SENDER,
+                        "requester_agent_id": 11,
                         "body": body,
                         "idempotency_key": "tell-intent-key"
                     },
                     {
-                        "schedule_id": "01a00000-0000-7000-8000-000000000011",
+                        "schedule_id": 32,
                         "kind": "renew",
-                        "logical_agent_id": RECIPIENT,
-                        "incarnation_id": INCARNATION,
+                        "logical_agent_id": 12,
+                        "incarnation_id": 13,
                         "interval_ms": 2_700_000,
                         "clock": "active",
                         "next_fire_at_ms": 2,
@@ -776,7 +790,7 @@ fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
                         "state": "active",
                         "last_outcome": null,
                         "last_message_id": null,
-                        "requester_agent_id": SENDER,
+                        "requester_agent_id": 11,
                         "body": null,
                         "idempotency_key": null
                     }
@@ -799,11 +813,11 @@ fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
     );
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("json");
     let tell = &parsed["result"]["schedules"][0];
-    assert_eq!(tell["requester_agent_id"], SENDER);
+    assert_eq!(tell["requester_agent_id"], 11);
     assert_eq!(tell["body"], body);
     assert_eq!(tell["idempotency_key"], "tell-intent-key");
     let renew = &parsed["result"]["schedules"][1];
     assert!(renew["body"].is_null());
     assert!(renew["idempotency_key"].is_null());
-    assert_eq!(renew["requester_agent_id"], SENDER);
+    assert_eq!(renew["requester_agent_id"], 11);
 }

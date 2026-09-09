@@ -3246,11 +3246,7 @@ impl Kelpie {
         Ok(PreparedReminder {
             reminder: reminder.clone(),
             request_id: format!("kelpie:reminder:{}:{now_ms}", reminder.ask_message_id),
-            envelope: envelope::render_reminder(
-                &waiting,
-                &reminder.ask_message_id.to_string(),
-                &reminder.body,
-            )?,
+            envelope: envelope::render_reminder(&waiting, &reminder.ask_message_id.to_string())?,
             now_ms,
         })
     }
@@ -5131,11 +5127,7 @@ impl Kelpie {
 
     fn fire_one_reminder(&mut self, reminder: &DueReminder, now_ms: i64) -> Result<(), SliceError> {
         let waiting = self.store.agent_address(reminder.waiting_agent_id)?;
-        let envelope = envelope::render_reminder(
-            &waiting,
-            &reminder.ask_message_id.to_string(),
-            &reminder.body,
-        )?;
+        let envelope = envelope::render_reminder(&waiting, &reminder.ask_message_id.to_string())?;
         let connection = self.blocking_connect()?;
         let request_id = format!("kelpie:reminder:{}:{}", reminder.ask_message_id, now_ms);
         self.store
@@ -5455,7 +5447,7 @@ mod tests {
     #[test]
     fn occupancy_join_is_pane_and_terminal_not_swapped() {
         let clock = IntervalRenewClock {
-            renew_id: crate::domain::RenewId::new(),
+            renew_id: crate::domain::RenewId::test(),
             pane_id: "w:p1".into(),
             terminal_id: "term-1".into(),
             active_remaining_ms: 1_000,
@@ -6010,7 +6002,7 @@ mod tests {
             HerdrClient::new(directory.path().join("unused.sock"), Duration::from_secs(1)),
         );
         let rendered = kelpie
-            .render_initial_message(&e2e_intent(), MessageId::new())
+            .render_initial_message(&e2e_intent(), MessageId::test())
             .expect("envelope");
         assert!(
             rendered.starts_with("<kelpie from=operator msg="),

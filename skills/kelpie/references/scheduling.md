@@ -143,10 +143,28 @@ BODY
 <kelpie-renew from=alice resumed cycle=N checkpointed-at-ms=MS>
 BODY
 </kelpie-renew>
+
+<kelpie-reminder waiting=alice reply-to=1847>
+You still owe alice a final on this ask.
+
+If the question is gone from context:
+  kelpie ask-info 1847
+
+Still working:
+  kelpie reminder-snooze 1847 --for 2h
+
+Ready to answer:
+  kelpie reply 1847 --final --file PATH
+
+Drop the obligation:
+  kelpie cancel 1847 --reason TEXT
+</kelpie-reminder>
 ```
 
 - Envelopes omit `to`, `kind`, body wrappers, and tell IDs. `reply-to` and `re`
   carry durable message IDs; `progress` and `final` are boolean flags.
+- Reminder envelopes never inline the ask body. Use their `ask-info` command to
+  recover it after context loss; reminders require no acknowledgement.
 - `from` names the reply target. `from=operator` identifies the user directly.
   Other enveloped turns are agent messages even though they use the human role.
 - On `<kelpie-renew ... prepare>`, write the checkpoint, then send

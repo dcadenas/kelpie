@@ -327,7 +327,7 @@ fn durable_reply_state(database: &Path) -> (String, String, String, String, Stri
     Connection::open(database)
         .expect("open state database")
         .query_row(
-            "SELECT m.id, o.outcome, a.phase, d.outcome, ob.state
+            "SELECT CAST(m.id AS TEXT), o.outcome, a.phase, d.outcome, ob.state
              FROM operations o
              JOIN operation_attempts a ON a.operation_id = o.id
              JOIN deliveries d ON d.operation_id = o.id
@@ -382,7 +382,7 @@ fn recover_and_assert_unknown_open(
     );
     assert_eq!(
         pending["result"][0]["ask_message_id"],
-        ask_message_id.to_string()
+        serde_json::json!(ask_message_id)
     );
     assert_eq!(pending["result"][0]["state"], "open");
     let after = durable_reply_state(database);

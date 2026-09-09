@@ -70,10 +70,155 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command,
         } => {
             let request_id = generated_id();
-            let (method, params) = build_typed(&socket, command, &request_id)?;
+            validate_command_ids(&command).map_err(io::Error::other)?;
+            let (method, mut params) = build_typed(&socket, command, &request_id)?;
+            normalize_durable_ids(&mut params)?;
             let request = typed_request(&request_id, &method, &params);
             exchange(&socket, &serde_json::to_string(&request)?, json)
         }
+    }
+}
+
+fn validate_command_ids(command: &Command) -> Result<(), String> {
+    match command {
+        Command::Tell {
+            recipient, sender, ..
+        }
+        | Command::Ask {
+            recipient, sender, ..
+        } => {
+            validate_recipient(recipient)?;
+            validate_caller(sender.as_ref())
+        }
+        Command::Reply {
+            reply_to,
+            requester,
+            ..
+        } => {
+            validate_id("reply_to", reply_to)?;
+            validate_caller(requester.as_ref())
+        }
+        Command::Clear { recipient, .. } => validate_recipient(recipient),
+        Command::Renew(renew) => {
+            if let Some(recipient) = &renew.recipient {
+                validate_exact_recipient(recipient)?;
+            }
+            validate_caller(renew.requester.as_ref())
+        }
+        Command::Pending { target }
+        | Command::Whoami { target }
+        | Command::Rename { target, .. }
+        | Command::Schedules { target } => validate_caller(target.as_ref()),
+        Command::Who { target, .. } => validate_attribution_target(target.as_ref()),
+        Command::Attribution { target, .. } => validate_attribution_target(Some(target)),
+        Command::Start(start) => {
+            if let Some(id) = &start.logical_agent_id {
+                validate_id("logical_agent_id", id)?;
+            }
+            if let kelpie::cli::StartParent::Agent(id) = &start.parent {
+                validate_id("parent.agent_id", id)?;
+            }
+            if let Some(id) = &start.initial_sender {
+                validate_id("initial_message.sender", id)?;
+            }
+            if let Some(id) = &start.supersedes {
+                validate_id("supersedes", id)?;
+            }
+            Ok(())
+        }
+        Command::Adopt(adopt) => {
+            if let Some(id) = &adopt.logical_agent_id {
+                validate_id("logical_agent_id", id)?;
+            }
+            Ok(())
+        }
+        Command::Cancel {
+            ask_id, requester, ..
+        }
+        | Command::ReminderSnooze {
+            ask_id, requester, ..
+        }
+        | Command::ReminderInterval {
+            ask_id, requester, ..
+        }
+        | Command::ReminderDisable { ask_id, requester } => {
+            validate_id("ask_message_id", ask_id)?;
+            validate_caller(requester.as_ref())
+        }
+        Command::RenewCancel {
+            renew_id,
+            requester,
+            ..
+        } => {
+            validate_id("renew_id", renew_id)?;
+            validate_caller(requester.as_ref())
+        }
+        Command::ScheduleCancel {
+            schedule_id,
+            requester,
+            ..
+        } => {
+            validate_id("schedule_id", schedule_id)?;
+            validate_caller(requester.as_ref())
+        }
+        Command::Retire { incarnation_id, .. } => validate_id("incarnation_id", incarnation_id),
+        Command::WaiterRegister { parent, .. } => {
+            if let kelpie::cli::StartParent::Agent(id) = parent {
+                validate_id("parent.agent_id", id)?;
+            }
+            Ok(())
+        }
+        Command::WaiterRetire { target } => match target {
+            AgentTarget::Id(id) => validate_id("logical_agent_id", id),
+            AgentTarget::Alias(_) => Ok(()),
+        },
+        Command::AskInfo { ask_id } => validate_id("ask_message_id", ask_id),
+        Command::Recover
+        | Command::Report { .. }
+        | Command::NameInfo { .. }
+        | Command::Notice { .. }
+        | Command::Notices => Ok(()),
+    }
+}
+
+fn validate_id(name: &str, text: &str) -> Result<(), String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{name} must be a positive decimal integer"));
+    }
+    let id = text
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a positive decimal integer"))?;
+    if id == 0 {
+        return Err(format!("{name} must be a positive decimal integer"));
+    }
+    Ok(())
+}
+
+fn validate_caller(caller: Option<&Caller>) -> Result<(), String> {
+    if let Some(Caller::Id(id)) = caller {
+        validate_id("agent_id", id)?;
+    }
+    Ok(())
+}
+
+fn validate_exact_recipient(recipient: &ExactRecipient) -> Result<(), String> {
+    validate_id("recipient", &recipient.recipient)?;
+    validate_id("recipient_incarnation", &recipient.incarnation)
+}
+
+fn validate_recipient(recipient: &Recipient) -> Result<(), String> {
+    match recipient {
+        Recipient::Alias(_) => Ok(()),
+        Recipient::Exact(recipient) => validate_exact_recipient(recipient),
+        Recipient::Agent(id) => validate_id("recipient", id),
+    }
+}
+
+fn validate_attribution_target(target: Option<&AttributionTarget>) -> Result<(), String> {
+    match target {
+        Some(AttributionTarget::Incarnation(id)) => validate_id("incarnation_id", id),
+        Some(AttributionTarget::Agent(id)) => validate_id("agent_id", id),
+        _ => Ok(()),
     }
 }
 
@@ -788,9 +933,61 @@ fn fail_if_error(response: &Value) -> Result<(), Box<dyn std::error::Error>> {
 fn field(value: &Value, name: &str) -> String {
     value
         .get(name)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+        .map_or_else(String::new, |field| match field {
+            Value::String(value) => value.clone(),
+            Value::Number(value) => value.to_string(),
+            _ => String::new(),
+        })
+}
+
+fn normalize_durable_ids(value: &mut Value) -> Result<(), Box<dyn std::error::Error>> {
+    const ID_FIELDS: &[&str] = &[
+        "agent_id",
+        "ask_message_id",
+        "incarnation_id",
+        "logical_agent_id",
+        "recipient",
+        "recipient_incarnation",
+        "renew_id",
+        "reply_to",
+        "requester",
+        "requester_agent_id",
+        "schedule_id",
+        "sender",
+        "supersedes",
+    ];
+
+    match value {
+        Value::Object(fields) => {
+            for (name, field) in fields {
+                if ID_FIELDS.contains(&name.as_str()) {
+                    if let Value::String(text) = field {
+                        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return Err(format!("{name} must be a positive decimal integer").into());
+                        }
+                        let id = text
+                            .parse::<u64>()
+                            .map_err(|_| format!("{name} must be a positive decimal integer"))?;
+                        if id == 0 {
+                            return Err(format!("{name} must be a positive decimal integer").into());
+                        }
+                        *field = json!(id);
+                    } else if !field.is_null() && !field.is_number() {
+                        return Err(format!("{name} must be a positive decimal integer").into());
+                    }
+                } else {
+                    normalize_durable_ids(field)?;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_durable_ids(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Default)]

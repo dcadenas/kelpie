@@ -363,7 +363,7 @@ fn on_clear_rotation_wait_does_not_block_an_unrelated_client() {
     );
     assert_eq!(
         pending["result"][0]["ask_message_id"],
-        ask.message_id.to_string()
+        serde_json::json!(ask.message_id)
     );
     assert!(clear_rx.try_recv().is_err(), "clear must remain parked");
     let tell_socket = kelpie_socket.clone();

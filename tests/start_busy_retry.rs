@@ -223,11 +223,9 @@ fn a_busy_pane_is_retried_by_the_daemon_and_the_start_succeeds() {
         2,
         "exactly one retry after the busy refusal: {seen:?}"
     );
-    let operation_id = response["result"]["runtime_start"]["operation_id"]
-        .as_str()
-        .expect("operation id");
+    let operation_id = response["result"]["runtime_start"]["operation_id"].to_string();
     assert_eq!(
-        operation_row(directory.path(), operation_id),
+        operation_row(directory.path(), &operation_id),
         ("succeeded".to_owned(), "ready".to_owned())
     );
 }

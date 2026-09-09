@@ -56,6 +56,7 @@ recipient with either its live alias or both `--recipient-id` and
 ## Preserve identity and outcomes
 
 Preserve returned message, logical-agent, incarnation, and schedule IDs exactly.
+IDs are positive decimal integers. UUIDs and zero are not valid Kelpie IDs.
 A public name is a reusable live alias. Continuing a logical agent preserves its
 obligations; a new agent with that name does not inherit them.
 
@@ -75,7 +76,7 @@ Requested model/provider/effort is intent, never observed attribution. Consult
 
 ## Reminders and cancellation
 
-Asks arrive immediately and default to twenty-minute reminders. Sender overrides
+Asks arrive immediately and default to forty-five-minute reminders. Sender overrides
 are `--remind-after-ms` or explicit `--no-remind`. Idle does not bypass due time.
 Only the owing receiver can snooze or increase an ask's interval. Snoozes survive
 progress; disabled reminders stay disabled. A snooze cannot retract a submitted

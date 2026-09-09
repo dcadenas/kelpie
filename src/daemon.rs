@@ -2709,7 +2709,7 @@ impl Daemon {
             request_id: String::new(),
             stream: None,
             prepared: PreparedPrompt {
-                operation_id: OperationId::new(),
+                operation_id: OperationId::RESERVED,
                 recipient_incarnation: reminder.reminder.recipient_incarnation,
                 pane_id: reminder.reminder.pane_id.clone(),
                 envelope: reminder.envelope.clone(),
@@ -7094,7 +7094,7 @@ mod tests {
 
     fn ask_params(remind_after_ms: Option<i64>, no_remind: bool) -> AskParams {
         AskParams {
-            sender: LogicalAgentId::new(),
+            sender: LogicalAgentId::test(),
             recipient: None,
             recipient_incarnation: None,
             recipient_alias: Some("worker".into()),
@@ -7179,10 +7179,10 @@ mod tests {
     }
 
     #[test]
-    fn asks_default_to_twenty_minute_reminders_with_explicit_override_and_opt_out() {
+    fn asks_default_to_forty_five_minute_reminders_with_explicit_override_and_opt_out() {
         assert_eq!(
             ask_reminder_interval(&ask_params(None, false)).expect("default"),
-            Some(1_200_000)
+            Some(2_700_000)
         );
         assert_eq!(
             ask_reminder_interval(&ask_params(Some(600_000), false)).expect("override"),
@@ -7353,7 +7353,7 @@ mod tests {
             &serde_json::json!({
                 "id": "none-2",
                 "method": "attribution",
-                "params": {"incarnation_id": IncarnationId::new()},
+                "params": {"incarnation_id": IncarnationId::test()},
             }),
         );
         assert!(absent["result"].is_null());
@@ -7382,14 +7382,17 @@ mod tests {
             &mut kelpie,
         )
         .expect("pane agent");
-        assert_eq!(by_agent["incarnation_id"], pane.incarnation_id.to_string());
+        assert_eq!(
+            by_agent["incarnation_id"],
+            serde_json::json!(pane.incarnation_id)
+        );
         assert_eq!(by_agent["delivery_transport"], "herdr_prompt");
 
         let by_name = dispatch_who(serde_json::json!({"alias": "botserver"}), &mut kelpie)
             .expect("socket waiter");
         assert_eq!(
             by_name["logical_agent_id"],
-            waiter.logical_agent_id.to_string()
+            serde_json::json!(waiter.logical_agent_id)
         );
         assert!(by_name["incarnation_id"].is_null());
         assert_eq!(by_name["delivery_transport"], "socket_inbox");
@@ -7674,7 +7677,7 @@ mod tests {
                 "method": "cancel",
                 "params": {
                     "requester_agent_id": waiting.logical_agent_id,
-                    "ask_message_id": MessageId::new(),
+                    "ask_message_id": MessageId::test(),
                     "reason": "no such ask"
                 }
             }),
@@ -8203,7 +8206,7 @@ mod tests {
             "served in {:?}, which is not concurrent with a 30s start",
             asked_at.elapsed()
         );
-        assert!(response["result"]["notice_id"].is_string(), "{response}");
+        assert!(response["result"]["notice_id"].is_number(), "{response}");
         assert_eq!(
             daemon.awaiting_starts.len(),
             1,
@@ -8585,7 +8588,7 @@ mod tests {
             daemon.poll().expect("poll");
             assert!(started.elapsed() < Duration::from_secs(1));
         }
-        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_string());
+        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_number());
         while !retire.is_finished() {
             daemon.poll().expect("finish retire");
         }
@@ -8691,7 +8694,7 @@ mod tests {
             daemon.poll().expect("poll");
             assert!(started.elapsed() < Duration::from_secs(1));
         }
-        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_string());
+        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_number());
         while !refresh.is_finished() {
             daemon.poll().expect("finish refresh");
         }
@@ -8752,7 +8755,7 @@ mod tests {
             "served in {:?}",
             asked_at.elapsed()
         );
-        assert!(response["result"]["notice_id"].is_string(), "{response}");
+        assert!(response["result"]["notice_id"].is_number(), "{response}");
         assert_eq!(daemon.reading.len(), 1, "stalled client is still parked");
         drop(daemon);
         let _ = stalled.join();
@@ -8818,7 +8821,7 @@ mod tests {
                 "unrelated request waited for the report response"
             );
         }
-        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_string());
+        assert!(unrelated.join().expect("unrelated")["result"]["notice_id"].is_number());
         assert!(
             !daemon.awaiting_writes.is_empty(),
             "the report client is still not reading, so its response must remain parked"
@@ -8889,10 +8892,9 @@ mod tests {
             },
             &mut kelpie,
         );
-        let schedule_id = armed.result.expect("arm result")["schedule_id"]
-            .as_str()
-            .expect("schedule id")
-            .to_string();
+        let schedule_id: ScheduleId =
+            serde_json::from_value(armed.result.expect("arm result")["schedule_id"].clone())
+                .expect("schedule id");
         let listed = dispatch(
             ClientRequest {
                 id: "list".into(),
@@ -8902,13 +8904,16 @@ mod tests {
             &mut kelpie,
         );
         let row = &listed.result.expect("list result")["schedules"][0];
-        assert_eq!(row["schedule_id"], schedule_id);
+        assert_eq!(row["schedule_id"], serde_json::json!(schedule_id));
         assert_eq!(row["kind"], "tell");
         assert_eq!(
             row["requester_agent_id"],
-            owner.logical_agent_id.to_string()
+            serde_json::json!(owner.logical_agent_id)
         );
-        assert_eq!(row["logical_agent_id"], owner.logical_agent_id.to_string());
+        assert_eq!(
+            row["logical_agent_id"],
+            serde_json::json!(owner.logical_agent_id)
+        );
         assert_eq!(row["body"], "repeat");
         assert_eq!(row["idempotency_key"], "schedule-rpc");
         assert_eq!(row["state"], "active");
@@ -9175,9 +9180,8 @@ mod tests {
             &mut kelpie,
         )
         .expect("failed operation frees the key");
-        let fresh_operation =
-            OperationId::parse(result["operation_id"].as_str().expect("fresh operation id"))
-                .expect("valid operation id");
+        let fresh_operation: OperationId =
+            serde_json::from_value(result["operation_id"].clone()).expect("fresh operation id");
         assert_ne!(fresh_operation, prior.operation_id);
         assert!(prepared.is_some(), "fresh prompt should be prepared");
         assert_eq!(
@@ -9240,18 +9244,21 @@ mod tests {
             &ask_request(
                 "replay",
                 sender.logical_agent_id,
-                LogicalAgentId::new(),
-                IncarnationId::new(),
+                LogicalAgentId::test(),
+                IncarnationId::test(),
                 "completed-ask",
             ),
             &mut kelpie,
         )
         .expect("succeeded operation replays before target resolution");
-        assert_eq!(result["message_id"], prior.message_id.to_string());
-        assert_eq!(result["operation_id"], prior.operation_id.to_string());
+        assert_eq!(result["message_id"], serde_json::json!(prior.message_id));
+        assert_eq!(
+            result["operation_id"],
+            serde_json::json!(prior.operation_id)
+        );
         assert_eq!(
             result["recipient_incarnation"],
-            recipient.incarnation_id.to_string()
+            serde_json::json!(recipient.incarnation_id)
         );
         assert_eq!(result["delivery_outcome"], "accepted");
         assert!(prepared.is_none(), "replay must not prepare another write");
@@ -9308,8 +9315,8 @@ mod tests {
             method: "tell".into(),
             params: serde_json::json!({
                 "sender": sender.logical_agent_id,
-                "recipient": LogicalAgentId::new(),
-                "recipient_incarnation": IncarnationId::new(),
+                "recipient": LogicalAgentId::test(),
+                "recipient_incarnation": IncarnationId::test(),
                 "body": "notice",
                 "idempotency_key": "completed-tell",
             }),
@@ -9317,8 +9324,11 @@ mod tests {
 
         let (result, prepared, _) =
             prepare_client_prompt(&request, &mut kelpie).expect("replay tell");
-        assert_eq!(result["message_id"], prior.message_id.to_string());
-        assert_eq!(result["operation_id"], prior.operation_id.to_string());
+        assert_eq!(result["message_id"], serde_json::json!(prior.message_id));
+        assert_eq!(
+            result["operation_id"],
+            serde_json::json!(prior.operation_id)
+        );
         assert_eq!(result["delivery_outcome"], "accepted");
         assert!(prepared.is_none(), "replay must not prepare another write");
     }
@@ -9372,8 +9382,8 @@ mod tests {
 
         let (result, prepared, reply_to) =
             prepare_client_prompt(&request, &mut kelpie).expect("replay reply");
-        assert_eq!(result["message_id"], prior.message_id.to_string());
-        assert_eq!(result["operation_id"], operation_id.to_string());
+        assert_eq!(result["message_id"], serde_json::json!(prior.message_id));
+        assert_eq!(result["operation_id"], serde_json::json!(operation_id));
         assert_eq!(result["disposition"], "final");
         assert_eq!(result["obligation_state"], "resolved");
         assert_eq!(reply_to, Some(ask.message_id));
@@ -9384,7 +9394,7 @@ mod tests {
             method: "reply".into(),
             params: serde_json::json!({
                 "reply_to": ask.message_id,
-                "requester_agent_id": LogicalAgentId::new(),
+                "requester_agent_id": LogicalAgentId::test(),
                 "body": "done",
                 "disposition": "final",
                 "idempotency_key": "completed-reply",
@@ -9803,7 +9813,7 @@ mod tests {
             serde_json::json!({
                 "id": "claim-foreign",
                 "method": "inbox.claim",
-                "params": {"logical_agent_id": LogicalAgentId::new()},
+                "params": {"logical_agent_id": LogicalAgentId::test()},
             }),
         );
         assert_eq!(refused["error"]["class"], "conflict");
@@ -9852,7 +9862,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["recipient"],
-            waiter.logical_agent_id.to_string()
+            serde_json::json!(waiter.logical_agent_id)
         );
         assert_eq!(response["result"]["recipient_incarnation"], Value::Null);
         assert_eq!(response["result"]["operation_id"], Value::Null);
@@ -9868,7 +9878,7 @@ mod tests {
         assert_eq!(delivery["params"]["body"], "unsolicited progress");
         assert_eq!(
             delivery["params"]["sender_agent_id"],
-            sender.logical_agent_id.to_string()
+            serde_json::json!(sender.logical_agent_id)
         );
         assert_eq!(delivery["params"]["sender_public_name"], "sender");
     }
@@ -9883,7 +9893,7 @@ mod tests {
         let delivery = drain_reply(&mut daemon, &socket, waiter, "claim-1");
         assert_eq!(delivery["method"], "inbox.delivery");
         assert_eq!(delivery["params"]["body"], "later reply body");
-        assert_eq!(delivery["params"]["message_id"], reply.to_string());
+        assert_eq!(delivery["params"]["message_id"], serde_json::json!(reply));
         assert_eq!(delivery["params"]["kind"], "reply");
         while !daemon.inboxes.is_empty() {
             let _ = daemon.poll().expect("drop");

@@ -18,13 +18,13 @@ reminders, and recovery that survive restarts of Kelpie, Herdr, or the agent.
 You ask a coordinator to get a review from a reviewer:
 
 ```text
-<kelpie from=coordinator reply-to=01J9Q5…>Review PR 783.</kelpie>
+<kelpie from=coordinator reply-to=1847>Review PR 783.</kelpie>
 ```
 
 The reviewer owes a final reply, and reports while working:
 
 ```text
-<kelpie from=reviewer re=01J9Q5… progress>Still checking restarts.</kelpie>
+<kelpie from=reviewer re=1847 progress>Still checking restarts.</kelpie>
 ```
 
 When the reviewer sends the final reply and Kelpie sees it accepted into the
@@ -33,7 +33,7 @@ pushed into the waiting session the moment it is written, so the sender is free
 to do other work or sit idle.
 
 ```text
-<kelpie from=reviewer re=01J9Q5… final>The change handles restarts correctly.</kelpie>
+<kelpie from=reviewer re=1847 final>The change handles restarts correctly.</kelpie>
 ```
 
 An ask is always delivered now — nobody is ever owed work they cannot see. A
@@ -144,7 +144,7 @@ loop: two agents, addressed by name, with the delivery recorded.
 ## What you get
 
 - **Durable asks.** A reply obligation lives in SQLite, not in a context
-  window. It survives restarts and gets reminders after twenty minutes by
+  window. It survives restarts and gets reminders after forty-five minutes by
   default, delivered only when idle or done. Receivers can snooze an ask or
   increase its reminder interval.
 - **Honest delivery.** Every message records whether it was accepted, rejected,
@@ -170,7 +170,7 @@ runtime, the pane, the logical agent, its children, its obligations, and its
 message history are untouched — only the context is replaced.
 
 ```text
-<kelpie-renew from=coordinator reply-to=01J9Q6… prepare cycle=1>Write progress.md so it resumes this work.</kelpie-renew>
+<kelpie-renew from=coordinator reply-to=1848 prepare cycle=1>Write progress.md so it resumes this work.</kelpie-renew>
 … the agent writes progress.md and replies final …
 <kelpie-renew from=coordinator resumed cycle=1>Read progress.md and continue.</kelpie-renew>
 ```
