@@ -189,6 +189,28 @@ release new_version:
     echo "Push with: just release-push {{new_version}}"
 
 # Push a release commit and its tag. Separate so the tag is reviewable first.
+# Requires the crate to already be live on crates.io, so a GitHub tag cannot
+# exist without the matching published version (and the argument cannot
+# disagree with the manifest).
 release-push version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    manifest=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+    if [[ "{{version}}" != "${manifest}" ]]; then
+        echo "release-push: asked to push {{version}}, but Cargo.toml is ${manifest}" >&2
+        exit 1
+    fi
+    if ! git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null; then
+        echo "release-push: local tag v{{version}} is missing; cut it with just release first" >&2
+        exit 1
+    fi
+    yanked=$(curl -sS -A "kelpie-release-push" \
+        "https://crates.io/api/v1/crates/kelpie-herdr/{{version}}" \
+        | python3 -c 'import json,sys; v=json.load(sys.stdin).get("version"); print("missing" if not v else v.get("yanked"))')
+    if [[ "${yanked}" != "False" ]]; then
+        echo "release-push: crates.io does not have an unyanked kelpie-herdr {{version}} (got ${yanked})" >&2
+        echo "        Publish first, then push, so the tag and the crate cannot drift." >&2
+        exit 1
+    fi
     git push origin main
     git push origin "v{{version}}"
