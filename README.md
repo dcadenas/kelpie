@@ -63,7 +63,7 @@ pre-release while Kelpie is alpha, so the version requirement is required —
 `cargo install` otherwise skips them.
 
 ```sh
-cargo install kelpie-herdr --version '^0.2.0-alpha.3'
+cargo install kelpie-herdr --version 0.2.0-alpha.5
 # or, from a checkout:
 cargo install --path .
 ```
@@ -219,9 +219,17 @@ operational procedures.
 ## Develop
 
 ```sh
+just gates
+```
+
+`just gates` runs the consistency checks (changelog, version identity, SPEC
+protocol constant, schema number) plus fmt, clippy, and tests. CI runs the
+cargo commands directly:
+
+```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules.

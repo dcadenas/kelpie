@@ -31,7 +31,10 @@ export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/kelpie-target"
 
 ## The gates
 
-CI runs exactly these; run them locally before pushing:
+Locally, `just gates` is the full set: consistency checks that no compiler
+catches, then what CI runs.
+
+CI runs exactly these:
 
 ```sh
 cargo fmt --check
