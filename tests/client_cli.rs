@@ -618,8 +618,8 @@ fn typed_cli_rejects_unknown_and_conflicting_process_args() {
 }
 
 #[test]
-fn typed_cli_rejects_uuid_and_zero_durable_ids_before_connecting() {
-    for invalid in ["019ff700-0000-7000-8000-000000000001", "0"] {
+fn typed_cli_rejects_noncanonical_durable_ids_before_connecting() {
+    for invalid in ["019ff700-0000-7000-8000-000000000001", "0", "0007"] {
         let output = run_cli(&["reply", invalid, "--final", "--body", "done"]);
         assert!(!output.status.success());
         assert!(

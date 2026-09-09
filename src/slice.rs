@@ -2749,11 +2749,7 @@ impl Kelpie {
         match item.inject_not_before_ms {
             // Rotates on the next prompt: the injection is the thing that
             // produces the signal, so it cannot be gated on that signal.
-            Some(earliest) => {
-                if now_ms < earliest {
-                    return Ok(None);
-                }
-            }
+            Some(earliest) if now_ms < earliest => return Ok(None),
             // Rotates on the clear: still the pre-clear conversation, so wait.
             // Injecting on elapsed time instead is the guess this design exists
             // to refuse, and the deadline reports the stall rather than
@@ -2767,7 +2763,7 @@ impl Kelpie {
                 )?;
                 return Ok(None);
             }
-            None => {}
+            Some(_) | None => {}
         }
         let requester_address = self.store.agent_address(item.requester_agent_id)?;
         let envelope = envelope::render_renew_resume(

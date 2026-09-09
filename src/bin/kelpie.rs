@@ -182,7 +182,10 @@ fn validate_command_ids(command: &Command) -> Result<(), String> {
 }
 
 fn validate_id(name: &str, text: &str) -> Result<(), String> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return Err(format!("{name} must be a positive decimal integer"));
     }
     let id = text
@@ -962,7 +965,10 @@ fn normalize_durable_ids(value: &mut Value) -> Result<(), Box<dyn std::error::Er
             for (name, field) in fields {
                 if ID_FIELDS.contains(&name.as_str()) {
                     if let Value::String(text) = field {
-                        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                        if text.is_empty()
+                            || (text.len() > 1 && text.starts_with('0'))
+                            || !text.bytes().all(|byte| byte.is_ascii_digit())
+                        {
                             return Err(format!("{name} must be a positive decimal integer").into());
                         }
                         let id = text

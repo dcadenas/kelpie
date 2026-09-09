@@ -28,7 +28,10 @@ macro_rules! id_type {
             }
 
             pub(crate) fn parse(value: &str) -> Option<Self> {
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                if value.is_empty()
+                    || (value.len() > 1 && value.starts_with('0'))
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                {
                     return None;
                 }
                 value
@@ -406,6 +409,8 @@ mod tests {
             "+1",
             "-1",
             "0x1",
+            "01",
+            "0007",
             "019ff700-0000-7000-8000-000000000001",
         ] {
             assert!(LogicalAgentId::parse(invalid).is_none(), "{invalid}");

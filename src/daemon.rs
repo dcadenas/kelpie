@@ -40,7 +40,7 @@ const MAX_ACCEPTS_PER_POLL: usize = 16;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// How long after bind kelpied keeps retrying recover for Herdr-restored agents.
 /// Native resume often lands after a client attaches, which is later than the socket.
-const BOOT_CONTINUE_WINDOW: Duration = Duration::from_secs(120);
+const BOOT_CONTINUE_WINDOW: Duration = Duration::from_mins(2);
 /// Pause between boot recover snapshots. Recover is idempotent.
 const BOOT_CONTINUE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -7070,7 +7070,7 @@ mod tests {
     #[test]
     fn boot_continue_starts_only_inside_the_window_when_idle() {
         let start = Instant::now();
-        let until = start + Duration::from_secs(120);
+        let until = start + Duration::from_mins(2);
         let next = start + Duration::from_secs(5);
         assert!(!boot_continue_should_start(start, until, next, false));
         assert!(boot_continue_should_start(next, until, next, false));

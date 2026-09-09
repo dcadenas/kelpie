@@ -568,10 +568,6 @@ pub struct DueReminder {
     pub pane_id: String,
     pub terminal_id: String,
     pub interval_ms: i64,
-    /// The ask's original question. The reminder is the amnesia protocol: a
-    /// renewed or restarted agent may owe an answer it can no longer remember,
-    /// so the reminder always carries what it was asked.
-    pub body: String,
 }
 
 /// An unanswered ask eligible for stopped-boundary observation.
@@ -5922,11 +5918,9 @@ impl Store {
     pub fn due_reminders(&self, now_ms: i64) -> Result<Vec<DueReminder>, StoreError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
-                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
-                    m.body
+                    i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
-             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state IN ('open','in_progress')
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -5952,12 +5946,11 @@ impl Store {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, String>(7)?,
             ))
         })?;
         let mut due = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, body) = row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms) = row?;
             due.push(DueReminder {
                 ask_message_id: parse_message_id(&ask)?,
                 owing_agent_id: parse_logical_agent_id(&owing)?,
@@ -5966,7 +5959,6 @@ impl Store {
                 pane_id: pane,
                 terminal_id: terminal,
                 interval_ms,
-                body,
             });
         }
         Ok(due)
@@ -5981,10 +5973,9 @@ impl Store {
         let mut statement = self.connection.prepare(&format!(
             "SELECT r.ask_message_id, o.owing_agent_id, o.waiting_agent_id,
                     i.id, i.observed_pane_id, i.observed_terminal_id, r.interval_ms,
-                    r.saw_working_at_ms IS NOT NULL, m.body
+                    r.saw_working_at_ms IS NOT NULL
              FROM obligation_reminders r
              JOIN obligations o ON o.ask_message_id = r.ask_message_id
-             JOIN messages m ON m.id = r.ask_message_id
              JOIN incarnations i ON i.logical_agent_id = o.owing_agent_id
              WHERE o.state = 'open'
                AND r.disabled_at_ms IS NULL AND r.suspended_at_ms IS NULL
@@ -6013,13 +6004,11 @@ impl Store {
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, bool>(7)?,
-                row.get::<_, String>(8)?,
             ))
         })?;
         let mut reminders = Vec::new();
         for row in rows {
-            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working, body) =
-                row?;
+            let (ask, owing, waiting, incarnation, pane, terminal, interval_ms, saw_working) = row?;
             reminders.push(BoundaryReminder {
                 reminder: DueReminder {
                     ask_message_id: parse_message_id(&ask)?,
@@ -6029,7 +6018,6 @@ impl Store {
                     pane_id: pane,
                     terminal_id: terminal,
                     interval_ms,
-                    body,
                 },
                 saw_working,
             });

@@ -90,6 +90,12 @@ export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/kelpie-target"
 
 ## Restart and prove it came back
 
+For a release without the integer-ID migration, restart normally:
+
+```sh
+systemctl --user restart kelpied
+```
+
 ### Integer-ID cutover
 
 If the pending migration changes UUID IDs to integers, do not use a single
@@ -120,10 +126,6 @@ ask again.
 An accepted tell is the notification receipt. A rejected, unavailable, or
 unknown delivery does not prove that Ready incarnation was notified; report it
 for explicit reconciliation and do not blindly resend an unknown delivery.
-
-```sh
-systemctl --user restart kelpied
-```
 
 The daemon opens and recovers the store *before* it binds the socket, so a
 migration that fails means no socket at all rather than a daemon serving wrong

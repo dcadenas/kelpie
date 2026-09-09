@@ -2261,9 +2261,13 @@ fn render_agent<'a>(
     seen: &mut Vec<&'a Value>,
 ) {
     let id = &agent["agent_id"];
-    if !id.is_number() {
+    // A newly installed client captures the old daemon's report before the
+    // integer-ID cutover. Render those string IDs opaquely; command parsing
+    // still rejects them, and no UUID-to-integer mapping exists.
+    if !(id.is_number() || id.is_string()) {
         return;
     }
+    let id_text = field(agent, "agent_id");
     // Parentage is data, and data can cycle; stop rather than recurse forever.
     if seen.contains(&id) {
         return;
@@ -2345,7 +2349,7 @@ fn render_agent<'a>(
     };
     let _ = writeln!(
         text,
-        "{indent}{branch}{} agent={id} backend={backend} kelpie={state}{live} \
+        "{indent}{branch}{} agent={id_text} backend={backend} kelpie={state}{live} \
          incarnations={incarnations}{conversation}{renew}{unsettled}",
         field(agent, "public_name")
     );
@@ -2936,6 +2940,29 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("history, not a fault"), "{text}");
+    }
+
+    #[test]
+    fn report_keeps_pre_cutover_string_ids_visible() {
+        let report = serde_json::json!({"result":{
+            "generated_at_ms": 0,
+            "alias_collisions": {},
+            "agents": [{
+                "agent_id":"019ff700-0000-7000-8000-000000000001",
+                "public_name":"coordinator",
+                "parent_agent_id":null,
+                "created_at_ms":0,
+                "incarnations":[{
+                    "incarnation_id":"019ff700-0000-7000-8000-000000000002",
+                    "state":"ready",
+                    "backend_kind":"opencode"
+                }]
+            }],
+            "obligations":[]
+        }});
+
+        let text = format_receipt("report", &report);
+        assert!(text.contains("coordinator agent=019ff700"), "{text}");
     }
 
     #[test]
