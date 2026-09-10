@@ -437,7 +437,11 @@ fn typed_who_resolves_a_dead_claimant_and_handoff_refuses_it() {
         stderr.contains("kelpie who botserver --resolve"),
         "{stderr}"
     );
-    assert!(stderr.contains("kelpie start --logical-id"), "{stderr}");
+    assert!(
+        stderr.contains("herdr_prompt") && stderr.contains("kelpie start --logical-id"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("register a new waiter"), "{stderr}");
     server.join().expect("server");
 }
 

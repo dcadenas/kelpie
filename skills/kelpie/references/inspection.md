@@ -20,9 +20,10 @@ Contents: [Method details](#method-details).
   continue. A unique Ready agent or active socket waiter wins. If none is
   addressable, the newest claimant wins by creation time then logical-agent ID,
   and the result includes every claimant and unresolved obligation. Live
-  ambiguity and an unclaimed name fail closed. Use the returned logical ID with
-  `start --logical-id` after the name is free; resolution does not free a Herdr
-  name held by a dead pane.
+  ambiguity and an unclaimed name fail closed. After the name is free, continue
+  a `herdr_prompt` result with `start --logical-id`. An ended `socket_inbox`
+  waiter cannot be reactivated; reconcile its obligations and register a new
+  waiter instead. Resolution does not free a Herdr name held by a dead pane.
 - `who --refresh`: observe again and append the result. A backend may
   record its serving model only after its first turn, so an agent that was
   `undetermined` at startup becomes knowable later. Refreshing never rewrites an

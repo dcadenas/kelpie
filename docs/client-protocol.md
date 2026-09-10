@@ -519,10 +519,13 @@ previous result and stdout shapes.
 `who <name> --resolve` uses that same ordered picture to name a continuation
 target. One uniquely addressable Ready incarnation or active socket waiter wins.
 When none is addressable, the last claimant wins because claimants are ordered
-by `created_at_ms`, then logical-agent ID. Retired, lost, and failed last
-incarnations remain eligible: `start --logical-id` can continue them. More than
-one addressable claimant and a name with no claimant both fail closed. The JSON
-result carries `public_name`, `logical_agent_id`, nullable `incarnation_id`,
+by `created_at_ms`, then logical-agent ID. Retired, lost, and failed claimants
+remain eligible for selection regardless of their last incarnation state. A
+selected `herdr_prompt` identity can continue with `start --logical-id`; an
+ended `socket_inbox` waiter cannot be reactivated, so a socket host registers a
+new waiter after reconciling its old obligations. More than one addressable
+claimant and a name with no claimant both fail closed. The JSON result carries
+`public_name`, `logical_agent_id`, nullable `incarnation_id`,
 `delivery_transport`, `addressable`, `continue` (`unique_addressable` or
 `newest_claimant`), `claimants`, and `unresolved`. A non-addressable stdout
 result points to `who <name> --history` when older claimants also exist.
@@ -644,8 +647,9 @@ The typed client also accepts `handoff --replace <alias>`. It first uses plain
 `who <alias>` to require one Ready Herdr incarnation, then supplies that exact
 incarnation and logical-agent ID to the unchanged `handoff` RPC. A socket waiter,
 dead claimant, or ambiguous live alias is refused with a pointer to
-`who <alias> --resolve` and `start --logical-id`; alias syntax does not make
-handoff continue an unavailable runtime.
+`who <alias> --resolve` and, for `herdr_prompt`, `start --logical-id`; alias
+syntax does not make handoff continue an unavailable runtime or reactivate an
+ended socket waiter.
 
 Binding-time observation only sees what a backend has already written, and a
 backend may record its serving model only after its first turn. `--refresh`

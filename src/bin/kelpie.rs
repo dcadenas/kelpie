@@ -717,7 +717,7 @@ fn resolve_handoff_alias(
         .and_then(Value::as_str)
         .unwrap_or("the alias is not held by one Ready incarnation");
     Err(format!(
-        "handoff --replace {alias} requires one uniquely Ready incarnation: {detail}; inspect `kelpie who {alias} --resolve`, then continue an unavailable claimant with `kelpie start --logical-id <id>`"
+        "handoff --replace {alias} requires one uniquely Ready incarnation: {detail}; inspect `kelpie who {alias} --resolve`, then continue an unavailable `herdr_prompt` claimant with `kelpie start --logical-id <id>` or register a new waiter for an ended `socket_inbox` identity"
     )
     .into())
 }
