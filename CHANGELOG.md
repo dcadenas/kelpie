@@ -6,6 +6,12 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.6
+
+`kelpie who NAME --resolve` selects the logical agent a name-keyed host should
+continue and includes the full claimant and unresolved-ask picture. Handoff can
+accept a name only while that name uniquely identifies a Ready incarnation.
+
 ## 0.2.0-alpha.5
 
 IDs are positive integers, unique within each record type. The JSON protocol
