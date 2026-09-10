@@ -836,8 +836,22 @@ typed client MUST default to its calling pane. The result MUST identify the
 logical agent, its public name, its delivery transport, whether it is currently
 addressable, and its incarnation and attribution when it has an incarnation.
 An alias history read MUST return every claimant and unresolved obligation for
-that name. The legacy `whoami`, `name.info`, and `attribution` methods MUST
+that name. An alias continuation read MUST return the unique addressable
+claimant when exactly one exists and MUST fail closed when more than one is
+addressable. With no addressable claimant it MUST return the newest claimant by
+`created_at_ms`, then logical-agent ID, without filtering on incarnation state.
+Its result MUST include the selected logical-agent ID, the Ready incarnation ID
+or null, delivery transport, addressability, selection reason, every claimant,
+and every unresolved obligation. It MUST fail when the name has no claimant.
+History, continuation resolution, and attribution refresh MUST be mutually
+exclusive. The legacy `whoami`, `name.info`, and `attribution` methods MUST
 remain available with their existing result shapes during this migration.
+
+The typed `handoff` client MAY accept a public alias in place of its predecessor
+incarnation ID. It MUST expand that alias only when plain `who` resolves one
+Ready Herdr incarnation, MUST supply that incarnation and its logical-agent ID
+to the existing handoff method, and MUST refuse dead or ambiguous aliases. The
+handoff method itself remains exact-ID and Ready-only.
 
 Administration of a socket waiter MUST accept either its logical agent ID or
 its unique active public alias. Alias ambiguity MUST fail closed.

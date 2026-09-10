@@ -16,6 +16,13 @@ Contents: [Method details](#method-details).
   nothing was observed, which is not the same as an observed `undetermined`
   field. Adapters exist for `claude`, `codex`, and `opencode`; other kinds are
   `undetermined`. Do not report your own model as observed attribution.
+- `who NAME --resolve`: name the logical agent a name-keyed host should
+  continue. A unique Ready agent or active socket waiter wins. If none is
+  addressable, the newest claimant wins by creation time then logical-agent ID,
+  and the result includes every claimant and unresolved obligation. Live
+  ambiguity and an unclaimed name fail closed. Use the returned logical ID with
+  `start --logical-id` after the name is free; resolution does not free a Herdr
+  name held by a dead pane.
 - `who --refresh`: observe again and append the result. A backend may
   record its serving model only after its first turn, so an agent that was
   `undetermined` at startup becomes knowable later. Refreshing never rewrites an
@@ -38,4 +45,3 @@ Contents: [Method details](#method-details).
   unknown — plus the ancestors that explain who started them, which is usually
   what you want and a fraction of the output. `--json` gives the graph for
   anything that wants to render it.
-

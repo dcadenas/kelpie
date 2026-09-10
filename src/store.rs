@@ -200,6 +200,17 @@ pub struct NameInfo {
     pub unresolved: Vec<NameObligation>,
 }
 
+/// Public-name claimant selected for a future continuation.
+#[derive(Debug, Clone)]
+pub struct NameContinue {
+    pub logical_agent_id: LogicalAgentId,
+    pub incarnation_id: Option<IncarnationId>,
+    pub delivery_transport: DeliveryTransport,
+    pub addressable: bool,
+    pub unique_addressable: bool,
+    pub info: NameInfo,
+}
+
 /// IDs atomically created for one ask and its obligation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedAsk {
@@ -3705,6 +3716,60 @@ impl Store {
     /// Returns store errors from the underlying queries.
     pub fn name_info(&self, public_name: &str) -> Result<NameInfo, StoreError> {
         Self::name_info_on(&self.connection, public_name)
+    }
+
+    /// Select the claimant a name-keyed host should continue.
+    ///
+    /// A unique live delivery target wins. With no live target, the newest
+    /// claimant wins by creation time and logical-agent id. Live ambiguity and
+    /// names with no known claimant fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns store errors or a conflict for live ambiguity or no claimants.
+    pub fn resolve_name_continue(&self, public_name: &str) -> Result<NameContinue, StoreError> {
+        let info = Self::name_info_on(&self.connection, public_name)?;
+        let addressable: Vec<&NameClaimant> = info
+            .claimants
+            .iter()
+            .filter(|claimant| claimant.is_addressable)
+            .collect();
+        let (claimant, unique_addressable) = match addressable.as_slice() {
+            [claimant] => (*claimant, true),
+            [] => (
+                info.claimants
+                    .last()
+                    .ok_or_else(|| StoreError::Conflict(self.alias_unready_message(public_name)))?,
+                false,
+            ),
+            _ => {
+                return Err(StoreError::Conflict(format!(
+                    "alias {public_name} is ambiguous among addressable agents"
+                )));
+            }
+        };
+        let logical_agent_id = parse_logical_agent_id(&claimant.logical_agent_id)?;
+        let incarnation_id = if claimant.has_ready_incarnation {
+            Some(
+                self.find_ready_alias(public_name)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidRecord(format!(
+                            "addressable Herdr claimant {logical_agent_id} has no Ready incarnation"
+                        ))
+                    })?
+                    .1,
+            )
+        } else {
+            None
+        };
+        Ok(NameContinue {
+            logical_agent_id,
+            incarnation_id,
+            delivery_transport: claimant.delivery_transport,
+            addressable: claimant.is_addressable,
+            unique_addressable,
+            info,
+        })
     }
 
     fn name_info_on(conn: &Connection, public_name: &str) -> Result<NameInfo, StoreError> {
@@ -15351,6 +15416,197 @@ mod tests {
             second_claimant.to_string(),
             open_ask.to_string(),
         )
+    }
+
+    fn insert_resolve_claimant(
+        store: &Store,
+        name: &str,
+        created_at_ms: i64,
+        transport: DeliveryTransport,
+        incarnation_state: Option<&str>,
+    ) -> (LogicalAgentId, Option<IncarnationId>) {
+        let agent = LogicalAgentId::test();
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_agents
+                 (id, public_name, explicitly_parentless, delivery_transport, created_at_ms)
+                 VALUES (?1, ?2, 1, ?3, ?4)",
+                params![agent.to_string(), name, transport.as_str(), created_at_ms],
+            )
+            .expect("logical agent");
+        let incarnation = incarnation_state.map(|state| {
+            let incarnation = IncarnationId::test();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO incarnations (
+                        id, logical_agent_id, herdr_session, intended_pane_id,
+                        expected_terminal_id, backend_kind, backend_args_json,
+                        working_directory, created_at_ms, state
+                     ) VALUES (?1, ?2, 's', 'w1:p1', 'term', 'claude', '[]', '/tmp', ?3, ?4)",
+                    params![
+                        incarnation.to_string(),
+                        agent.to_string(),
+                        created_at_ms,
+                        state
+                    ],
+                )
+                .expect("incarnation");
+            incarnation
+        });
+        (agent, incarnation)
+    }
+
+    #[test]
+    fn resolve_name_continue_returns_a_unique_ready_claimant() {
+        let store = Store::in_memory().expect("store");
+        let (agent, incarnation) = insert_resolve_claimant(
+            &store,
+            "worker",
+            1,
+            DeliveryTransport::HerdrPrompt,
+            Some("ready"),
+        );
+
+        let resolved = store.resolve_name_continue("worker").expect("resolve");
+        assert_eq!(resolved.logical_agent_id, agent);
+        assert_eq!(resolved.incarnation_id, incarnation);
+        assert!(resolved.addressable);
+        assert!(resolved.unique_addressable);
+    }
+
+    #[test]
+    fn resolve_name_continue_returns_a_unique_active_waiter() {
+        let store = Store::in_memory().expect("store");
+        let (agent, _) =
+            insert_resolve_claimant(&store, "worker", 1, DeliveryTransport::SocketInbox, None);
+
+        let resolved = store.resolve_name_continue("worker").expect("resolve");
+        assert_eq!(resolved.logical_agent_id, agent);
+        assert_eq!(resolved.incarnation_id, None);
+        assert_eq!(resolved.delivery_transport, DeliveryTransport::SocketInbox);
+        assert!(resolved.addressable);
+        assert!(resolved.unique_addressable);
+    }
+
+    #[test]
+    fn resolve_name_continue_refuses_ready_and_waiter_ambiguity() {
+        let store = Store::in_memory().expect("store");
+        insert_resolve_claimant(
+            &store,
+            "worker",
+            1,
+            DeliveryTransport::HerdrPrompt,
+            Some("ready"),
+        );
+        insert_resolve_claimant(&store, "worker", 2, DeliveryTransport::SocketInbox, None);
+
+        let error = store
+            .resolve_name_continue("worker")
+            .expect_err("two addressable claimants");
+        assert!(error.to_string().contains("ambiguous among addressable"));
+    }
+
+    #[test]
+    fn resolve_name_continue_refuses_two_ready_claimants() {
+        let store = Store::in_memory().expect("store");
+        for created_at_ms in [1, 2] {
+            insert_resolve_claimant(
+                &store,
+                "worker",
+                created_at_ms,
+                DeliveryTransport::HerdrPrompt,
+                Some("ready"),
+            );
+        }
+
+        assert!(
+            store
+                .resolve_name_continue("worker")
+                .expect_err("two Ready claimants")
+                .to_string()
+                .contains("ambiguous among addressable")
+        );
+    }
+
+    #[test]
+    fn resolve_name_continue_refuses_a_name_with_no_claimants() {
+        let store = Store::in_memory().expect("store");
+        let error = store
+            .resolve_name_continue("worker")
+            .expect_err("no claimants");
+        assert!(error.to_string().contains("live Herdr agent may hold"));
+    }
+
+    #[test]
+    fn resolve_name_continue_returns_one_dead_claimant() {
+        let store = Store::in_memory().expect("store");
+        let (agent, _) = insert_resolve_claimant(
+            &store,
+            "worker",
+            1,
+            DeliveryTransport::HerdrPrompt,
+            Some("lost"),
+        );
+
+        let resolved = store.resolve_name_continue("worker").expect("resolve");
+        assert_eq!(resolved.logical_agent_id, agent);
+        assert_eq!(resolved.incarnation_id, None);
+        assert!(!resolved.addressable);
+        assert!(!resolved.unique_addressable);
+    }
+
+    #[test]
+    fn resolve_name_continue_chooses_the_newest_dead_claimant_by_time() {
+        let store = Store::in_memory().expect("store");
+        insert_resolve_claimant(
+            &store,
+            "worker",
+            1,
+            DeliveryTransport::HerdrPrompt,
+            Some("retired"),
+        );
+        let (newest, _) = insert_resolve_claimant(
+            &store,
+            "worker",
+            9,
+            DeliveryTransport::HerdrPrompt,
+            Some("lost"),
+        );
+        insert_resolve_claimant(
+            &store,
+            "worker",
+            4,
+            DeliveryTransport::HerdrPrompt,
+            Some("failed"),
+        );
+
+        let resolved = store.resolve_name_continue("worker").expect("resolve");
+        assert_eq!(resolved.logical_agent_id, newest);
+        assert_eq!(resolved.info.claimants.len(), 3);
+    }
+
+    #[test]
+    fn resolve_name_continue_breaks_a_creation_time_tie_by_largest_id() {
+        let store = Store::in_memory().expect("store");
+        insert_resolve_claimant(
+            &store,
+            "worker",
+            7,
+            DeliveryTransport::HerdrPrompt,
+            Some("lost"),
+        );
+        let (larger_id, _) = insert_resolve_claimant(
+            &store,
+            "worker",
+            7,
+            DeliveryTransport::HerdrPrompt,
+            Some("retired"),
+        );
+
+        let resolved = store.resolve_name_continue("worker").expect("resolve");
+        assert_eq!(resolved.logical_agent_id, larger_id);
     }
 
     #[test]

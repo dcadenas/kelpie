@@ -121,9 +121,6 @@ fn validate_command_ids(command: &Command) -> Result<(), String> {
             if let Some(id) = &start.initial_sender {
                 validate_id("initial_message.sender", id)?;
             }
-            if let Some(id) = &start.supersedes {
-                validate_id("supersedes", id)?;
-            }
             Ok(())
         }
         Command::Adopt(adopt) => {
@@ -390,6 +387,7 @@ fn build_typed(
             target,
             adopt_caller,
             history,
+            resolve,
             refresh,
         } => {
             let target = match target {
@@ -405,6 +403,7 @@ fn build_typed(
             };
             let mut params = attribution_params(&target);
             params["history"] = json!(history);
+            params["resolve"] = json!(resolve);
             params["refresh"] = json!(refresh);
             if adopt_caller {
                 params["lazy_adopt_key"] = json!(format!("{request_id}:lazy-adopt:self"));
@@ -436,7 +435,7 @@ fn build_typed(
         Command::Start(start) => {
             let StartCommand {
                 public_name,
-                logical_agent_id,
+                mut logical_agent_id,
                 parent,
                 herdr_session,
                 pane_id,
@@ -453,8 +452,26 @@ fn build_typed(
                 requested_model,
                 requested_provider,
                 requested_effort,
-                supersedes,
+                mut supersedes,
             } = *start;
+            if let Some(alias) = supersedes
+                .as_deref()
+                .filter(|candidate| validate_id("supersedes", candidate).is_err())
+            {
+                let (resolved_agent, resolved_incarnation) = resolve_handoff_alias(socket, alias)?;
+                if logical_agent_id
+                    .as_deref()
+                    .is_some_and(|id| id != resolved_agent)
+                {
+                    return Err(format!(
+                        "handoff alias {alias} resolves to logical agent {resolved_agent}, not --logical-id {}",
+                        logical_agent_id.as_deref().unwrap_or_default()
+                    )
+                    .into());
+                }
+                logical_agent_id = Some(resolved_agent);
+                supersedes = Some(resolved_incarnation);
+            }
             // An ask opens an obligation, so it needs an agent waiting identity.
             // Resolve the caller when none was given, the way tell and ask do; a
             // tell stays operator-attributed unless --sender-id says otherwise.
@@ -672,6 +689,37 @@ fn build_typed(
             },
         )),
     }
+}
+
+fn resolve_handoff_alias(
+    socket: &Path,
+    alias: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let request = typed_request(
+        &generated_id(),
+        "who",
+        &json!({"alias": alias, "history": false, "resolve": false, "refresh": false}),
+    );
+    let (_, response) = rpc(socket, &serde_json::to_string(&request)?, "who", false)?;
+    let result = response.get("result").filter(|result| !result.is_null());
+    if let Some(result) = result
+        && result["delivery_transport"] == "herdr_prompt"
+        && result["addressable"] == true
+        && !result["incarnation_id"].is_null()
+    {
+        return Ok((
+            field(result, "logical_agent_id"),
+            field(result, "incarnation_id"),
+        ));
+    }
+    let detail = response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("the alias is not held by one Ready incarnation");
+    Err(format!(
+        "handoff --replace {alias} requires one uniquely Ready incarnation: {detail}; inspect `kelpie who {alias} --resolve`, then continue an unavailable claimant with `kelpie start --logical-id <id>`"
+    )
+    .into())
 }
 
 /// Turn a requested delivery time into the epoch milliseconds the daemon takes.
