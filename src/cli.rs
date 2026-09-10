@@ -92,6 +92,7 @@ pub enum Command {
         target: Option<AttributionTarget>,
         adopt_caller: bool,
         history: bool,
+        resolve: bool,
         refresh: bool,
     },
     Attribution {
@@ -593,7 +594,7 @@ Commands:
   pending [alias]
   recover
   who [alias] | --pane ID | --agent-id ID | --incarnation-id ID
-       [--history] [--refresh]
+       [--history | --resolve] [--refresh]
   whoami [alias]
   name-info <alias>
   ask-info <ask-id>
@@ -601,7 +602,7 @@ Commands:
        [--refresh]
   report [--live] [--active]
   rename [alias] | --sender-id ID --name NEW-NAME
-  handoff --replace INCARNATION-ID <all start arguments>
+  handoff --replace INCARNATION-ID|ALIAS <all start arguments>
   start --name NAME --pane ID --terminal ID --backend KIND --cwd PATH
        --timeout-ms N (--keep-open | --no-keep-open)
        (--parentless | --parent-id ID) (--tell | --ask)
@@ -1138,6 +1139,7 @@ fn parse_whoami(args: &[String]) -> Result<Command, String> {
 fn parse_who(args: &[String]) -> Result<Command, String> {
     let mut tokens = Tokens::new(&args[1..]);
     let history = tokens.take_bool("--history")?;
+    let resolve = tokens.take_bool("--resolve")?;
     let refresh = tokens.take_bool("--refresh")?;
     let adopt_caller = args[1..].iter().all(|arg| arg == "--refresh");
     let target = take_optional_attribution_target(&mut tokens, "who")?;
@@ -1148,10 +1150,17 @@ fn parse_who(args: &[String]) -> Result<Command, String> {
     if history && refresh {
         return Err("who --history does not accept --refresh".into());
     }
+    if resolve && !matches!(target, Some(AttributionTarget::Alias(_))) {
+        return Err("who --resolve requires an alias".into());
+    }
+    if resolve && (history || refresh) {
+        return Err("who --resolve does not accept --history or --refresh".into());
+    }
     Ok(Command::Who {
         target,
         adopt_caller,
         history,
+        resolve,
         refresh,
     })
 }
@@ -2423,6 +2432,29 @@ fn render_attribution(result: &Value) -> String {
 }
 
 fn render_who(result: &Value) -> String {
+    if result.get("continue").is_some() {
+        let mut rendered = format!(
+            "who name={} agent={} incarnation={} transport={} addressable={} continue={}\n",
+            field(result, "public_name"),
+            field(result, "logical_agent_id"),
+            field(result, "incarnation_id"),
+            field(result, "delivery_transport"),
+            field(result, "addressable"),
+            field(result, "continue"),
+        );
+        if result["continue"] == "newest_claimant"
+            && result["claimants"]
+                .as_array()
+                .is_some_and(|claimants| claimants.len() > 1)
+        {
+            let _ = writeln!(
+                rendered,
+                "other claimants exist; inspect with kelpie who {} --history",
+                field(result, "public_name")
+            );
+        }
+        return rendered;
+    }
     if result.get("claimants").is_some() {
         return render_name_info(result).replacen("name-info ", "who ", 1);
     }
@@ -2604,6 +2636,7 @@ mod tests {
                     target: Some(AttributionTarget::Agent(ref id)),
                     adopt_caller: false,
                     history: false,
+                    resolve: false,
                     refresh: false,
                 },
                 ..
@@ -2625,6 +2658,24 @@ mod tests {
         ));
         assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--history"])).is_err());
         assert!(parse_invocation(&args(&["who", "botserver", "--history", "--refresh"])).is_err());
+        let resolve =
+            parse_invocation(&args(&["who", "botserver", "--resolve"])).expect("name resolve");
+        assert!(matches!(
+            resolve,
+            Invocation::Typed {
+                command: Command::Who {
+                    target: Some(AttributionTarget::Alias(ref alias)),
+                    resolve: true,
+                    history: false,
+                    refresh: false,
+                    ..
+                },
+                ..
+            } if alias == "botserver"
+        ));
+        assert!(parse_invocation(&args(&["who", "--pane", "w1:p1", "--resolve"])).is_err());
+        assert!(parse_invocation(&args(&["who", "botserver", "--resolve", "--history"])).is_err());
+        assert!(parse_invocation(&args(&["who", "botserver", "--resolve", "--refresh"])).is_err());
         assert!(matches!(
             parse_invocation(&args(&["who", "--refresh"])).expect("default self"),
             Invocation::Typed {
@@ -3554,6 +3605,33 @@ mod tests {
             "who name=botserver agent=waiter-1 incarnation=- transport=socket_inbox addressable=true\n"
         );
         assert!(!waiter.contains("observed"));
+    }
+
+    #[test]
+    fn who_renders_a_continuation_target_and_points_to_history_for_other_claimants() {
+        let rendered = format_receipt(
+            "who",
+            &json!({"result": {
+                "public_name": "botserver",
+                "logical_agent_id": 3,
+                "incarnation_id": null,
+                "delivery_transport": "herdr_prompt",
+                "addressable": false,
+                "continue": "newest_claimant",
+                "claimants": [{"logical_agent_id": 1}, {"logical_agent_id": 3}],
+                "unresolved": []
+            }}),
+        );
+        assert!(
+            rendered.starts_with(
+                "who name=botserver agent=3 incarnation=- transport=herdr_prompt addressable=false continue=newest_claimant"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("kelpie who botserver --history"),
+            "{rendered}"
+        );
     }
 
     #[test]

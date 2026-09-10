@@ -42,6 +42,7 @@ kelpie reply <ask-id> --progress --body started
 kelpie pending
 kelpie who
 kelpie who reviewer
+kelpie who reviewer --resolve
 kelpie ask-info <ask-id>
 kelpie reminder-snooze <ask-id> --for 2h
 kelpie reminder-interval <ask-id> --every 40m

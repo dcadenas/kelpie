@@ -5195,6 +5195,38 @@ fn who_identity_response(
 fn dispatch_who(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<WhoParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if params.resolve {
+        let (Some(alias), None, None, None, false, false) = (
+            params.alias.as_deref(),
+            params.agent_id,
+            params.incarnation_id,
+            params.pane_id.as_deref(),
+            params.history,
+            params.refresh,
+        ) else {
+            return Err(SliceError::Store(StoreError::InvalidRecord(
+                "who --resolve requires exactly one alias and does not accept --history or --refresh"
+                    .into(),
+            )));
+        };
+        let resolved = kelpie.store().resolve_name_continue(alias)?;
+        let claimants = name_claimants_response(&resolved.info);
+        let unresolved = name_unresolved_response(&resolved.info);
+        return Ok(serde_json::json!({
+            "public_name": resolved.info.public_name,
+            "logical_agent_id": resolved.logical_agent_id,
+            "incarnation_id": resolved.incarnation_id,
+            "delivery_transport": resolved.delivery_transport,
+            "addressable": resolved.addressable,
+            "continue": if resolved.unique_addressable {
+                "unique_addressable"
+            } else {
+                "newest_claimant"
+            },
+            "claimants": claimants,
+            "unresolved": unresolved,
+        }));
+    }
     if params.history {
         let (Some(alias), None, None, None, false) = (
             params.alias.as_deref(),
@@ -5278,8 +5310,17 @@ fn dispatch_name_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, Slice
     let params = serde_json::from_value::<NameInfoParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let info = kelpie.name_info(&params.name)?;
-    let claimants: Vec<Value> = info
-        .claimants
+    let claimants = name_claimants_response(&info);
+    let unresolved = name_unresolved_response(&info);
+    Ok(serde_json::json!({
+        "name": info.public_name,
+        "claimants": claimants,
+        "unresolved": unresolved,
+    }))
+}
+
+fn name_claimants_response(info: &crate::store::NameInfo) -> Vec<Value> {
+    info.claimants
         .iter()
         .map(|claimant| {
             serde_json::json!({
@@ -5291,9 +5332,11 @@ fn dispatch_name_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, Slice
                 "unresolved_count": claimant.unresolved_count,
             })
         })
-        .collect();
-    let unresolved: Vec<Value> = info
-        .unresolved
+        .collect()
+}
+
+fn name_unresolved_response(info: &crate::store::NameInfo) -> Vec<Value> {
+    info.unresolved
         .iter()
         .map(|obligation| {
             serde_json::json!({
@@ -5313,12 +5356,7 @@ fn dispatch_name_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, Slice
                 },
             })
         })
-        .collect();
-    Ok(serde_json::json!({
-        "name": info.public_name,
-        "claimants": claimants,
-        "unresolved": unresolved,
-    }))
+        .collect()
 }
 
 /// Report requested and observed attribution for one exact incarnation.
@@ -5717,15 +5755,17 @@ fn prepare_who_read(
             "provide exactly one of incarnation_id, agent_id, alias, or pane_id".into(),
         )));
     }
-    if params.history {
+    if params.history || params.resolve {
         if params.alias.is_none()
             || params.agent_id.is_some()
             || params.incarnation_id.is_some()
             || params.pane_id.is_some()
             || params.refresh
+            || (params.history && params.resolve)
         {
             return Err(SliceError::Store(StoreError::InvalidRecord(
-                "who history requires exactly one alias and does not accept refresh".into(),
+                "who history/resolve requires exactly one alias; the modes are exclusive and do not accept refresh"
+                    .into(),
             )));
         }
         return Ok(None);
@@ -7008,6 +7048,8 @@ struct WhoParams {
     #[serde(default)]
     history: bool,
     #[serde(default)]
+    resolve: bool,
+    #[serde(default)]
     refresh: bool,
     #[serde(default)]
     lazy_adopt_key: Option<String>,
@@ -7396,6 +7438,26 @@ mod tests {
         );
         assert!(by_name["incarnation_id"].is_null());
         assert_eq!(by_name["delivery_transport"], "socket_inbox");
+        let resolved = dispatch_who(
+            serde_json::json!({"alias": "botserver", "resolve": true}),
+            &mut kelpie,
+        )
+        .expect("resolve socket waiter");
+        assert_eq!(
+            resolved["logical_agent_id"],
+            serde_json::json!(waiter.logical_agent_id)
+        );
+        assert_eq!(resolved["continue"], "unique_addressable");
+        assert_eq!(
+            resolved["claimants"].as_array().expect("claimants").len(),
+            1
+        );
+        assert!(
+            resolved["unresolved"]
+                .as_array()
+                .expect("unresolved")
+                .is_empty()
+        );
         assert!(
             dispatch_who(
                 serde_json::json!({"alias": "botserver", "refresh": true}),
@@ -7446,6 +7508,29 @@ mod tests {
                 .to_string()
                 .contains("live Herdr agent may hold that name unadopted")
         );
+    }
+
+    #[test]
+    fn who_resolve_requires_an_alias_and_rejects_other_modes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        store
+            .register_socket_waiter("botserver", Parent::Parentless, "who-waiter")
+            .expect("waiter");
+        let mut kelpie = Kelpie::new(
+            store,
+            HerdrClient::new(
+                directory.path().join("unused-herdr.sock"),
+                Duration::from_secs(1),
+            ),
+        );
+        for invalid in [
+            serde_json::json!({"pane_id": "w1:p1", "resolve": true}),
+            serde_json::json!({"alias": "botserver", "resolve": true, "history": true}),
+            serde_json::json!({"alias": "botserver", "resolve": true, "refresh": true}),
+        ] {
+            assert!(dispatch_who(invalid, &mut kelpie).is_err());
+        }
     }
 
     #[test]

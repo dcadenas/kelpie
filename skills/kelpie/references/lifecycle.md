@@ -17,6 +17,11 @@ Contents: [Method details](#method-details); [addressing recovery](#addressing-r
 - `handoff`: replace a Ready runtime while preserving logical identity, children,
   obligations, and messages. Use the `start` arguments plus `--replace
   INCARNATION-ID` and `--logical-id` for that predecessor's exact logical agent.
+  The typed client also accepts `--replace ALIAS` and fills both IDs only when
+  that alias has one uniquely Ready Herdr incarnation. A dead or ambiguous alias
+  is not a handoff: inspect `kelpie who ALIAS --resolve`, then use
+  `start --logical-id` for an unavailable `herdr_prompt` target or register a
+  new waiter after reconciling an ended `socket_inbox` identity.
   The transaction proving the successor Ready marks the predecessor
   `superseded`. Herdr allows one live claim on a public name: first release the
   predecessor's name with `herdr agent rename <predecessor-pane> --clear`.

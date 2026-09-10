@@ -21,6 +21,19 @@ fn package_metadata_includes_canonical_skill() {
     assert!(manifest.contains("\"README.md\""));
 }
 
+#[test]
+fn skill_documents_name_based_continuation_without_dead_handoff() {
+    let inspection = include_str!("../skills/kelpie/references/inspection.md");
+    let lifecycle = include_str!("../skills/kelpie/references/lifecycle.md");
+    assert!(CANONICAL.contains("kelpie who reviewer --resolve"));
+    assert!(inspection.contains("who NAME --resolve"));
+    assert!(inspection.contains("start --logical-id"));
+    assert!(lifecycle.contains("uniquely Ready Herdr incarnation"));
+    assert!(lifecycle.contains("dead or ambiguous alias"));
+    assert!(lifecycle.contains("unavailable `herdr_prompt` target"));
+    assert!(lifecycle.contains("ended `socket_inbox` identity"));
+}
+
 /// Split one documented command into argv, dropping shell-only syntax.
 ///
 /// Placeholders like `<ask-id>` are ordinary tokens; only a redirection `<` or a

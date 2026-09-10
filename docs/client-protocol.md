@@ -110,7 +110,11 @@ authentication boundary.
   Herdr-bound identities also carry `backend_kind`, `incarnation_state`,
   `requested`, `observed`, and `observations`. `--refresh` refreshes attribution.
   `who <alias> --history` instead returns every claimant and unresolved ask for
-  that name.
+  that name. `who <alias> --resolve` returns the identity a name-keyed host
+  should continue: the unique addressable claimant, or, when none is
+  addressable, the newest claimant by creation time then logical-agent ID. It
+  fails on live ambiguity and includes the full claimant and unresolved-ask
+  picture. `--history`, `--resolve`, and `--refresh` are mutually exclusive.
 - `waiter.register` creates a pane-less LogicalAgent with
   `delivery_transport=socket_inbox`. It mints no incarnation. `waiter.retire`
   ends that targeting and releases the name. Open or in-progress asks waiting
@@ -512,6 +516,20 @@ or take a different name by renaming the agent in Herdr and adopting under it.
 The legacy `name.info` method and `name-info` command return exactly their
 previous result and stdout shapes.
 
+`who <name> --resolve` uses that same ordered picture to name a continuation
+target. One uniquely addressable Ready incarnation or active socket waiter wins.
+When none is addressable, the last claimant wins because claimants are ordered
+by `created_at_ms`, then logical-agent ID. Retired, lost, and failed claimants
+remain eligible for selection regardless of their last incarnation state. A
+selected `herdr_prompt` identity can continue with `start --logical-id`; an
+ended `socket_inbox` waiter cannot be reactivated, so a socket host registers a
+new waiter after reconciling its old obligations. More than one addressable
+claimant and a name with no claimant both fail closed. The JSON result carries
+`public_name`, `logical_agent_id`, nullable `incarnation_id`,
+`delivery_transport`, `addressable`, `continue` (`unique_addressable` or
+`newest_claimant`), `claimants`, and `unresolved`. A non-addressable stdout
+result points to `who <name> --history` when older claimants also exist.
+
 `ask.info` takes one ask `message_id` and returns, read-only, the ask's durable
 body, both parties (`asker` is the waiter, `responder` is the agent that owes
 the final reply, with agent ids and names), obligation state, timestamps, the
@@ -624,6 +642,14 @@ it is `{"status":"reported","value":…}` when it did. Adapters exist for
 `kelpie who [alias] | --pane ID | --agent-id ID | --incarnation-id ID`,
 defaulting to `$HERDR_PANE_ID`. The legacy `attribution` and `whoami` commands
 remain available with exactly their previous result and stdout shapes.
+
+The typed client also accepts `handoff --replace <alias>`. It first uses plain
+`who <alias>` to require one Ready Herdr incarnation, then supplies that exact
+incarnation and logical-agent ID to the unchanged `handoff` RPC. A socket waiter,
+dead claimant, or ambiguous live alias is refused with a pointer to
+`who <alias> --resolve` and, for `herdr_prompt`, `start --logical-id`; alias
+syntax does not make handoff continue an unavailable runtime or reactivate an
+ended socket waiter.
 
 Binding-time observation only sees what a backend has already written, and a
 backend may record its serving model only after its first turn. `--refresh`

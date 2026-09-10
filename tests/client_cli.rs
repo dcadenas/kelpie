@@ -364,6 +364,155 @@ fn typed_who_defaults_to_the_calling_pane_and_finds_a_waiter_by_name() {
     server.join().expect("server");
 }
 
+#[test]
+fn typed_who_resolves_a_dead_claimant_and_handoff_refuses_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut store = Store::open(directory.path().join("db.sqlite3")).expect("store");
+    let waiter = store
+        .register_socket_waiter("botserver", Parent::Parentless, "dead-waiter")
+        .expect("waiter");
+    store
+        .end_socket_waiter(waiter.logical_agent_id)
+        .expect("end waiter");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let kelpie = Kelpie::new(
+        store,
+        HerdrClient::new(directory.path().join("unused.sock"), Duration::from_secs(1)),
+    );
+    let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind");
+    let server = thread::spawn(move || {
+        daemon.serve_one().expect("who resolve");
+        daemon.serve_one().expect("handoff alias lookup");
+    });
+
+    let resolve = run_cli(&[
+        "--socket",
+        kelpie_socket.to_str().expect("socket"),
+        "--json",
+        "who",
+        "botserver",
+        "--resolve",
+    ]);
+    assert!(resolve.status.success());
+    let response: Value = serde_json::from_slice(&resolve.stdout).expect("resolve JSON");
+    assert_eq!(
+        response["result"]["logical_agent_id"],
+        serde_json::json!(waiter.logical_agent_id)
+    );
+    assert_eq!(response["result"]["continue"], "newest_claimant");
+    assert_eq!(response["result"]["addressable"], false);
+    assert!(response["result"]["incarnation_id"].is_null());
+
+    let handoff = run_cli(&[
+        "--socket",
+        kelpie_socket.to_str().expect("socket"),
+        "handoff",
+        "--replace",
+        "botserver",
+        "--name",
+        "botserver",
+        "--pane",
+        "w2:p1",
+        "--terminal",
+        "term-2",
+        "--backend",
+        "opencode",
+        "--cwd",
+        "/tmp",
+        "--timeout-ms",
+        "1000",
+        "--keep-open",
+        "--parentless",
+        "--tell",
+        "--body",
+        "continue",
+    ]);
+    assert!(!handoff.status.success());
+    let stderr = String::from_utf8_lossy(&handoff.stderr);
+    assert!(
+        stderr.contains("requires one uniquely Ready incarnation"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("kelpie who botserver --resolve"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("herdr_prompt") && stderr.contains("kelpie start --logical-id"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("register a new waiter"), "{stderr}");
+    server.join().expect("server");
+}
+
+#[test]
+fn typed_handoff_expands_a_ready_alias_to_exact_ids() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("kelpie.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        for sequence in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone"))
+                .read_line(&mut line)
+                .expect("read");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            let result = if sequence == 0 {
+                assert_eq!(request["method"], "who");
+                assert_eq!(request["params"]["alias"], "worker");
+                json!({
+                    "logical_agent_id": 41,
+                    "incarnation_id": 52,
+                    "public_name": "worker",
+                    "delivery_transport": "herdr_prompt",
+                    "addressable": true
+                })
+            } else {
+                assert_eq!(request["method"], "handoff");
+                assert_eq!(request["params"]["logical_agent_id"], 41);
+                assert_eq!(request["params"]["supersedes"], 52);
+                json!({"logical_agent_id": 41, "incarnation_id": 53})
+            };
+            serde_json::to_writer(&mut stream, &json!({"id": request["id"], "result": result}))
+                .expect("response");
+            stream.write_all(b"\n").expect("newline");
+        }
+    });
+
+    let output = run_cli(&[
+        "--socket",
+        socket.to_str().expect("socket"),
+        "--json",
+        "handoff",
+        "--replace",
+        "worker",
+        "--name",
+        "worker",
+        "--pane",
+        "w2:p1",
+        "--terminal",
+        "term-2",
+        "--backend",
+        "opencode",
+        "--cwd",
+        "/tmp",
+        "--timeout-ms",
+        "1000",
+        "--keep-open",
+        "--parentless",
+        "--tell",
+        "--body",
+        "continue",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("server");
+}
+
 fn store_ready(mut store: Store, name: &str, pane: &str, terminal: &str) -> Store {
     store
         .declare_adopt(
