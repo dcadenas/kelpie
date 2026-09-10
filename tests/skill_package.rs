@@ -30,6 +30,8 @@ fn skill_documents_name_based_continuation_without_dead_handoff() {
     assert!(inspection.contains("start --logical-id"));
     assert!(lifecycle.contains("uniquely Ready Herdr incarnation"));
     assert!(lifecycle.contains("dead or ambiguous alias"));
+    assert!(lifecycle.contains("unavailable `herdr_prompt` target"));
+    assert!(lifecycle.contains("ended `socket_inbox` identity"));
 }
 
 /// Split one documented command into argv, dropping shell-only syntax.
