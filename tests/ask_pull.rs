@@ -1,6 +1,7 @@
 //! Real-`kelpied` pull reply-sink conformance with a fake Herdr server.
 
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -12,12 +13,14 @@ use kelpie::domain::{
     InitialMessageIntent, InitialMessageKind, LogicalAgentId, MessageId, Parent, ReplyDelivery,
     StartIntent,
 };
-use kelpie::herdr::AgentObservation;
+use kelpie::herdr::{AgentObservation, HerdrClient};
+use kelpie::slice::Kelpie;
 use kelpie::store::{DeclaredStart, Store};
 use rusqlite::Connection;
 use serde_json::Value;
 
 const DAEMON_BOUND: &str = "daemon_bound";
+const ASK_PULL_AFTER_PERSIST: &str = "ask_pull_after_persist";
 
 fn intent(name: &str, pane: &str, terminal: &str, key: &str) -> StartIntent {
     StartIntent {
@@ -135,6 +138,7 @@ fn spawn_kelpied(
     kelpie_socket: &Path,
     herdr_socket: &Path,
     fault_socket: &Path,
+    points: &str,
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_kelpied"))
         .arg("--database")
@@ -143,7 +147,7 @@ fn spawn_kelpied(
         .arg(kelpie_socket)
         .arg("--herdr-socket")
         .arg(herdr_socket)
-        .env("KELPIE_TEST_FAULT_POINTS", DAEMON_BOUND)
+        .env("KELPIE_TEST_FAULT_POINTS", points)
         .env("KELPIE_TEST_FAULT_SOCKET", fault_socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -180,7 +184,13 @@ fn boot(
     fault_socket: &Path,
 ) -> (Child, UnixListener) {
     let fault_listener = UnixListener::bind(fault_socket).expect("bind fault");
-    let daemon = spawn_kelpied(database, kelpie_socket, herdr_socket, fault_socket);
+    let daemon = spawn_kelpied(
+        database,
+        kelpie_socket,
+        herdr_socket,
+        fault_socket,
+        DAEMON_BOUND,
+    );
     let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
     bound.write_all(b"x").expect("release");
     (daemon, fault_listener)
@@ -861,5 +871,244 @@ fn dropped_poller_does_not_inject_and_replacement_recovers() {
     );
     assert_eq!(recovered["result"]["obligation_state"], "resolved");
     assert_eq!(parent_prompt_count(&log), after_ask);
+    daemon.kill().ok();
+}
+
+#[test]
+fn cross_ask_ack_is_conflict_and_does_not_brick_the_named_obligation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (parent, reviewer) = seed_ready_pair(&database);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let _herdr = spawn_prompt_herdr(&herdr_socket, Arc::clone(&log));
+    let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
+    let ask_a = pull_ask(
+        &kelpie_socket,
+        parent.logical_agent_id,
+        reviewer.logical_agent_id,
+        reviewer.incarnation_id,
+        "ask-a",
+    );
+    let ask_b = pull_ask(
+        &kelpie_socket,
+        parent.logical_agent_id,
+        reviewer.logical_agent_id,
+        reviewer.incarnation_id,
+        "ask-b",
+    );
+    let final_a = reply(
+        &kelpie_socket,
+        ask_a,
+        reviewer.logical_agent_id,
+        "final",
+        "done-a",
+        "final-a",
+    );
+    let message_a = final_a["result"]["message_id"].clone();
+    let lease_b = claim(&kelpie_socket, ask_b, parent.logical_agent_id, "lease-b");
+    let crossed = ack(
+        &kelpie_socket,
+        ask_b,
+        parent.logical_agent_id,
+        &message_a,
+        lease_b,
+        "cross-ack",
+    );
+    assert_eq!(crossed["error"]["class"], "conflict", "{crossed}");
+    assert_eq!(obligation_state(&database, ask_a), "open");
+    assert_eq!(obligation_state(&database, ask_b), "open");
+
+    let lease_a = claim(&kelpie_socket, ask_a, parent.logical_agent_id, "lease-a");
+    let resolved = ack(
+        &kelpie_socket,
+        ask_a,
+        parent.logical_agent_id,
+        &message_a,
+        lease_a,
+        "ack-a",
+    );
+    assert_eq!(resolved["result"]["outcome"], "accepted");
+    assert_eq!(resolved["result"]["obligation_state"], "resolved");
+    assert_eq!(obligation_state(&database, ask_b), "open");
+    assert_eq!(herdr_reply_deliveries(&database), 0);
+    daemon.kill().ok();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn kill_after_pull_persist_recovers_without_inject() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (parent, reviewer) = seed_ready_pair(&database);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let _herdr = spawn_prompt_herdr(&herdr_socket, Arc::clone(&log));
+    let fault_listener = UnixListener::bind(&fault_socket).expect("bind fault");
+    let mut daemon = spawn_kelpied(
+        &database,
+        &kelpie_socket,
+        &herdr_socket,
+        &fault_socket,
+        &format!("{DAEMON_BOUND},{ASK_PULL_AFTER_PERSIST}"),
+    );
+    let mut bound = accept_point(&fault_listener, DAEMON_BOUND);
+    bound.write_all(b"x").expect("release");
+    let ask = pull_ask(
+        &kelpie_socket,
+        parent.logical_agent_id,
+        reviewer.logical_agent_id,
+        reviewer.incarnation_id,
+        "kill-ask",
+    );
+    let after_ask = parent_prompt_count(&log);
+    let socket = kelpie_socket.clone();
+    let owing = reviewer.logical_agent_id;
+    let client = thread::spawn(move || {
+        let mut stream = UnixStream::connect(socket).expect("connect reply");
+        serde_json::to_writer(
+            &mut stream,
+            &serde_json::json!({
+                "id": "kill-final",
+                "method": "reply",
+                "params": {
+                    "reply_to": ask,
+                    "requester_agent_id": owing,
+                    "body": "done",
+                    "disposition": "final",
+                    "idempotency_key": "kill-final"
+                }
+            }),
+        )
+        .expect("write reply");
+        stream.write_all(b"\n").expect("nl");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("until death");
+        response
+    });
+    let persisted = accept_point(&fault_listener, ASK_PULL_AFTER_PERSIST);
+    daemon.kill().expect("kill kelpied");
+    daemon.wait().expect("reap");
+    drop(persisted);
+    assert!(client.join().expect("reply client").is_empty());
+    assert_eq!(obligation_state(&database, ask), "open");
+    assert_eq!(herdr_reply_deliveries(&database), 0);
+    assert_eq!(parent_prompt_count(&log), after_ask);
+
+    fs::remove_file(&kelpie_socket).expect("remove killed socket");
+    let mut recovered = spawn_kelpied(
+        &database,
+        &kelpie_socket,
+        &herdr_socket,
+        &fault_socket,
+        DAEMON_BOUND,
+    );
+    let mut recovered_bound = accept_point(&fault_listener, DAEMON_BOUND);
+    recovered_bound.write_all(b"x").expect("release recovered");
+    assert_eq!(obligation_state(&database, ask), "open");
+    assert_eq!(herdr_reply_deliveries(&database), 0);
+    let lease = claim(
+        &kelpie_socket,
+        ask,
+        parent.logical_agent_id,
+        "recover-lease",
+    );
+    let polled = poll(
+        &kelpie_socket,
+        ask,
+        parent.logical_agent_id,
+        0,
+        Some(lease),
+        None,
+        "recover-poll",
+    );
+    assert_eq!(polled["result"]["status"], "ok");
+    let message_id = polled["result"]["events"][0]["message_id"].clone();
+    let acked = ack(
+        &kelpie_socket,
+        ask,
+        parent.logical_agent_id,
+        &message_id,
+        lease,
+        "recover-ack",
+    );
+    assert_eq!(acked["result"]["obligation_state"], "resolved");
+    assert_eq!(parent_prompt_count(&log), after_ask);
+    assert_eq!(herdr_reply_deliveries(&database), 0);
+    recovered.kill().ok();
+    recovered.wait().ok();
+}
+
+#[test]
+fn start_ask_pull_copies_policy_and_skips_parent_pane() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (parent, reviewer) = seed_ready_pair(&database);
+    let mut start = intent("reviewer", "w1:p2", "term-reviewer", "start-pull-initial");
+    start.initial_message = InitialMessageIntent {
+        sender: Some(parent.logical_agent_id),
+        kind: InitialMessageKind::Ask,
+        body: "review via start".into(),
+        reply_delivery: ReplyDelivery::Inject,
+    };
+    start.reply_delivery = ReplyDelivery::Pull;
+    let mut kelpie = Kelpie::new(
+        Store::open(&database).expect("store"),
+        HerdrClient::new("/unused", Duration::from_secs(1)),
+    );
+    let (_prepared, ask) = kelpie
+        .begin_initial_message(&start, reviewer)
+        .expect("start ask");
+    let policy: String = Connection::open(&database)
+        .expect("db")
+        .query_row(
+            "SELECT reply_delivery FROM obligations WHERE ask_message_id = ?1",
+            [ask.to_string()],
+            |row| row.get(0),
+        )
+        .expect("policy");
+    assert_eq!(policy, "pull");
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let _herdr = spawn_prompt_herdr(&herdr_socket, Arc::clone(&log));
+    let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
+    let after_boot = parent_prompt_count(&log);
+    let _ = reply(
+        &kelpie_socket,
+        ask,
+        reviewer.logical_agent_id,
+        "final",
+        "done",
+        "start-final",
+    );
+    assert_eq!(parent_prompt_count(&log), after_boot);
+    assert_eq!(herdr_reply_deliveries(&database), 0);
+    let lease = claim(&kelpie_socket, ask, parent.logical_agent_id, "start-claim");
+    let polled = poll(
+        &kelpie_socket,
+        ask,
+        parent.logical_agent_id,
+        0,
+        Some(lease),
+        None,
+        "start-poll",
+    );
+    let message_id = polled["result"]["events"][0]["message_id"].clone();
+    let acked = ack(
+        &kelpie_socket,
+        ask,
+        parent.logical_agent_id,
+        &message_id,
+        lease,
+        "start-ack",
+    );
+    assert_eq!(acked["result"]["obligation_state"], "resolved");
     daemon.kill().ok();
 }

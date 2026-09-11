@@ -2804,16 +2804,30 @@ impl Store {
         require_live_ask_pull_lease(&tx, ask_message_id, requester_agent_id, lease_id)?;
         let outcome: Option<String> = tx
             .query_row(
-                "SELECT outcome FROM deliveries
-                  WHERE message_id = ?1
-                    AND recipient_agent_id = ?2
-                    AND delivery_transport = 'ask_pull'",
-                params![message_id.to_string(), requester_agent_id.to_string()],
+                "SELECT d.outcome
+                   FROM deliveries d
+                   JOIN messages m ON m.id = d.message_id
+                  WHERE d.message_id = ?1
+                    AND d.recipient_agent_id = ?2
+                    AND d.delivery_transport = 'ask_pull'
+                    AND (
+                          m.reply_to_message_id = ?3
+                          OR m.id = (
+                            SELECT cancellation_response_message_id FROM obligations
+                             WHERE ask_message_id = ?3
+                          )
+                        )",
+                params![
+                    message_id.to_string(),
+                    requester_agent_id.to_string(),
+                    ask_message_id.to_string()
+                ],
                 |row| row.get(0),
             )
             .optional()?;
         match outcome.as_deref() {
             Some("accepted") => {
+                resolve_ask_pull_final_reply(&tx, ask_message_id, message_id, now)?;
                 tx.commit()?;
                 Ok(DeliveryOutcome::Accepted)
             }
