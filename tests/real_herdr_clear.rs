@@ -76,6 +76,7 @@ fn real_herdr_clear_rotates_the_backend_native_session() {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "say ready and wait".into(),
+                reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             },
             working_directory,
             idempotency_key: format!("real-clear-start-{}", uuid::Uuid::now_v7()),
@@ -85,6 +86,7 @@ fn real_herdr_clear_rotates_the_backend_native_session() {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         })
         .expect("real start reaches exact readiness");
     assert_eq!(started.start_outcome, OperationOutcome::Succeeded);

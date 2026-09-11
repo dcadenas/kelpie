@@ -25,6 +25,7 @@ fn intent(name: &str, pane: &str, terminal: &str, key: &str) -> StartIntent {
             sender: None,
             kind: InitialMessageKind::Tell,
             body: "work".into(),
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         },
         working_directory: "/tmp/work".into(),
         idempotency_key: key.into(),
@@ -34,6 +35,7 @@ fn intent(name: &str, pane: &str, terminal: &str, key: &str) -> StartIntent {
         requested_model: None,
         requested_provider: None,
         requested_effort: None,
+        reply_delivery: kelpie::domain::ReplyDelivery::Inject,
     }
 }
 
@@ -665,6 +667,7 @@ fn initial_start_ask_arms_forty_five_minute_default_on_acceptance() {
                 sender: Some(sender.logical_agent_id),
                 kind: InitialMessageKind::Ask,
                 body: "work".into(),
+                reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             },
             "initial",
         )

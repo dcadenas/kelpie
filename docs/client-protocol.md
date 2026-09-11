@@ -28,6 +28,7 @@ contains either `result` or an error with a stable `class` and human-readable
 `message`. Initial methods are `recover`, `start`, `adopt`, `tell`, `ask`,
 `reply`, `clear`, `renew`, `renew.cancel`, `schedule.cancel`, `schedule.list`, `pending`, `cancel`, `retire`,
 `waiter.register`, `waiter.retire`, `inbox.claim`, `inbox.ack`,
+`replies.claim`, `replies`, `replies.ack`,
 `notice.create`, `notice.list`, `who`, `name.info`, `ask.info`, `attribution`,
 and `whoami`, using the fields in the corresponding SPEC contracts.
 
@@ -324,6 +325,33 @@ delivery; the socket client's `inbox.ack` is acceptance. Dropping the host
 leaves the delivery queued and the obligation open. An alias-addressed `tell`
 to an active socket waiter uses the same queue and ACK path but creates no
 obligation; `operation_id` and `recipient_incarnation` are null.
+
+`ask` and `start --ask` accept optional `reply_delivery`: `inject` (default) or
+`pull`. Only the waiting agent may set it, and only at ask time. It is
+immutable. `socket_inbox` waiters refuse `pull`. `pull` does not change
+LogicalAgent.delivery_transport. Reverse progress, final, and waiting-side
+cancel for that obligation use delivery-row transport `ask_pull`: queued at
+persist, no prompt operation, no Herdr write. Persist is not acceptance. Final
+resolves only when the waiting agent ACKs that final with a live lease.
+Progress may set `in_progress` at persist; progress ACK never resolves.
+
+```
+kelpie ask reviewer --reply-delivery pull --file ./brief.md
+kelpie start ... --ask --reply-delivery pull --file ./initial.md
+kelpie replies-claim <ask-id>
+kelpie replies <ask-id> --after <cursor> --lease ID --timeout 30s
+kelpie replies-ack <ask-id> <message-id> --lease ID
+```
+
+`replies` is a non-destructive log for that ask. Repeating `--after C` must not
+lose events. ACK does not delete rows. Omitted timeout or `--timeout 0` returns
+immediately. Positive timeout is a bounded long-poll, hard cap 60s. Timeout
+returns success with `status=pending`, empty events, and an unchanged cursor.
+`--timeout 61s` is refused. A replacement `replies-claim` invalidates the old
+lease. Stale-lease ACK is `conflict` and does not resolve. Non-owner poll/ack is
+`conflict`. Poll authorization is the waiting logical agent, not proof that the
+caller is a native subagent. If the poller disappears, the sink stays durable
+and there is no fallback inject into the parent pane.
 
 Wrong or stale correlation fails closed. Progress sets the obligation
 `in_progress` when the reply is recorded and does not resolve it. A final reply

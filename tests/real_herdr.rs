@@ -46,6 +46,7 @@ fn real_herdr_start_ask_and_correlated_reply() {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "real Herdr integration fixture".into(),
+                reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             },
             working_directory,
             idempotency_key: format!("real-start-{}", uuid::Uuid::now_v7()),
@@ -55,6 +56,7 @@ fn real_herdr_start_ask_and_correlated_reply() {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         })
         .expect("real start reaches exact readiness");
     assert_eq!(started.start_outcome, OperationOutcome::Succeeded);

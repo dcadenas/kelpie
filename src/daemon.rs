@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::domain::{
     AdoptIntent, IncarnationId, LogicalAgentId, MessageId, MessageKind, OperationId, Parent,
-    RenewId, RenewPhase, RenewTimeout, ReplyDisposition, ScheduleId, StartIntent,
+    RenewId, RenewPhase, RenewTimeout, ReplyDelivery, ReplyDisposition, ScheduleId, StartIntent,
 };
 use crate::herdr::HerdrError;
 use crate::herdr_exec::{FailPhase, HerdrEvent, HerdrExec, HerdrJob, HerdrJobResult, LeaseCmd};
@@ -38,6 +38,7 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_POLL: Duration = Duration::from_secs(1);
 const MAX_ACCEPTS_PER_POLL: usize = 16;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_REPLIES_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after bind kelpied keeps retrying recover for Herdr-restored agents.
 /// Native resume often lands after a client attaches, which is later than the socket.
 const BOOT_CONTINUE_WINDOW: Duration = Duration::from_mins(2);
@@ -219,6 +220,18 @@ struct AwaitingClearRequest {
     lease: Option<std::sync::mpsc::Sender<LeaseCmd>>,
 }
 
+/// Bounded long-poll for one ask-pull log.
+#[derive(Debug)]
+struct AwaitingReplies {
+    request_id: String,
+    stream: UnixStream,
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+    after: i64,
+    lease_id: Option<i64>,
+    deadline: Instant,
+}
+
 /// Long-lived socket-inbox client. One-shot RPCs are not this receive path.
 #[derive(Debug)]
 struct InboxSession {
@@ -256,6 +269,7 @@ pub struct Daemon {
     awaiting_starts: Vec<AwaitingStart>,
     awaiting_clears: Vec<AwaitingClearRequest>,
     inboxes: Vec<InboxSession>,
+    awaiting_replies: Vec<AwaitingReplies>,
     reading: Vec<ReadingClient>,
     awaiting_writes: Vec<AwaitingWrite>,
     herdr_exec: HerdrExec,
@@ -464,6 +478,7 @@ impl Daemon {
             awaiting_starts: Vec::new(),
             awaiting_clears: Vec::new(),
             inboxes: Vec::new(),
+            awaiting_replies: Vec::new(),
             reading: Vec::new(),
             awaiting_writes: Vec::new(),
             herdr_exec,
@@ -502,7 +517,12 @@ impl Daemon {
     pub fn run(&mut self) -> Result<(), DaemonError> {
         loop {
             if !self.poll()? {
-                thread::sleep(self.kelpie.idle_wait(Duration::from_millis(100)));
+                let wait = self
+                    .next_replies_wait()
+                    .map_or(self.kelpie.idle_wait(Duration::from_millis(100)), |wait| {
+                        wait.min(self.kelpie.idle_wait(Duration::from_millis(100)))
+                    });
+                thread::sleep(wait);
             }
         }
     }
@@ -572,6 +592,8 @@ impl Daemon {
         log_slow_phase("clear_herdr", &mut phase);
         let inbox_advanced = self.advance_inboxes();
         log_slow_phase("inboxes", &mut phase);
+        let replies_advanced = self.advance_replies_waits();
+        log_slow_phase("replies_waits", &mut phase);
         let write_advanced = self.advance_writes();
         log_slow_phase("writes", &mut phase);
         let reading_advanced = self.pump_reading();
@@ -601,6 +623,7 @@ impl Daemon {
         let advanced = start_advanced
             || clear_advanced
             || inbox_advanced
+            || replies_advanced
             || write_advanced
             || reading_advanced
             || reading_after_accept
@@ -700,6 +723,7 @@ impl Daemon {
             Ok(Served::AwaitingStart(awaiting)) => self.park_start(*awaiting),
             Ok(Served::AwaitingClear(awaiting)) => self.awaiting_clears.push(*awaiting),
             Ok(Served::Inbox(session)) => self.park_inbox(*session),
+            Ok(Served::AwaitingReplies(wait)) => self.awaiting_replies.push(*wait),
             Ok(Served::AwaitingPrompt(awaiting)) => self.park_prompt(*awaiting),
             Ok(Served::AwaitingCancel(pending)) => self.park_cancel(*pending),
             Ok(Served::AwaitingWaiterRetire(pending)) => {
@@ -3898,6 +3922,31 @@ impl Daemon {
         progressed
     }
 
+    fn next_replies_wait(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.awaiting_replies
+            .iter()
+            .map(|wait| wait.deadline.saturating_duration_since(now))
+            .min()
+    }
+
+    fn advance_replies_waits(&mut self) -> bool {
+        let mut progressed = false;
+        let mut still_open = Vec::with_capacity(self.awaiting_replies.len());
+        for wait in std::mem::take(&mut self.awaiting_replies) {
+            match complete_replies_wait(wait, &self.kelpie) {
+                Ok(None) => progressed = true,
+                Ok(Some(wait)) => still_open.push(wait),
+                Err(error) => {
+                    eprintln!("kelpied: replies wait failed: {error}");
+                    progressed = true;
+                }
+            }
+        }
+        self.awaiting_replies = still_open;
+        progressed
+    }
+
     fn park_inbox(&mut self, session: InboxSession) {
         let waiter_id = session.waiter_id;
         self.inboxes.retain(|open| open.waiter_id != waiter_id);
@@ -4076,6 +4125,11 @@ impl Daemon {
             }
             Served::AwaitingRename(rename) => self.serve_one_rename(*rename),
             Served::AwaitingRetire(retire) => self.serve_one_retire(*retire),
+            Served::AwaitingReplies(mut wait) => {
+                wait.deadline = Instant::now();
+                let _ = complete_replies_wait(*wait, &self.kelpie)?;
+                Ok(())
+            }
             Served::AwaitingClear(mut awaiting) => loop {
                 match advance_clear_state(awaiting.state, &mut self.kelpie) {
                     Ok(ClearDispatch::Awaiting(state)) => {
@@ -4113,6 +4167,8 @@ enum Served {
     AwaitingClear(Box<AwaitingClearRequest>),
     /// A socket waiter claimed this connection as its inbox.
     Inbox(Box<InboxSession>),
+    /// A pull-sink long-poll waiting for the first event or timeout.
+    AwaitingReplies(Box<AwaitingReplies>),
     /// Ask/tell Herdr write is running off-thread.
     AwaitingPrompt(Box<AwaitingPrompt>),
     /// Cancel notices are running off-thread.
@@ -4319,6 +4375,9 @@ fn serve_parsed_line(
                     return Ok(Served::Answered);
                 }
             }
+        }
+        Ok(request) if request.method == "replies" => {
+            return begin_replies(request, stream, kelpie);
         }
         Ok(request) if request.method == "inbox.claim" => match claim_inbox(&request, kelpie) {
             Ok(waiter_id) => {
@@ -4705,6 +4764,188 @@ fn write_json_line(
     Ok(())
 }
 
+fn begin_replies(
+    request: ClientRequest,
+    mut stream: UnixStream,
+    kelpie: &mut Kelpie,
+) -> Result<Served, DaemonError> {
+    match replies_dispatch(&request, kelpie) {
+        Ok(RepliesDispatch::Ready(result)) => {
+            let response = respond(&request.id, Ok(result));
+            write_response(&mut stream, &response)?;
+            Ok(Served::Answered)
+        }
+        Ok(RepliesDispatch::Wait(wait)) => Ok(Served::AwaitingReplies(Box::new(AwaitingReplies {
+            request_id: request.id,
+            stream,
+            ask_message_id: wait.ask_message_id,
+            requester_agent_id: wait.requester_agent_id,
+            after: wait.after,
+            lease_id: wait.lease_id,
+            deadline: wait.deadline,
+        }))),
+        Err(error) => {
+            let response = respond(&request.id, Err(error));
+            write_response(&mut stream, &response)?;
+            Ok(Served::Answered)
+        }
+    }
+}
+
+struct RepliesWaitPlan {
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+    after: i64,
+    lease_id: Option<i64>,
+    deadline: Instant,
+}
+
+enum RepliesDispatch {
+    Ready(Value),
+    Wait(RepliesWaitPlan),
+}
+
+fn replies_dispatch(
+    request: &ClientRequest,
+    kelpie: &Kelpie,
+) -> Result<RepliesDispatch, SliceError> {
+    let params = serde_json::from_value::<RepliesParams>(request.params.clone())
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let timeout_ms = params.timeout_ms.unwrap_or(0);
+    if timeout_ms < 0 {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "replies timeout_ms must not be negative".into(),
+        )));
+    }
+    if timeout_ms > i64::try_from(MAX_REPLIES_TIMEOUT.as_millis()).unwrap_or(60_000) {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "replies timeout must be at most 60s".into(),
+        )));
+    }
+    let poll = kelpie
+        .store()
+        .poll_ask_pull(
+            params.ask_message_id,
+            params.requester_agent_id,
+            params.after,
+            params.lease_id,
+        )
+        .map_err(SliceError::Store)?;
+    if !poll.events.is_empty() || timeout_ms == 0 {
+        return Ok(RepliesDispatch::Ready(replies_poll_json(&poll)));
+    }
+    Ok(RepliesDispatch::Wait(RepliesWaitPlan {
+        ask_message_id: params.ask_message_id,
+        requester_agent_id: params.requester_agent_id,
+        after: params.after,
+        lease_id: params.lease_id,
+        deadline: Instant::now() + Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0)),
+    }))
+}
+
+fn complete_replies_wait(
+    mut wait: AwaitingReplies,
+    kelpie: &Kelpie,
+) -> Result<Option<AwaitingReplies>, DaemonError> {
+    let poll = match kelpie.store().poll_ask_pull(
+        wait.ask_message_id,
+        wait.requester_agent_id,
+        wait.after,
+        wait.lease_id,
+    ) {
+        Ok(poll) => poll,
+        Err(error) => {
+            let response = respond(&wait.request_id, Err(SliceError::Store(error)));
+            write_response(&mut wait.stream, &response)?;
+            return Ok(None);
+        }
+    };
+    if !poll.events.is_empty() || Instant::now() >= wait.deadline {
+        let response = respond(&wait.request_id, Ok(replies_poll_json(&poll)));
+        write_response(&mut wait.stream, &response)?;
+        return Ok(None);
+    }
+    Ok(Some(wait))
+}
+
+fn replies_poll_json(poll: &crate::store::AskPullPoll) -> Value {
+    let events: Vec<Value> = poll
+        .events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "message_id": event.message_id,
+                "kind": event.kind,
+                "body": event.body,
+                "reply_to": event.reply_to,
+                "disposition": event.disposition,
+                "sender_agent_id": event.sender_agent_id,
+                "sender_public_name": event.sender_public_name,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "status": poll.status,
+        "cursor": poll.cursor,
+        "events": events,
+    })
+}
+
+fn dispatch_replies_claim(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<RepliesClaimParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let claimed = kelpie
+        .store_mut()
+        .claim_ask_pull_lease(params.ask_message_id, params.requester_agent_id)
+        .map_err(SliceError::Store)?;
+    Ok(serde_json::json!({
+        "lease_id": claimed.lease_id,
+        "ask_message_id": claimed.ask_message_id,
+    }))
+}
+
+fn dispatch_replies(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<RepliesParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    if params.timeout_ms.unwrap_or(0) != 0 {
+        return Err(SliceError::Store(StoreError::InvalidRecord(
+            "positive replies timeout requires a parked client connection".into(),
+        )));
+    }
+    let poll = kelpie
+        .store()
+        .poll_ask_pull(
+            params.ask_message_id,
+            params.requester_agent_id,
+            params.after,
+            params.lease_id,
+        )
+        .map_err(SliceError::Store)?;
+    Ok(replies_poll_json(&poll))
+}
+
+fn dispatch_replies_ack(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
+    let params = serde_json::from_value::<RepliesAckParams>(params)
+        .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
+    let outcome = kelpie
+        .store_mut()
+        .ack_ask_pull_delivery(
+            params.ask_message_id,
+            params.requester_agent_id,
+            params.message_id,
+            params.lease_id,
+        )
+        .map_err(SliceError::Store)?;
+    Ok(serde_json::json!({
+        "message_id": params.message_id,
+        "outcome": outcome,
+        "obligation_state": kelpie
+            .store()
+            .obligation_state(params.ask_message_id)
+            .map_err(SliceError::Store)?,
+    }))
+}
+
 fn claim_inbox(request: &ClientRequest, kelpie: &Kelpie) -> Result<LogicalAgentId, SliceError> {
     let params = serde_json::from_value::<InboxClaimParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
@@ -4938,6 +5179,9 @@ fn dispatch(request: ClientRequest, kelpie: &mut Kelpie) -> ClientResponse {
         "start" | "handoff" => dispatch_start(request.params, kelpie),
         "adopt" => dispatch_adopt(request.params, kelpie),
         "ask" => dispatch_ask(request.params, kelpie),
+        "replies.claim" => dispatch_replies_claim(request.params, kelpie),
+        "replies" => dispatch_replies(request.params, kelpie),
+        "replies.ack" => dispatch_replies_ack(request.params, kelpie),
         "waiter.register" => dispatch_waiter_register(request.params, kelpie),
         "waiter.retire" => dispatch_waiter_retire(request.params, kelpie),
         "tell" => dispatch_tell(request.params, kelpie),
@@ -5124,6 +5368,11 @@ fn resolve_who_identity(params: &WhoParams, kelpie: &Kelpie) -> Result<WhoIdenti
                 .map_err(SliceError::Store),
             crate::domain::DeliveryTransport::SocketInbox => {
                 Ok(WhoIdentity::SocketWaiter(agent_id))
+            }
+            crate::domain::DeliveryTransport::AskPull => {
+                Err(SliceError::Store(StoreError::InvalidRecord(format!(
+                    "logical agent {agent_id} cannot have delivery_transport ask_pull"
+                ))))
             }
         };
     }
@@ -6012,6 +6261,13 @@ fn prepare_client_prompt(
             params.sender,
             None,
         )? {
+            let stored = replay.reply_delivery.unwrap_or(ReplyDelivery::Inject);
+            if stored != params.reply_delivery {
+                return Err(SliceError::Store(StoreError::Conflict(format!(
+                    "idempotency key already recorded reply_delivery {}",
+                    stored.as_str()
+                ))));
+            }
             return Ok((prompt_replay_result(&replay)?, None, None));
         }
         let (recipient, recipient_incarnation) = resolve_recipient(
@@ -6030,6 +6286,7 @@ fn prepare_client_prompt(
             None,
             reminder_interval,
             params.from_operator,
+            params.reply_delivery,
         )?;
         let mut result = serde_json::json!({
             "message_id": created.message_id,
@@ -6037,6 +6294,7 @@ fn prepare_client_prompt(
             "recipient": recipient,
             "recipient_incarnation": recipient_incarnation,
             "waiting_agent_id": params.sender,
+            "reply_delivery": params.reply_delivery,
         });
         if let Some(remind_after_ms) = reminder_interval {
             result["remind_after_ms"] = serde_json::json!(remind_after_ms);
@@ -6866,6 +7124,33 @@ struct InboxAckParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct RepliesClaimParams {
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepliesParams {
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+    #[serde(default)]
+    after: i64,
+    #[serde(default)]
+    lease_id: Option<i64>,
+    #[serde(default)]
+    timeout_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct RepliesAckParams {
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+    message_id: MessageId,
+    lease_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct AskParams {
     sender: LogicalAgentId,
     #[serde(default)]
@@ -6888,6 +7173,9 @@ struct AskParams {
     /// Message-sender attribution only. The waiting agent is still `sender`.
     #[serde(default)]
     from_operator: bool,
+    /// Reverse-path policy. Default inject. Immutable after persist.
+    #[serde(default)]
+    reply_delivery: ReplyDelivery,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7145,6 +7433,7 @@ mod tests {
             due_at_ms: None,
             remind_after_ms,
             no_remind,
+            reply_delivery: ReplyDelivery::Inject,
             from_operator: false,
         }
     }
@@ -7251,6 +7540,7 @@ mod tests {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "work".into(),
+                reply_delivery: ReplyDelivery::Inject,
             },
             working_directory: "/tmp/work".into(),
             idempotency_key: key.into(),
@@ -7260,6 +7550,7 @@ mod tests {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: ReplyDelivery::Inject,
         }
     }
 

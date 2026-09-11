@@ -67,6 +67,9 @@ The compiled points are test infrastructure, not a public operational API:
 - `inbox_after_ack_before_resolve`: a parsed `inbox.ack` names that queued
   delivery, while the delivery remains `queued` and the obligation has not been
   resolved.
+- `ask_pull_after_persist`: a pull reverse reply is durably queued on `ask_pull`
+  with no prompt operation, and no parent-pane `agent.prompt` byte has been
+  written. There is no Herdr write on this path.
 - `initial_message_after_submitted_before_write`: runtime start is independently
   `succeeded` and its incarnation is `ready`; the initial tell's separate
   message, prompt operation, delivery, and request attempt are durable; the

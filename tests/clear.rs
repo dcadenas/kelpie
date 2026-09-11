@@ -28,6 +28,7 @@ fn intent(backend: &str) -> StartIntent {
             sender: None,
             kind: InitialMessageKind::Tell,
             body: "work".into(),
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         },
         working_directory: "/tmp/work".into(),
         idempotency_key: format!("start-{backend}"),
@@ -37,6 +38,7 @@ fn intent(backend: &str) -> StartIntent {
         requested_model: None,
         requested_provider: None,
         requested_effort: None,
+        reply_delivery: kelpie::domain::ReplyDelivery::Inject,
     }
 }
 

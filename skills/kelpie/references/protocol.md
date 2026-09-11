@@ -19,6 +19,11 @@ Contents: [Method details](#method-details), [typed client examples](#typed-clie
   `from=` is the waiter's public name. The host receives deliveries on a
   long-lived `inbox.claim` connection for that waiter id, then `inbox.ack`.
   `pending` and `ask.info` are not the socket-waiter receive path.
+- `replies.claim`, `replies`, `replies.ack`: ask-scoped pull sink for reverse
+  traffic when the ask used `reply_delivery=pull`. Not `inbox.claim`. `replies`
+  is a non-destructive log for that ask only. Poll authorization is the waiting
+  logical agent. A live lease is required to ACK a final. Do not document that
+  as authentication.
 - `notice.create` and `notice.list`: write and inspect durable operator notices.
 
 Read `docs/client-protocol.md` and `SPEC.md` in the release for exact fields.
@@ -49,6 +54,10 @@ kelpie tell coordinator --every 15m --file supervision-pass.txt
 kelpie schedule-cancel <schedule-id> --reason supervision-moved
 kelpie schedules
 kelpie ask kelpie-envelope-builder --file ./task.md
+kelpie ask kelpie-envelope-builder --reply-delivery pull --file ./brief.md
+kelpie replies-claim <ask-id>
+kelpie replies <ask-id> --after 0 --timeout 30s
+kelpie replies-ack <ask-id> <message-id> --lease 1
 kelpie clear kelpie-envelope-builder
 kelpie ask kelpie-envelope-builder --remind-after-ms 600000 --file ./long-task.md
 kelpie ask kelpie-envelope-builder --no-remind --file ./parked-question.md

@@ -144,6 +144,31 @@ pub enum InitialMessageKind {
     Ask,
 }
 
+/// How reverse traffic for one ask reaches the waiting agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyDelivery {
+    /// Inject progress, final, and waiting-side cancel into the asker's pane.
+    #[default]
+    Inject,
+    /// Queue reverse traffic on an ask-scoped pull sink. No parent-pane prompt.
+    Pull,
+}
+
+impl ReplyDelivery {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inject => "inject",
+            Self::Pull => "pull",
+        }
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_inject_reply_delivery(value: &ReplyDelivery) -> bool {
+    *value == ReplyDelivery::Inject
+}
+
 /// Initial message stored in launch intent before runtime effects begin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitialMessageIntent {
@@ -151,6 +176,9 @@ pub struct InitialMessageIntent {
     pub sender: Option<LogicalAgentId>,
     pub kind: InitialMessageKind,
     pub body: String,
+    /// Reverse-path policy for an initial ask. Ignored for tells. Default inject.
+    #[serde(default)]
+    pub reply_delivery: ReplyDelivery,
 }
 
 /// Disposition of a reply message.
@@ -173,6 +201,9 @@ pub enum ObligationState {
 }
 
 /// Local delivery client for one logical agent, fixed at creation.
+///
+/// `AskPull` is a delivery-row transport only. `LogicalAgent.delivery_transport`
+/// remains `herdr_prompt` or `socket_inbox`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryTransport {
@@ -180,6 +211,8 @@ pub enum DeliveryTransport {
     HerdrPrompt,
     /// Pane-less socket inbox addressed by logical-agent id.
     SocketInbox,
+    /// Ask-scoped pull sink for reverse traffic. No Herdr write.
+    AskPull,
 }
 
 impl DeliveryTransport {
@@ -187,6 +220,7 @@ impl DeliveryTransport {
         match self {
             Self::HerdrPrompt => "herdr_prompt",
             Self::SocketInbox => "socket_inbox",
+            Self::AskPull => "ask_pull",
         }
     }
 }
@@ -297,6 +331,9 @@ pub struct StartIntent {
     /// Requested reasoning effort. Never treated as observed execution metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_effort: Option<String>,
+    /// Reverse-path policy for an initial ask. Default inject. Tells ignore it.
+    #[serde(default, skip_serializing_if = "is_inject_reply_delivery")]
+    pub reply_delivery: ReplyDelivery,
     /// Incarnation this start replaces, demoted in the same transaction that
     /// proves the successor Ready.
     ///

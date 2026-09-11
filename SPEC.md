@@ -325,9 +325,9 @@ A `Delivery` represents one attempt to convey a message to one recipient.
 It MUST contain:
 
 - message ID;
-- `delivery_transport`: `herdr_prompt` or `socket_inbox`;
+- `delivery_transport`: `herdr_prompt`, `socket_inbox`, or `ask_pull`;
 - for `herdr_prompt`, the exact recipient incarnation ID;
-- for `socket_inbox`, the recipient logical-agent ID, and MUST NOT require an
+- for `socket_inbox` and `ask_pull`, the recipient logical-agent ID, and MUST NOT require an
   incarnation ID;
 - attempt number;
 - scheduled, attempted, and resolved times where applicable;
@@ -335,7 +335,7 @@ It MUST contain:
   correlation is available;
 - an outcome.
 
-Herdr request correlation MUST NOT be required for `socket_inbox`.
+Herdr request correlation MUST NOT be required for `socket_inbox` or `ask_pull`.
 
 Delivery outcome MUST distinguish at least:
 
@@ -376,7 +376,9 @@ It MUST contain:
 - creation and last-activity times;
 - state: `open`, `in_progress`, `resolved`, `cancelled`, or `orphaned`;
 - the resolving final-reply message ID when resolved;
-- the cancellation requester and reason when cancelled.
+- the cancellation requester and reason when cancelled;
+- `reply_delivery`: `inject` or `pull`, set only by the waiting agent at ask
+  creation and immutable afterwards.
 
 A progress reply MUST refresh activity and set `in_progress`; it MUST NOT resolve
 the obligation. A final reply MUST resolve only the exact obligation named by
@@ -392,7 +394,12 @@ MUST bind the waiter's receive path:
 
 - `herdr_prompt`: the unique Ready incarnation of the waiting agent, then Herdr
   prompt delivery;
-- `socket_inbox`: the waiting agent's socket inbox, with no Herdr prompt.
+- `socket_inbox`: the waiting agent's socket inbox, with no Herdr prompt;
+- `pull`: an ask-scoped pull sink with delivery-row transport `ask_pull`. No
+  Herdr prompt, no parent-pane wake, and no fallback inject if the poller
+  disappears. `pull` is not a third LogicalAgent transport;
+  LogicalAgent.delivery_transport remains `herdr_prompt`. A `socket_inbox`
+  waiter MUST refuse `pull`. The responder MUST NOT set or clear the policy.
 
 Outcomes are the same accepted / rejected / target-unavailable / unknown set as
 `tell` and `ask`. Submitted and unknown reply deliveries MUST NOT be blindly
@@ -400,10 +407,22 @@ resent.
 
 A final reply MUST resolve the obligation only when its delivery is accepted.
 For `socket_inbox`, accepted means the socket client acknowledged that
-delivery. Rejected, target-unavailable, or unknown final deliveries leave the
+delivery. For `ask_pull`, accepted means the waiting agent acknowledged that
+final message with a live lease, exactly once. A stale-lease ACK MUST be
+`conflict` and MUST NOT resolve. Progress ACK MUST NEVER resolve. Rejected, target-unavailable, or unknown final deliveries leave the
 obligation open or in progress so the waiter is not treated as answered without
 an accepted delivery. Progress MAY set `in_progress` when the progress message
 is durably recorded, independent of that progress delivery's terminal outcome.
+
+`replies.claim` rotates a lease for that ask. `replies` is a non-destructive log
+for that ask only; repeating the same `--after` cursor MUST NOT lose events.
+Omitted timeout or timeout 0 returns immediately. A positive timeout is a
+bounded long-poll with a hard cap of 60 seconds. Timeout returns success with
+`status=pending`, empty events, and an unchanged cursor. Poll authorization is
+the waiting logical agent. Waiting-side cancellation of a `pull` ask MUST be a
+sink event, not a parent-pane prompt. Owing-side stop-notice remains a pane
+inject. Bare `ask` and existing stored obligations MUST stay full reverse
+injection.
 
 ### OperatorNotice
 
@@ -1237,6 +1256,8 @@ Herdr prompt proofs above.
 | An owing cancellation outlives the owing agent | Cancel an ask whose owing agent has no Ready incarnation, then re-adopt that owing agent and verify pending surfaces the cancellation with its reason; verify a stop-notice already accepted into a pane does not re-surface. |
 | Only the responder can reply | As the asker (or a third party), reply to an open ask and verify the refusal names the owing agent, the obligation stays untouched, and nothing is delivered to any pane. |
 | Socket-inbox final resolves only on ACK | Occupant `reply` final to a `socket_inbox` waiter: no Herdr prompt to the waiter, persist does not resolve, ACK resolves once, a dropped host leaves the obligation open. |
+| Pull reverse traffic never prompts the parent pane | `ask` with `reply_delivery=pull`: reviewer receives the ask; parent pane Herdr log contains no reply or waiting-side cancel bytes, including after persist, poller kill, lease steal, continuation, and timeout. |
+| Pull final resolves only on live-lease ACK | Progress sets `in_progress` at persist and ACK does not resolve. Final stays queued until ACK; ACK resolves once; stale-lease ACK is `conflict` and leaves the obligation open. |
 | Socket-inbox cancel reaches the waiter | Cancel an ask whose asker is a socket waiter and verify a Kelpie-authored `cancellation` reaches the inbox, state `cancelled` not `resolved`, not attributed to the responder. |
 | Same-user cancel is not waiter-only | With the waiter gone, cancel as the owing agent or a third Ready agent by ask id and reason; verify `cancelled` (not `resolved`) and the requester recorded. Cancel with the waiter's id still works. A wrong ask id fails closed. A renew prepare ask is refused and the policy stays armed. |
 | Socket-inbox reconnect drains one waiter | Create an ask, disconnect, reconnect as the same waiter id, drain the later reply, and ACK; claiming an id that is not an active socket waiter is refused. |

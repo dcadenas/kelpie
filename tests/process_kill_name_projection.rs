@@ -183,11 +183,13 @@ fn seed(database: &Path) {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             parent: Parent::Parentless,
             initial_message: InitialMessageIntent {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "seed".into(),
+                reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             },
             idempotency_key: "seed-worker".into(),
             readiness_timeout_ms: 1_000,

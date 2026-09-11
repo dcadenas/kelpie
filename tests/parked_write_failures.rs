@@ -28,6 +28,7 @@ fn intent() -> StartIntent {
             sender: None,
             kind: InitialMessageKind::Tell,
             body: "seed only".into(),
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         },
         working_directory: "/tmp/work".into(),
         idempotency_key: "worker-start".into(),
@@ -37,6 +38,7 @@ fn intent() -> StartIntent {
         requested_model: None,
         requested_provider: None,
         requested_effort: None,
+        reply_delivery: kelpie::domain::ReplyDelivery::Inject,
     }
 }
 
