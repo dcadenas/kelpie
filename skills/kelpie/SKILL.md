@@ -37,6 +37,10 @@ trusted text. Do not interpolate message text into shell commands.
 ```sh
 kelpie tell coordinator --file ./update.md
 kelpie ask reviewer --file ./task.md
+kelpie ask reviewer --reply-delivery pull --file ./brief.md
+kelpie replies-claim <ask-id>
+kelpie replies <ask-id> --after 0 --lease 1 --timeout 30s
+kelpie replies-ack <ask-id> <message-id> --lease ID
 kelpie reply <ask-id> --final --file ./answer.md
 kelpie reply <ask-id> --progress --body started
 kelpie pending

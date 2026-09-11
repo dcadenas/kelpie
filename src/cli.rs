@@ -29,6 +29,7 @@ pub struct AdoptArgs {
 
 /// How the client should speak to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Invocation {
     /// Print the canonical skill text.
     Skill,
@@ -66,6 +67,7 @@ pub enum Command {
         remind_after_ms: Option<i64>,
         no_remind: bool,
         from_operator: bool,
+        reply_delivery: Option<String>,
     },
     Reply {
         reply_to: String,
@@ -167,6 +169,23 @@ pub enum Command {
     WaiterRetire {
         target: AgentTarget,
     },
+    RepliesClaim {
+        ask_id: String,
+        requester: Option<Caller>,
+    },
+    Replies {
+        ask_id: String,
+        after: String,
+        lease_id: Option<String>,
+        timeout_ms: Option<i64>,
+        requester: Option<Caller>,
+    },
+    RepliesAck {
+        ask_id: String,
+        message_id: String,
+        lease_id: String,
+        requester: Option<Caller>,
+    },
 }
 
 /// `StartIntent` parent: parentless or an exact parent agent ID.
@@ -199,6 +218,7 @@ pub struct StartCommand {
     pub requested_effort: Option<String>,
     /// Incarnation this start replaces, for `handoff`.
     pub supersedes: Option<String>,
+    pub reply_delivery: Option<String>,
 }
 
 /// Caller identity supplied on the command line.
@@ -447,6 +467,18 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "delivery_outcome"),
             field(&result, "obligation_state")
         ),
+        "replies.claim" => format!(
+            "replies-claim lease={} ask={}\n",
+            field(&result, "lease_id"),
+            field(&result, "ask_message_id")
+        ),
+        "replies" => format_replies_receipt(&result),
+        "replies.ack" => format!(
+            "replies-ack message={} delivery={} obligation={}\n",
+            field(&result, "message_id"),
+            field(&result, "outcome"),
+            field(&result, "obligation_state")
+        ),
         "whoami" => format!(
             "whoami name={} agent={} incarnation={}\n",
             field(&result, "public_name"),
@@ -517,6 +549,15 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
     }
 }
 
+fn format_replies_receipt(result: &Value) -> String {
+    let events = result["events"].as_array().map_or(0, Vec::len);
+    format!(
+        "replies status={} cursor={} events={events}\n",
+        field(result, "status"),
+        field(result, "cursor")
+    )
+}
+
 fn format_clear_receipt(result: &Value) -> String {
     format!(
         "clear operation={} recipient={} outcome={}\n",
@@ -580,6 +621,7 @@ Commands:
   ask  <recipient> | --recipient-id ID --recipient-incarnation ID
        (--stdin | --file PATH | --body TEXT)
        [--remind-after-ms MS | --no-remind]
+       [--reply-delivery inject|pull]
   reply <ask-id> (--progress | --final) (--stdin | --file PATH | --body TEXT)
   clear <recipient> | --recipient-id ID --recipient-incarnation ID
   renew [--recipient-id ID --recipient-incarnation ID]
@@ -605,10 +647,11 @@ Commands:
   handoff --replace INCARNATION-ID|ALIAS <all start arguments>
   start --name NAME --pane ID --terminal ID --backend KIND --cwd PATH
        --timeout-ms N (--keep-open | --no-keep-open)
-       (--parentless | --parent-id ID) (--tell | --ask)
-       (--stdin | --file PATH | --body TEXT)
-       [--arg ARG]... [--session NAME] [--logical-id ID] [--sender-id ID]
-       [--requested-model NAME] [--requested-provider NAME] [--requested-effort NAME]
+        (--parentless | --parent-id ID) (--tell | --ask)
+        (--stdin | --file PATH | --body TEXT)
+        [--arg ARG]... [--session NAME] [--logical-id ID] [--sender-id ID]
+        [--requested-model NAME] [--requested-provider NAME] [--requested-effort NAME]
+        [--reply-delivery inject|pull]
   adopt --pane ID --terminal ID [--name NAME] [--backend KIND]
        [--logical-id ID] [--session NAME]
   notice (--stdin | --file PATH | --body TEXT)
@@ -620,6 +663,9 @@ Commands:
   retire --incarnation ID [--close-pane]
   waiter-register --name NAME (--parentless | --parent-id ID)
   waiter-retire <alias> | --logical-id ID
+  replies-claim <ask-id>
+  replies <ask-id> --after CURSOR [--lease ID] [--timeout 30s]
+  replies-ack <ask-id> <message-id> --lease ID
 
 Unknown, duplicate, conflicting, or extra arguments fail closed. Ordinary
 bodies should use --stdin or --file. --body is only for short trusted text.
@@ -698,6 +744,9 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "adopt" => parse_adopt(&args[1..]),
         "waiter-register" => parse_waiter_register(&args[1..]),
         "waiter-retire" => parse_waiter_retire(&args[1..]),
+        "replies-claim" => parse_replies_claim(args),
+        "replies" => parse_replies(args),
+        "replies-ack" => parse_replies_ack(args),
         "notice" => {
             let mut tokens = Tokens::new(&args[1..]);
             let body = take_body(&mut tokens, "notice")?;
@@ -743,6 +792,79 @@ fn parse_waiter_retire(args: &[String]) -> Result<Command, String> {
         _ => return Err("waiter-retire requires exactly one of <alias> or --logical-id".into()),
     };
     Ok(Command::WaiterRetire { target })
+}
+
+fn take_reply_delivery(tokens: &mut Tokens<'_>, verb: &str) -> Result<Option<String>, String> {
+    match tokens.take_value("--reply-delivery")? {
+        None => Ok(None),
+        Some(_) if verb == "tell" => Err("tell does not accept --reply-delivery".into()),
+        Some(value) if value == "inject" || value == "pull" => Ok(Some(value)),
+        Some(other) => Err(format!(
+            "--reply-delivery must be inject or pull, not {other}"
+        )),
+    }
+}
+
+fn parse_replies_claim(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let ask_id = tokens
+        .take_positional()
+        .ok_or("replies-claim requires <ask-id>")?;
+    let requester = take_caller(&mut tokens)?;
+    tokens.finish("replies-claim")?;
+    Ok(Command::RepliesClaim { ask_id, requester })
+}
+
+fn parse_replies(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let ask_id = tokens
+        .take_positional()
+        .ok_or("replies requires <ask-id>")?;
+    let after = tokens
+        .take_value("--after")?
+        .ok_or("replies requires --after")?;
+    let lease_id = tokens.take_value("--lease")?;
+    let timeout_ms = match tokens.take_value("--timeout")? {
+        None => None,
+        Some(value) if value == "0" || value == "0s" => Some(0),
+        Some(value) => {
+            let parsed = parse_duration_for("--timeout", &value)?;
+            if parsed > 60_000 {
+                return Err("replies --timeout must be at most 60s".into());
+            }
+            Some(parsed)
+        }
+    };
+    let requester = take_caller(&mut tokens)?;
+    tokens.finish("replies")?;
+    Ok(Command::Replies {
+        ask_id,
+        after,
+        lease_id,
+        timeout_ms,
+        requester,
+    })
+}
+
+fn parse_replies_ack(args: &[String]) -> Result<Command, String> {
+    let mut tokens = Tokens::new(&args[1..]);
+    let ask_id = tokens
+        .take_positional()
+        .ok_or("replies-ack requires <ask-id>")?;
+    let message_id = tokens
+        .take_positional()
+        .ok_or("replies-ack requires <message-id>")?;
+    let lease_id = tokens
+        .take_value("--lease")?
+        .ok_or("replies-ack requires --lease")?;
+    let requester = take_caller(&mut tokens)?;
+    tokens.finish("replies-ack")?;
+    Ok(Command::RepliesAck {
+        ask_id,
+        message_id,
+        lease_id,
+        requester,
+    })
 }
 
 fn parse_clear(args: &[String]) -> Result<Command, String> {
@@ -820,6 +942,7 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
         Some("operator") => return Err("tell does not accept --from".into()),
         Some(_) => return Err("--from only accepts operator".into()),
     };
+    let reply_delivery = take_reply_delivery(&mut tokens, verb)?;
     let positional = tokens.take_positional();
     tokens.finish(verb)?;
     let recipient = match (positional, recipient_id, recipient_incarnation) {
@@ -856,6 +979,7 @@ fn parse_message_command(args: &[String]) -> Result<Command, String> {
             remind_after_ms,
             no_remind,
             from_operator,
+            reply_delivery,
         })
     }
 }
@@ -1284,6 +1408,7 @@ fn take_initial_kind(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_start(args: &[String], handoff: bool) -> Result<Command, String> {
     let command = if handoff { "handoff" } else { "start" };
     let mut tokens = Tokens::new(args);
@@ -1344,6 +1469,23 @@ fn parse_start(args: &[String], handoff: bool) -> Result<Command, String> {
     let requested_provider = problems.value(&mut tokens, "--requested-provider");
     let requested_effort = problems.value(&mut tokens, "--requested-effort");
     let idempotency_key = problems.value(&mut tokens, "--idempotency-key");
+    let reply_delivery = match tokens.take_value("--reply-delivery") {
+        Ok(None) => None,
+        Ok(Some(value)) if value == "inject" || value == "pull" => Some(value),
+        Ok(Some(other)) => {
+            problems.note(format!(
+                "--reply-delivery must be inject or pull, not {other}"
+            ));
+            None
+        }
+        Err(problem) => {
+            problems.note(problem);
+            None
+        }
+    };
+    if reply_delivery.is_some() && initial_kind != "ask" {
+        problems.note("start --reply-delivery is only valid with --ask");
+    }
     problems.resolve(&tokens, command)?;
     // Past resolve every branch above that produced None also noted a problem,
     // so these unwraps restate a check that has already passed.
@@ -1375,6 +1517,7 @@ fn parse_start(args: &[String], handoff: bool) -> Result<Command, String> {
         requested_provider,
         requested_effort,
         supersedes,
+        reply_delivery,
     })))
 }
 
@@ -4017,5 +4160,33 @@ mod tests {
         let bad = parse_invocation(&args(&["ask", "owing", "--from", "relay", "--body", "q"]))
             .expect_err("from");
         assert!(bad.contains("operator"), "{bad}");
+    }
+
+    #[test]
+    fn pull_reply_commands_parse() {
+        let ask = parse_invocation(&args(&[
+            "ask",
+            "reviewer",
+            "--reply-delivery",
+            "pull",
+            "--body",
+            "q",
+        ]))
+        .expect("ask pull");
+        match ask {
+            Invocation::Typed {
+                command: Command::Ask { reply_delivery, .. },
+                ..
+            } => assert_eq!(reply_delivery.as_deref(), Some("pull")),
+            other => panic!("{other:?}"),
+        }
+        parse_invocation(&args(&["replies-claim", "1"])).expect("claim");
+        parse_invocation(&args(&["replies", "1", "--after", "0", "--timeout", "30s"]))
+            .expect("replies");
+        parse_invocation(&args(&["replies-ack", "1", "2", "--lease", "3"])).expect("ack");
+        let too_long =
+            parse_invocation(&args(&["replies", "1", "--after", "0", "--timeout", "61s"]))
+                .expect_err("cap");
+        assert!(too_long.contains("60s"), "{too_long}");
     }
 }

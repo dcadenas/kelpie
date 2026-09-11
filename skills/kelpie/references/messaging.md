@@ -30,7 +30,13 @@ Contents: [Method details](#method-details); [ask vs tell](#ask-vs-tell).
   Delivery is immediate; due-time flags are refused. The returned message ID
   identifies the obligation. Pending-reply reminders default to forty-five minutes;
   use `remind_after_ms` to override or `no_remind: true` to disable them.
-  Becoming idle never bypasses the due time.
+  Becoming idle never bypasses the due time. `--reply-delivery pull` is an
+  opt-in reverse path for that ask only: the ask still injects into the
+  recipient, but progress, final, and waiting-side cancel go to an ask-scoped
+  pull sink instead of the asker's pane. Bare `ask` stays full reverse
+  injection. `socket_inbox` waiters refuse `pull`. The responder cannot set
+  the policy. Poll authorization is the waiting logical agent, not proof the
+  caller is a native subagent.
 - `ask-info`: read an ask by message ID, including original body, parties,
   obligation state, and delivery outcomes for the ask and every reply.
 - `reply`: supply the ask's `reply_to`, `body`, `progress` or `final`, and
@@ -64,12 +70,29 @@ terminal failure permits a fresh attempt. Refused pending, accepted, superseded,
 or unknown outcomes require reconciliation; changing the key must not bypass
 the refusal because the original effect may have landed.
 
-After sending an ask, read its delivery outcome and end the turn. Kelpie pushes
-the correlated answer into the sender's pane, waking it when idle. This applies
-to children and human decisions relayed through agents. Do not sleep, poll
-`pending`, or use `herdr agent wait` for an answer. `pending` lists what you owe;
-Herdr `idle` or `done` is not a reply. Do not invent side work to keep the turn
-open while waiting.
+After sending an ask, read its delivery outcome and end the turn. For the
+default inject path, Kelpie pushes the correlated answer into the sender's pane,
+waking it when idle. This applies to children and human decisions relayed
+through agents. Do not sleep, poll `pending`, or use `herdr agent wait` for an
+answer. `pending` lists what you owe; Herdr `idle` or `done` is not a reply. Do
+not invent side work to keep the turn open while waiting.
+
+When the ask used `--reply-delivery pull`, reverse traffic does not wake the
+asker pane. Claim, poll, and ACK the sink instead:
+
+```sh
+kelpie replies-claim <ask-id>
+kelpie replies <ask-id> --after 0 --lease 1 --timeout 30s
+kelpie replies-ack <ask-id> <message-id> --lease ID
+```
+
+Do not name the read command `await`. Omitted timeout or `--timeout 0` returns
+immediately with `status=pending` when empty. Positive timeout is a bounded
+long-poll, hard cap 60s. Timeout is success with empty events, not a cue to
+busy-loop. Repeating `--after C` must not lose events. A replacement claim
+invalidates the old lease. Stale-lease ACK is `conflict` and does not resolve.
+If the poller disappears, the sink stays durable; there is no fallback inject
+into the parent pane.
 
 Ending the turn leaves the Ready incarnation addressable. If instructed to stay
 up while awaiting a reply, remain idle without parking, retiring, or closing the

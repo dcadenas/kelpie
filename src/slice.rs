@@ -10,7 +10,8 @@ use thiserror::Error;
 use crate::domain::{
     AdoptIntent, DeliveryOutcome, IncarnationId, InitialMessageKind, LogicalAgentId, MessageId,
     MessageKind, ObligationState, OperationId, OperationOutcome, OperatorNoticeId, RenewId,
-    RenewIntent, RenewPhase, RenewStep, RenewTimeout, ReplyDisposition, ScheduleId, StartIntent,
+    RenewIntent, RenewPhase, RenewStep, RenewTimeout, ReplyDelivery, ReplyDisposition, ScheduleId,
+    StartIntent,
 };
 use crate::envelope::{self, EnvelopeError};
 use crate::herdr::{AgentObservation, HerdrClient, HerdrError};
@@ -1432,10 +1433,14 @@ impl Kelpie {
         intent: &StartIntent,
         started: DeclaredStart,
     ) -> Result<(PreparedPrompt, MessageId), SliceError> {
+        let mut initial_message = intent.initial_message.clone();
+        if intent.reply_delivery != ReplyDelivery::Inject {
+            initial_message.reply_delivery = intent.reply_delivery;
+        }
         let message = self.store.create_initial_message(
             started.logical_agent_id,
             started.incarnation_id,
-            &intent.initial_message,
+            &initial_message,
             &format!("{}:initial-message", intent.idempotency_key),
         )?;
         let binding = self.store.ready_binding(started.incarnation_id)?;
@@ -1553,6 +1558,7 @@ impl Kelpie {
             due_at_ms,
             remind_after_ms,
             operator_attributed,
+            ReplyDelivery::Inject,
         )?;
         if let Some(prepared) = prepared {
             self.send_prepared_prompt(&prepared)?;
@@ -1576,6 +1582,7 @@ impl Kelpie {
         due_at_ms: Option<i64>,
         remind_after_ms: Option<i64>,
         operator_attributed: bool,
+        reply_delivery: ReplyDelivery,
     ) -> Result<(CreatedAsk, Option<PreparedPrompt>), SliceError> {
         if let Some(replay) = self.store.replay_prompt_by_idempotency_key(
             idempotency_key,
@@ -1583,6 +1590,13 @@ impl Kelpie {
             sender,
             None,
         )? {
+            let stored = replay.reply_delivery.unwrap_or(ReplyDelivery::Inject);
+            if stored != reply_delivery {
+                return Err(SliceError::Store(StoreError::Conflict(format!(
+                    "idempotency key already recorded reply_delivery {}",
+                    stored.as_str()
+                ))));
+            }
             return Ok((
                 CreatedAsk {
                     message_id: replay.message_id,
@@ -1594,7 +1608,7 @@ impl Kelpie {
         let _binding = self.store.ready_binding(recipient_incarnation)?;
         let (effective_due_at_ms, defer) =
             self.prompt_schedule(recipient_incarnation, due_at_ms)?;
-        let ask = self.store.create_ask_with_schedule(
+        let ask = self.store.create_ask_with_reply_delivery(
             sender,
             recipient,
             recipient_incarnation,
@@ -1603,6 +1617,7 @@ impl Kelpie {
             effective_due_at_ms,
             remind_after_ms,
             operator_attributed,
+            reply_delivery,
         )?;
         if defer {
             return Ok((ask, None));
@@ -3440,18 +3455,19 @@ impl Kelpie {
             .store
             .reply_receive_path(reply_to, requester_agent_id)?;
         let recipient_incarnation = match receive_path {
-            ReplyReceivePath::SocketInbox => {
-                return Ok((
-                    self.store.create_reply_with_due(
-                        reply_to,
-                        requester_agent_id,
-                        body,
-                        disposition,
-                        idempotency_key,
-                        None,
-                    )?,
+            ReplyReceivePath::SocketInbox | ReplyReceivePath::AskPull => {
+                let created = self.store.create_reply_with_due(
+                    reply_to,
+                    requester_agent_id,
+                    body,
+                    disposition,
+                    idempotency_key,
                     None,
-                ));
+                )?;
+                if receive_path == ReplyReceivePath::AskPull {
+                    crate::test_fault::pause("ask_pull_after_persist");
+                }
+                return Ok((created, None));
             }
             ReplyReceivePath::HerdrPrompt(incarnation) => incarnation,
         };
@@ -5942,6 +5958,7 @@ mod tests {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "work".into(),
+                reply_delivery: ReplyDelivery::Inject,
             },
             working_directory: "/tmp/work".into(),
             idempotency_key: "start-e2e".into(),
@@ -5951,6 +5968,7 @@ mod tests {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: ReplyDelivery::Inject,
         }
     }
 

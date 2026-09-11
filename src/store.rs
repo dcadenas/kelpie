@@ -13,7 +13,7 @@ use crate::domain::{
     DeliveryOutcome, DeliveryTransport, IncarnationId, IncarnationState, InitialMessageKind,
     LogicalAgentId, MessageId, MessageKind, ObligationState, OperationId, OperationOutcome,
     OperatorNoticeId, Parent, RenewId, RenewIntent, RenewPhase, RenewStep, RenewTimeout,
-    ReplyDisposition, ScheduleFiringOutcome, ScheduleId, StartIntent,
+    ReplyDelivery, ReplyDisposition, ScheduleFiringOutcome, ScheduleId, StartIntent,
 };
 use crate::herdr::Snapshot;
 
@@ -56,7 +56,7 @@ fn optional_id_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Stri
         .transpose()
 }
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 /// Backstop interval for unanswered asks, including initial launch asks.
 pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 2_700_000;
 
@@ -232,6 +232,7 @@ pub struct PromptOperationReplay {
     pub disposition: Option<ReplyDisposition>,
     pub obligation_state: Option<ObligationState>,
     pub remind_after_ms: Option<i64>,
+    pub reply_delivery: Option<ReplyDelivery>,
     pub intent: serde_json::Value,
 }
 
@@ -275,6 +276,33 @@ pub struct SocketInboxDelivery {
     pub sender_public_name: Option<String>,
 }
 
+/// One reverse event on an ask-scoped pull sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskPullEvent {
+    pub message_id: MessageId,
+    pub kind: MessageKind,
+    pub body: String,
+    pub reply_to: Option<MessageId>,
+    pub disposition: Option<ReplyDisposition>,
+    pub sender_agent_id: Option<LogicalAgentId>,
+    pub sender_public_name: Option<String>,
+}
+
+/// Live lease for one pull-ask sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimedAskPullLease {
+    pub lease_id: i64,
+    pub ask_message_id: MessageId,
+}
+
+/// Non-destructive poll of one ask-pull log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskPullPoll {
+    pub status: &'static str,
+    pub cursor: i64,
+    pub events: Vec<AskPullEvent>,
+}
+
 /// IDs atomically created for one tell and its delivery operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedTell {
@@ -292,7 +320,7 @@ pub struct CreatedSocketTell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedReply {
     pub message_id: MessageId,
-    /// Present for `herdr_prompt` waiters. Socket-inbox replies have no operation.
+    /// Present for `herdr_prompt` waiters. Socket-inbox and ask-pull replies have no operation.
     pub operation_id: Option<OperationId>,
     /// Exact Ready incarnation of a `herdr_prompt` waiter selected at send time.
     pub recipient_incarnation: Option<IncarnationId>,
@@ -306,6 +334,8 @@ pub enum ReplyReceivePath {
     HerdrPrompt(IncarnationId),
     /// Waiting agent's socket inbox, with no Herdr prompt.
     SocketInbox,
+    /// Ask-scoped pull sink. No Herdr prompt and no parent-pane wake.
+    AskPull,
 }
 
 /// Which occupant a Kelpie-authored cancellation notice is for.
@@ -1919,6 +1949,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns a conflict for an invalid sender, recipient, or operator ask.
+    #[allow(clippy::too_many_lines)]
     pub fn create_initial_message(
         &mut self,
         recipient: LogicalAgentId,
@@ -1929,6 +1960,11 @@ impl Store {
         if intent.kind == InitialMessageKind::Ask && intent.sender.is_none() {
             return Err(StoreError::Conflict(
                 "an operator-attributed initial ask needs an agent waiting identity".into(),
+            ));
+        }
+        if intent.kind != InitialMessageKind::Ask && intent.reply_delivery == ReplyDelivery::Pull {
+            return Err(StoreError::Conflict(
+                "reply_delivery pull is only valid on an ask".into(),
             ));
         }
         let now = now_millis()?;
@@ -1956,6 +1992,17 @@ impl Store {
                     "initial-message sender logical agent is absent".into(),
                 ));
             }
+            if intent.kind == InitialMessageKind::Ask
+                && intent.reply_delivery == ReplyDelivery::Pull
+            {
+                let waiting = waiter_identity(&tx, sender)?;
+                if waiting.transport == DeliveryTransport::SocketInbox {
+                    return Err(StoreError::Conflict(
+                        "socket_inbox waiters already have a sink and refuse reply_delivery pull"
+                            .into(),
+                    ));
+                }
+            }
         }
         let kind = match intent.kind {
             InitialMessageKind::Tell => "tell",
@@ -1980,7 +2027,14 @@ impl Store {
             .sender
             .filter(|_| intent.kind == InitialMessageKind::Ask)
         {
-            insert_obligation(&tx, message_id, recipient, sender, now)?;
+            insert_obligation(
+                &tx,
+                message_id,
+                recipient,
+                sender,
+                now,
+                intent.reply_delivery,
+            )?;
             tx.execute(
                 "INSERT INTO obligation_reminders (ask_message_id, interval_ms) VALUES (?1, ?2)",
                 params![message_id.to_string(), DEFAULT_REMINDER_INTERVAL_MS],
@@ -2550,6 +2604,256 @@ impl Store {
         Ok(message_id)
     }
 
+    /// Reverse-path policy recorded on one obligation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the obligation is absent.
+    pub fn obligation_reply_delivery(
+        &self,
+        ask_message_id: MessageId,
+    ) -> Result<ReplyDelivery, StoreError> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT reply_delivery FROM obligations WHERE ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(value) = value else {
+            return Err(StoreError::Conflict("obligation is absent".into()));
+        };
+        parse_reply_delivery(&value)
+    }
+
+    /// Claim or rotate the pull-sink lease for one ask.
+    ///
+    /// Replacement invalidates the previous lease. Authorization is the waiting
+    /// logical agent, not proof of a native subagent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the ask is absent, is not pull, or the caller is
+    /// not the waiting agent.
+    pub fn claim_ask_pull_lease(
+        &mut self,
+        ask_message_id: MessageId,
+        requester_agent_id: LogicalAgentId,
+    ) -> Result<ClaimedAskPullLease, StoreError> {
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        require_pull_waiter(&tx, ask_message_id, requester_agent_id)?;
+        tx.execute(
+            "DELETE FROM ask_pull_leases WHERE ask_message_id = ?1",
+            [ask_message_id.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO ask_pull_leases (ask_message_id, waiting_agent_id, claimed_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![
+                ask_message_id.to_string(),
+                requester_agent_id.to_string(),
+                now
+            ],
+        )?;
+        let lease_id = tx.last_insert_rowid();
+        if lease_id <= 0 {
+            return Err(StoreError::InvalidRecord(
+                "SQLite returned an invalid ask_pull lease id".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(ClaimedAskPullLease {
+            lease_id,
+            ask_message_id,
+        })
+    }
+
+    /// Non-destructive log of reverse events for one pull ask after `cursor`.
+    ///
+    /// Cursor `0` reads from the beginning. Repeating the same cursor must not
+    /// lose events. ACK does not delete rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the ask is absent, is not pull, or the caller is
+    /// not the waiting agent.
+    pub fn poll_ask_pull(
+        &self,
+        ask_message_id: MessageId,
+        requester_agent_id: LogicalAgentId,
+        after: i64,
+        lease_id: Option<i64>,
+    ) -> Result<AskPullPoll, StoreError> {
+        if after < 0 {
+            return Err(StoreError::InvalidRecord(
+                "replies cursor must not be negative".into(),
+            ));
+        }
+        require_pull_waiter(&self.connection, ask_message_id, requester_agent_id)?;
+        if let Some(lease_id) = lease_id {
+            require_live_ask_pull_lease(
+                &self.connection,
+                ask_message_id,
+                requester_agent_id,
+                lease_id,
+            )?;
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.kind, m.body, m.reply_to_message_id, m.disposition,
+                    m.sender_agent_id, s.public_name
+               FROM deliveries d
+               JOIN messages m ON m.id = d.message_id
+               LEFT JOIN logical_agents s ON s.id = m.sender_agent_id
+              WHERE d.delivery_transport = 'ask_pull'
+                AND d.recipient_agent_id = ?1
+                AND m.id > ?3
+                AND (
+                      m.reply_to_message_id = ?2
+                      OR m.id = (
+                        SELECT cancellation_response_message_id FROM obligations
+                         WHERE ask_message_id = ?2
+                      )
+                    )
+              ORDER BY m.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                requester_agent_id.to_string(),
+                ask_message_id.to_string(),
+                after
+            ],
+            |row| {
+                Ok((
+                    id_text(row, 0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    optional_id_text(row, 3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    optional_id_text(row, 5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (
+                message_id,
+                kind,
+                body,
+                reply_to,
+                disposition,
+                sender_agent_id,
+                sender_public_name,
+            ) = row?;
+            events.push(AskPullEvent {
+                message_id: parse_message_id(&message_id)?,
+                kind: parse_message_kind(&kind)?,
+                body,
+                reply_to: reply_to.as_deref().map(parse_message_id).transpose()?,
+                disposition: disposition
+                    .as_deref()
+                    .map(parse_reply_disposition)
+                    .transpose()?,
+                sender_agent_id: sender_agent_id
+                    .as_deref()
+                    .map(parse_logical_agent_id)
+                    .transpose()?,
+                sender_public_name,
+            });
+        }
+        if events.is_empty() {
+            return Ok(AskPullPoll {
+                status: "pending",
+                cursor: after,
+                events,
+            });
+        }
+        let cursor = events
+            .last()
+            .map(|event| message_id_as_i64(event.message_id))
+            .transpose()?
+            .unwrap_or(after);
+        Ok(AskPullPoll {
+            status: "ok",
+            cursor,
+            events,
+        })
+    }
+
+    /// Acknowledge one ask-pull delivery under a live lease.
+    ///
+    /// Persist is not acceptance. Final ACK with a live lease resolves once.
+    /// Progress ACK never resolves. Stale-lease ACK is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict for a non-owner, a stale lease, or a delivery that is
+    /// not a queued or already-accepted ask-pull row for that ask.
+    pub fn ack_ask_pull_delivery(
+        &mut self,
+        ask_message_id: MessageId,
+        requester_agent_id: LogicalAgentId,
+        message_id: MessageId,
+        lease_id: i64,
+    ) -> Result<DeliveryOutcome, StoreError> {
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        require_pull_waiter(&tx, ask_message_id, requester_agent_id)?;
+        require_live_ask_pull_lease(&tx, ask_message_id, requester_agent_id, lease_id)?;
+        let outcome: Option<String> = tx
+            .query_row(
+                "SELECT d.outcome
+                   FROM deliveries d
+                   JOIN messages m ON m.id = d.message_id
+                  WHERE d.message_id = ?1
+                    AND d.recipient_agent_id = ?2
+                    AND d.delivery_transport = 'ask_pull'
+                    AND (
+                          m.reply_to_message_id = ?3
+                          OR m.id = (
+                            SELECT cancellation_response_message_id FROM obligations
+                             WHERE ask_message_id = ?3
+                          )
+                        )",
+                params![
+                    message_id.to_string(),
+                    requester_agent_id.to_string(),
+                    ask_message_id.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match outcome.as_deref() {
+            Some("accepted") => {
+                resolve_ask_pull_final_reply(&tx, ask_message_id, message_id, now)?;
+                tx.commit()?;
+                Ok(DeliveryOutcome::Accepted)
+            }
+            Some("queued") => {
+                tx.execute(
+                    "UPDATE deliveries
+                        SET outcome = 'accepted', resolved_at_ms = ?1
+                      WHERE message_id = ?2
+                        AND recipient_agent_id = ?3
+                        AND delivery_transport = 'ask_pull'
+                        AND outcome = 'queued'",
+                    params![now, message_id.to_string(), requester_agent_id.to_string()],
+                )?;
+                resolve_ask_pull_final_reply(&tx, ask_message_id, message_id, now)?;
+                tx.commit()?;
+                Ok(DeliveryOutcome::Accepted)
+            }
+            Some(other) => Err(StoreError::Conflict(format!(
+                "ask-pull delivery {message_id} for {ask_message_id} is {other}"
+            ))),
+            None => Err(StoreError::Conflict(format!(
+                "no ask-pull delivery {message_id} for ask {ask_message_id}"
+            ))),
+        }
+    }
+
     /// Read the delivery transport recorded at logical-agent creation.
     ///
     /// # Errors
@@ -2643,6 +2947,7 @@ impl Store {
     /// Persist an ask with optional delivery and reply-reminder schedules.
     ///
     /// The reminder remains unarmed until the original ask delivery is accepted.
+    /// Reverse traffic defaults to pane inject.
     ///
     /// # Errors
     ///
@@ -2659,6 +2964,41 @@ impl Store {
         remind_after_ms: Option<i64>,
         operator_attributed: bool,
     ) -> Result<CreatedAsk, StoreError> {
+        self.create_ask_with_reply_delivery(
+            sender,
+            recipient,
+            recipient_incarnation,
+            body,
+            idempotency_key,
+            due_at_ms,
+            remind_after_ms,
+            operator_attributed,
+            ReplyDelivery::Inject,
+        )
+    }
+
+    /// Persist an ask and its immutable reverse-path policy.
+    ///
+    /// `pull` is refused for `socket_inbox` waiters. Replay of the same key
+    /// keeps the stored policy; a different policy is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identities, times, reminder intervals, or
+    /// a pull policy on a socket waiter.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn create_ask_with_reply_delivery(
+        &mut self,
+        sender: LogicalAgentId,
+        recipient: LogicalAgentId,
+        recipient_incarnation: IncarnationId,
+        body: &str,
+        idempotency_key: &str,
+        due_at_ms: Option<i64>,
+        remind_after_ms: Option<i64>,
+        operator_attributed: bool,
+        reply_delivery: ReplyDelivery,
+    ) -> Result<CreatedAsk, StoreError> {
         if remind_after_ms.is_some_and(|value| value <= 0) {
             return Err(StoreError::Conflict(
                 "reminder interval must be greater than zero".into(),
@@ -2667,6 +3007,13 @@ impl Store {
         if let Some(replay) =
             self.replay_prompt_by_idempotency_key(idempotency_key, MessageKind::Ask, sender, None)?
         {
+            let stored = replay.reply_delivery.unwrap_or(ReplyDelivery::Inject);
+            if stored != reply_delivery {
+                return Err(StoreError::Conflict(format!(
+                    "idempotency key already recorded reply_delivery {}",
+                    stored.as_str()
+                )));
+            }
             return Ok(CreatedAsk {
                 message_id: replay.message_id,
                 operation_id: replay.operation_id,
@@ -2698,6 +3045,13 @@ impl Store {
                 "socket waiter {sender} is no longer a delivery target"
             )));
         }
+        if reply_delivery == ReplyDelivery::Pull
+            && waiting.transport == DeliveryTransport::SocketInbox
+        {
+            return Err(StoreError::Conflict(
+                "socket_inbox waiters already have a sink and refuse reply_delivery pull".into(),
+            ));
+        }
         let message_sender = if operator_attributed {
             None
         } else {
@@ -2710,7 +3064,7 @@ impl Store {
             params![message_sender, recipient.to_string(), body, now],
         )?;
         let message_id = last_insert_id!(tx, MessageId);
-        insert_obligation(&tx, message_id, recipient, sender, now)?;
+        insert_obligation(&tx, message_id, recipient, sender, now, reply_delivery)?;
         if let Some(interval_ms) = remind_after_ms {
             tx.execute(
                 "INSERT INTO obligation_reminders (ask_message_id, interval_ms)
@@ -3404,6 +3758,53 @@ impl Store {
         .collect()
     }
 
+    fn replay_ask_pull_reply(
+        &self,
+        idempotency_key: &str,
+        requester_agent_id: LogicalAgentId,
+        reply_to: MessageId,
+    ) -> Result<Option<CreatedReply>, StoreError> {
+        let row: Option<(String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT k.message_id, m.disposition, m.sender_agent_id
+                   FROM ask_pull_keys k
+                   JOIN messages m ON m.id = k.message_id
+                  WHERE k.idempotency_key = ?1",
+                [idempotency_key],
+                |row| Ok((id_text(row, 0)?, row.get(1)?, id_text(row, 2)?)),
+            )
+            .optional()?;
+        let Some((message_id, disposition, sender)) = row else {
+            return Ok(None);
+        };
+        if sender != requester_agent_id.to_string() {
+            return Err(StoreError::Conflict(
+                "idempotency key already exists".into(),
+            ));
+        }
+        let message_id = parse_message_id(&message_id)?;
+        let correlated: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT reply_to_message_id FROM messages WHERE id = ?1",
+                [message_id.to_string()],
+                |row| id_text(row, 0),
+            )
+            .optional()?;
+        if correlated.as_deref() != Some(&reply_to.to_string()) {
+            return Err(StoreError::Conflict(
+                "idempotency key already exists".into(),
+            ));
+        }
+        Ok(Some(CreatedReply {
+            message_id,
+            operation_id: None,
+            recipient_incarnation: None,
+            disposition: parse_reply_disposition(&disposition)?,
+        }))
+    }
+
     /// Persist a correlated progress or final reply and its delivery intent.
     ///
     /// The ask message ID alone resolves the exact owing sender and waiting
@@ -3470,16 +3871,22 @@ impl Store {
                 })?,
             });
         }
+        if let Some(replay) =
+            self.replay_ask_pull_reply(idempotency_key, requester_agent_id, reply_to)?
+        {
+            return Ok(replay);
+        }
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
-        let owners: Option<(String, String, String)> = tx
+        let owners: Option<(String, String, String, String)> = tx
             .query_row(
-                "SELECT owing_agent_id, waiting_agent_id, state FROM obligations WHERE ask_message_id = ?1",
+                "SELECT owing_agent_id, waiting_agent_id, state, reply_delivery
+                 FROM obligations WHERE ask_message_id = ?1",
                 [reply_to.to_string()],
-                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((owing, waiting, state)) = owners else {
+        let Some((owing, waiting, state, reply_delivery)) = owners else {
             return Err(StoreError::Conflict(
                 "reply_to does not name an obligation".into(),
             ));
@@ -3518,6 +3925,23 @@ impl Store {
             ],
         )?;
         let message_id = last_insert_id!(tx, MessageId);
+        if reply_delivery == "pull" {
+            queue_ask_pull_delivery(&tx, message_id, waiting_agent, now)?;
+            tx.execute(
+                "INSERT INTO ask_pull_keys (idempotency_key, message_id)
+                 VALUES (?1, ?2)",
+                params![idempotency_key, message_id.to_string()],
+            )
+            .map_err(map_constraint)?;
+            apply_reply_obligation_activity(&tx, reply_to, disposition, now)?;
+            tx.commit()?;
+            return Ok(CreatedReply {
+                message_id,
+                operation_id: None,
+                recipient_incarnation: None,
+                disposition,
+            });
+        }
         match waiting_identity.transport {
             DeliveryTransport::SocketInbox => {
                 queue_socket_inbox_delivery(&tx, message_id, waiting_agent, now)?;
@@ -3537,6 +3961,11 @@ impl Store {
                 });
             }
             DeliveryTransport::HerdrPrompt => {}
+            DeliveryTransport::AskPull => {
+                return Err(StoreError::InvalidRecord(format!(
+                    "logical agent {waiting_agent} cannot have delivery_transport ask_pull"
+                )));
+            }
         }
         let recipient_incarnation = ready_incarnation_for_agent(&tx, waiting_agent)?;
         let intent = serde_json::json!({
@@ -3596,16 +4025,16 @@ impl Store {
         reply_to: MessageId,
         requester_agent_id: LogicalAgentId,
     ) -> Result<ReplyReceivePath, StoreError> {
-        let parties: Option<(String, String)> = self
+        let parties: Option<(String, String, String)> = self
             .connection
             .query_row(
-                "SELECT waiting_agent_id, owing_agent_id FROM obligations
+                "SELECT waiting_agent_id, owing_agent_id, reply_delivery FROM obligations
                  WHERE ask_message_id = ?1 AND state IN ('open','in_progress')",
                 [reply_to.to_string()],
-                |row| Ok((id_text(row, 0)?, id_text(row, 1)?)),
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((waiting, owing)) = parties else {
+        let Some((waiting, owing, reply_delivery)) = parties else {
             return Err(StoreError::Conflict(
                 "reply_to does not name an open obligation".into(),
             ));
@@ -3624,6 +4053,9 @@ impl Store {
             )));
         }
         let waiting = parse_logical_agent_id(&waiting)?;
+        if reply_delivery == "pull" {
+            return Ok(ReplyReceivePath::AskPull);
+        }
         let identity = waiter_identity(&self.connection, waiting)?;
         if identity.ended {
             return Err(StoreError::Conflict(format!(
@@ -3636,6 +4068,9 @@ impl Store {
                 ready_incarnation_for_agent(&self.connection, waiting)
                     .map(ReplyReceivePath::HerdrPrompt)
             }
+            DeliveryTransport::AskPull => Err(StoreError::InvalidRecord(format!(
+                "logical agent {waiting} cannot have delivery_transport ask_pull"
+            ))),
         }
     }
 
@@ -4295,6 +4730,17 @@ impl Store {
                 .map(parse_obligation_state)
                 .transpose()?,
             remind_after_ms,
+            reply_delivery: if actual_kind == MessageKind::Ask {
+                Some(self.obligation_reply_delivery(parse_message_id(
+                    message_id.as_deref().ok_or_else(|| {
+                        StoreError::InvalidRecord(format!(
+                            "succeeded prompt operation {operation_id} has no message"
+                        ))
+                    })?,
+                )?)?)
+            } else {
+                None
+            },
             intent: serde_json::from_str(&intent).map_err(|error| invalid_json(&error))?,
         }))
     }
@@ -9111,18 +9557,20 @@ fn insert_obligation(
     owing_agent_id: LogicalAgentId,
     waiting_agent_id: LogicalAgentId,
     now: i64,
+    reply_delivery: ReplyDelivery,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO obligations
          (ask_message_id, owing_agent_id, waiting_agent_id, creation_sequence,
-          created_at_ms, last_activity_at_ms, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'open')",
+          created_at_ms, last_activity_at_ms, state, reply_delivery)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'open', ?6)",
         params![
             ask_message_id.to_string(),
             owing_agent_id.to_string(),
             waiting_agent_id.to_string(),
             next_obligation_sequence(tx)?,
-            now
+            now,
+            reply_delivery.as_str()
         ],
     )?;
     Ok(())
@@ -9411,6 +9859,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 29 {
         connection.execute_batch(include_str!("../migrations/030_integer_ids.sql"))?;
         version = 30;
+    }
+    if version == 30 {
+        connection.execute_batch(include_str!("../migrations/031_ask_pull.sql"))?;
+        version = 31;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
@@ -9770,10 +10222,135 @@ fn parse_delivery_transport(value: &str) -> Result<DeliveryTransport, StoreError
     match value {
         "herdr_prompt" => Ok(DeliveryTransport::HerdrPrompt),
         "socket_inbox" => Ok(DeliveryTransport::SocketInbox),
+        "ask_pull" => Ok(DeliveryTransport::AskPull),
         other => Err(StoreError::InvalidRecord(format!(
             "unknown delivery_transport {other}"
         ))),
     }
+}
+
+fn parse_reply_delivery(value: &str) -> Result<ReplyDelivery, StoreError> {
+    match value {
+        "inject" => Ok(ReplyDelivery::Inject),
+        "pull" => Ok(ReplyDelivery::Pull),
+        other => Err(StoreError::InvalidRecord(format!(
+            "unknown reply_delivery {other}"
+        ))),
+    }
+}
+
+fn message_id_as_i64(id: MessageId) -> Result<i64, StoreError> {
+    id.to_string()
+        .parse()
+        .map_err(|_| StoreError::InvalidRecord(format!("invalid message id {id}")))
+}
+
+fn obligation_reply_delivery(
+    conn: &Connection,
+    ask_message_id: MessageId,
+) -> Result<ReplyDelivery, StoreError> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT reply_delivery FROM obligations WHERE ask_message_id = ?1",
+            [ask_message_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(value) = value else {
+        return Err(StoreError::Conflict("obligation is absent".into()));
+    };
+    parse_reply_delivery(&value)
+}
+
+fn require_pull_waiter(
+    conn: &Connection,
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+) -> Result<(), StoreError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT waiting_agent_id, reply_delivery FROM obligations
+             WHERE ask_message_id = ?1",
+            [ask_message_id.to_string()],
+            |row| Ok((id_text(row, 0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((waiting, reply_delivery)) = row else {
+        return Err(StoreError::Conflict("obligation is absent".into()));
+    };
+    if reply_delivery != "pull" {
+        return Err(StoreError::Conflict("ask is not a pull reply sink".into()));
+    }
+    if waiting != requester_agent_id.to_string() {
+        return Err(StoreError::Conflict(
+            "only the waiting agent can poll or ack this pull sink".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_live_ask_pull_lease(
+    conn: &Connection,
+    ask_message_id: MessageId,
+    requester_agent_id: LogicalAgentId,
+    lease_id: i64,
+) -> Result<(), StoreError> {
+    let live: Option<i64> = conn
+        .query_row(
+            "SELECT lease_id FROM ask_pull_leases
+              WHERE ask_message_id = ?1 AND waiting_agent_id = ?2",
+            params![ask_message_id.to_string(), requester_agent_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match live {
+        Some(current) if current == lease_id => Ok(()),
+        Some(_) => Err(StoreError::Conflict("ask-pull lease is stale".into())),
+        None => Err(StoreError::Conflict("ask-pull lease is absent".into())),
+    }
+}
+
+fn queue_ask_pull_delivery(
+    tx: &Transaction<'_>,
+    message_id: MessageId,
+    recipient_agent_id: LogicalAgentId,
+    now: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO deliveries
+         (message_id, delivery_transport, recipient_incarnation_id, recipient_agent_id,
+          attempt_number, scheduled_at_ms, outcome)
+         VALUES (?1, 'ask_pull', NULL, ?2, 1, ?3, 'queued')",
+        params![message_id.to_string(), recipient_agent_id.to_string(), now],
+    )?;
+    Ok(())
+}
+
+fn resolve_ask_pull_final_reply(
+    tx: &Transaction<'_>,
+    ask_message_id: MessageId,
+    message_id: MessageId,
+    now: i64,
+) -> Result<(), StoreError> {
+    let final_reply: Option<String> = tx
+        .query_row(
+            "SELECT id FROM messages
+              WHERE id = ?1 AND kind = 'reply' AND disposition = 'final'
+                AND reply_to_message_id = ?2",
+            params![message_id.to_string(), ask_message_id.to_string()],
+            |row| id_text(row, 0),
+        )
+        .optional()?;
+    let Some(resolving_message_id) = final_reply else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE obligations SET state = 'resolved', last_activity_at_ms = ?1,
+         resolving_message_id = ?2
+         WHERE ask_message_id = ?3 AND state IN ('open', 'in_progress')",
+        params![now, resolving_message_id, ask_message_id.to_string()],
+    )?;
+    Ok(())
 }
 
 struct WaiterIdentity {
@@ -9994,29 +10571,41 @@ fn record_cancellation_side(
     )?;
     let message_id = last_insert_id!(tx, MessageId);
     let identity = waiter_identity(tx, recipient_agent)?;
-    let delivery = match identity.transport {
-        DeliveryTransport::SocketInbox => {
-            if !identity.ended {
-                queue_socket_inbox_delivery(tx, message_id, recipient_agent, now)?;
-            }
-            None
-        }
-        DeliveryTransport::HerdrPrompt => {
-            match optional_ready_incarnation(tx, recipient_agent, ambiguous_ready)? {
-                Some(recipient_incarnation) => {
-                    let operation_id = insert_cancellation_prompt(
-                        tx,
-                        message_id,
-                        ask_message_id,
-                        reason,
-                        recipient_incarnation,
-                        audience,
-                        due_at_ms,
-                        now,
-                    )?;
-                    Some((operation_id, recipient_incarnation))
+    let pull_waiting = audience == CancellationAudience::Waiting
+        && obligation_reply_delivery(tx, ask_message_id)? == ReplyDelivery::Pull;
+    let delivery = if pull_waiting {
+        queue_ask_pull_delivery(tx, message_id, recipient_agent, now)?;
+        None
+    } else {
+        match identity.transport {
+            DeliveryTransport::SocketInbox => {
+                if !identity.ended {
+                    queue_socket_inbox_delivery(tx, message_id, recipient_agent, now)?;
                 }
-                None => None,
+                None
+            }
+            DeliveryTransport::HerdrPrompt => {
+                match optional_ready_incarnation(tx, recipient_agent, ambiguous_ready)? {
+                    Some(recipient_incarnation) => {
+                        let operation_id = insert_cancellation_prompt(
+                            tx,
+                            message_id,
+                            ask_message_id,
+                            reason,
+                            recipient_incarnation,
+                            audience,
+                            due_at_ms,
+                            now,
+                        )?;
+                        Some((operation_id, recipient_incarnation))
+                    }
+                    None => None,
+                }
+            }
+            DeliveryTransport::AskPull => {
+                return Err(StoreError::InvalidRecord(format!(
+                    "logical agent {recipient_agent} cannot have delivery_transport ask_pull"
+                )));
             }
         }
     };
@@ -10286,6 +10875,7 @@ mod tests {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "work".into(),
+                reply_delivery: crate::domain::ReplyDelivery::Inject,
             },
             working_directory: "/tmp/work".into(),
             idempotency_key: key.into(),
@@ -10295,6 +10885,7 @@ mod tests {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: crate::domain::ReplyDelivery::Inject,
         }
     }
 
@@ -11515,7 +12106,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("version"),
-            30
+            SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -11990,6 +12581,7 @@ mod tests {
                     sender: Some(sender.logical_agent_id),
                     kind: InitialMessageKind::Ask,
                     body: "explicit question".into(),
+                    reply_delivery: crate::domain::ReplyDelivery::Inject,
                 },
                 "initial-ask",
             )

@@ -79,6 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_command_ids(command: &Command) -> Result<(), String> {
     match command {
         Command::Tell {
@@ -138,7 +139,8 @@ fn validate_command_ids(command: &Command) -> Result<(), String> {
         | Command::ReminderInterval {
             ask_id, requester, ..
         }
-        | Command::ReminderDisable { ask_id, requester } => {
+        | Command::ReminderDisable { ask_id, requester }
+        | Command::RepliesClaim { ask_id, requester } => {
             validate_id("ask_message_id", ask_id)?;
             validate_caller(requester.as_ref())
         }
@@ -170,12 +172,49 @@ fn validate_command_ids(command: &Command) -> Result<(), String> {
             AgentTarget::Alias(_) => Ok(()),
         },
         Command::AskInfo { ask_id } => validate_id("ask_message_id", ask_id),
+        Command::Replies {
+            ask_id,
+            after,
+            lease_id,
+            requester,
+            ..
+        } => {
+            validate_id("ask_message_id", ask_id)?;
+            validate_cursor("after", after)?;
+            if let Some(lease_id) = lease_id {
+                validate_id("lease_id", lease_id)?;
+            }
+            validate_caller(requester.as_ref())
+        }
+        Command::RepliesAck {
+            ask_id,
+            message_id,
+            lease_id,
+            requester,
+        } => {
+            validate_id("ask_message_id", ask_id)?;
+            validate_id("message_id", message_id)?;
+            validate_id("lease_id", lease_id)?;
+            validate_caller(requester.as_ref())
+        }
         Command::Recover
         | Command::Report { .. }
         | Command::NameInfo { .. }
         | Command::Notice { .. }
         | Command::Notices => Ok(()),
     }
+}
+
+fn validate_cursor(name: &str, text: &str) -> Result<(), String> {
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{name} must be a non-negative decimal integer"));
+    }
+    text.parse::<u64>()
+        .map(|_| ())
+        .map_err(|_| format!("{name} must be a non-negative decimal integer"))
 }
 
 fn validate_id(name: &str, text: &str) -> Result<(), String> {
@@ -325,6 +364,7 @@ fn build_typed(
             remind_after_ms,
             no_remind,
             from_operator,
+            reply_delivery,
         } => Ok(("ask".into(), {
             let mut params = message_command(
                 socket,
@@ -343,6 +383,9 @@ fn build_typed(
             }
             if from_operator {
                 params["from_operator"] = json!(true);
+            }
+            if let Some(reply_delivery) = reply_delivery {
+                params["reply_delivery"] = json!(reply_delivery);
             }
             params
         })),
@@ -453,6 +496,7 @@ fn build_typed(
                 requested_provider,
                 requested_effort,
                 mut supersedes,
+                reply_delivery,
             } = *start;
             if let Some(alias) = supersedes
                 .as_deref()
@@ -516,7 +560,13 @@ fn build_typed(
             }
             if let Some(predecessor) = supersedes {
                 params["supersedes"] = json!(predecessor);
+                if let Some(reply_delivery) = reply_delivery {
+                    params["reply_delivery"] = json!(reply_delivery);
+                }
                 return Ok(("handoff".into(), params));
+            }
+            if let Some(reply_delivery) = reply_delivery {
+                params["reply_delivery"] = json!(reply_delivery);
             }
             Ok(("start".into(), params))
         }
@@ -688,6 +738,58 @@ fn build_typed(
                 AgentTarget::Alias(alias) => json!({ "alias": alias }),
             },
         )),
+        Command::RepliesClaim { ask_id, requester } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            Ok((
+                "replies.claim".into(),
+                json!({
+                    "ask_message_id": ask_id,
+                    "requester_agent_id": agent,
+                }),
+            ))
+        }
+        Command::Replies {
+            ask_id,
+            after,
+            lease_id,
+            timeout_ms,
+            requester,
+        } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            let after: i64 = after.parse().map_err(|_| "after must be an integer")?;
+            let mut params = json!({
+                "ask_message_id": ask_id,
+                "requester_agent_id": agent,
+                "after": after,
+            });
+            if let Some(lease_id) = lease_id {
+                let lease_id: i64 = lease_id
+                    .parse()
+                    .map_err(|_| "lease_id must be an integer")?;
+                params["lease_id"] = json!(lease_id);
+            }
+            if let Some(timeout_ms) = timeout_ms {
+                params["timeout_ms"] = json!(timeout_ms);
+            }
+            Ok(("replies".into(), params))
+        }
+        Command::RepliesAck {
+            ask_id,
+            message_id,
+            lease_id,
+            requester,
+        } => {
+            let agent = resolve_caller(socket, requester, request_id)?.0;
+            Ok((
+                "replies.ack".into(),
+                json!({
+                    "ask_message_id": ask_id,
+                    "requester_agent_id": agent,
+                    "message_id": message_id,
+                    "lease_id": lease_id.parse::<i64>().map_err(|_| "lease_id must be an integer")?,
+                }),
+            ))
+        }
     }
 }
 

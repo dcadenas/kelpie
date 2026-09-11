@@ -141,6 +141,7 @@ fn start_request(id: &str) -> Value {
                 sender: None,
                 kind: InitialMessageKind::Tell,
                 body: "initial work".into(),
+                reply_delivery: kelpie::domain::ReplyDelivery::Inject,
             },
             working_directory: "/tmp/work".into(),
             idempotency_key: format!("{id}-key"),
@@ -150,6 +151,7 @@ fn start_request(id: &str) -> Value {
             requested_model: None,
             requested_provider: None,
             requested_effort: None,
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         }
     })
 }

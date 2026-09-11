@@ -31,6 +31,7 @@ fn intent(name: &str, terminal: &str, key: &str) -> StartIntent {
             sender: None,
             kind: InitialMessageKind::Tell,
             body: "work".into(),
+            reply_delivery: kelpie::domain::ReplyDelivery::Inject,
         },
         working_directory: "/tmp/work".into(),
         idempotency_key: key.into(),
@@ -40,6 +41,7 @@ fn intent(name: &str, terminal: &str, key: &str) -> StartIntent {
         requested_model: None,
         requested_provider: None,
         requested_effort: None,
+        reply_delivery: kelpie::domain::ReplyDelivery::Inject,
     }
 }
 
