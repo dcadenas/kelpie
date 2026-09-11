@@ -20,6 +20,12 @@ the part that cannot be undone.
 Restarting a service is an external effect. Confirm before doing it unless the
 request already said to.
 
+The repo recipe is `just deploy`: it discovers the user unit, backs up the
+database, builds `--release`, installs every `kelpie`/`kelpied` on PATH plus
+the unit's `ExecStart`, restarts, and checks version plus schema. `just
+release-push` runs it after the GitHub tag exists so a cut release also
+replaces the daemon on this machine.
+
 ## Find what is actually running
 
 Never assume the layout. Read it:

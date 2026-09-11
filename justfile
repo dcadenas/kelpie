@@ -148,6 +148,79 @@ _verify-license:
         exit 1
     fi
 
+# Install this tree's release binaries onto the running user kelpied and restart it.
+# Discovers the unit's database, socket, and install path rather than assuming them.
+# `just release-push` runs this after the tag is on GitHub.
+deploy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! systemctl --user cat kelpied >/dev/null 2>&1; then
+        echo "deploy: no user unit kelpied" >&2
+        exit 1
+    fi
+    unit=$(systemctl --user cat kelpied)
+    database=$(printf '%s\n' "${unit}" | awk '/--database/{print $2; exit}')
+    socket=$(printf '%s\n' "${unit}" | awk '/--socket/{print $2; exit}')
+    execstart=$(printf '%s\n' "${unit}" | awk '/^ExecStart=/{sub(/^ExecStart=/,""); print $1; exit}')
+    if [[ -z "${database}" || -z "${socket}" || -z "${execstart}" ]]; then
+        echo "deploy: could not read ExecStart/--database/--socket from kelpied unit" >&2
+        exit 1
+    fi
+    schema=$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' src/store.rs)
+    version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+    before_version=$(kelpie --version 2>/dev/null || true)
+    before_schema=$(sqlite3 -readonly "${database}" "PRAGMA user_version;")
+    before_report=$(kelpie report --active 2>/dev/null | wc -l)
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="${database}.bak-schema${before_schema}-${stamp}"
+    echo "deploy: ${before_version:-unknown} schema ${before_schema} -> ${version} schema ${schema}"
+    echo "deploy: backup ${backup}"
+    sqlite3 "${database}" ".backup '${backup}'"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/kelpie-target}"
+    cargo build --release
+    src_kelpie="${CARGO_TARGET_DIR}/release/kelpie"
+    src_kelpied="${CARGO_TARGET_DIR}/release/kelpied"
+    dirs=()
+    dirs+=("$(dirname "${execstart}")")
+    while IFS= read -r path; do
+        dirs+=("$(dirname "${path}")")
+    done < <(which -a kelpie kelpied 2>/dev/null || true)
+    unique_dirs=$(printf '%s\n' "${dirs[@]}" | awk 'NF && !seen[$0]++')
+    while IFS= read -r dir; do
+        echo "deploy: install ${dir}"
+        install -m755 "${src_kelpie}" "${dir}/kelpie"
+        install -m755 "${src_kelpied}" "${dir}/kelpied"
+    done <<<"${unique_dirs}"
+    systemctl --user restart kelpied
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if kelpie who >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    after_schema=$(sqlite3 -readonly "${database}" "PRAGMA user_version;")
+    after_version=$(kelpie --version)
+    after_report=$(kelpie report --active | wc -l)
+    active=$(systemctl --user is-active kelpied)
+    if [[ "${active}" != "active" ]]; then
+        echo "deploy: kelpied is ${active}" >&2
+        systemctl --user status kelpied --no-pager >&2 || true
+        exit 1
+    fi
+    if [[ "${after_schema}" != "${schema}" ]]; then
+        echo "deploy: schema is ${after_schema}, expected ${schema}" >&2
+        exit 1
+    fi
+    if [[ "${after_version}" != "kelpie ${version}" ]]; then
+        echo "deploy: ${after_version} is not kelpie ${version}" >&2
+        exit 1
+    fi
+    echo "deploy: ${after_version} schema ${after_schema} active"
+    echo "deploy: report --active lines ${before_report} -> ${after_report} (backup ${backup})"
+    if [[ "${after_report}" != "${before_report}" ]]; then
+        echo "deploy: warning: active report line count changed; inspect kelpie report --active" >&2
+    fi
+
 # Cut a release: `just release 0.2.0-alpha.5`
 #
 # Refuses a dirty tree or a wrong branch rather than producing a half-release.
@@ -214,3 +287,6 @@ release-push version:
     fi
     git push origin main
     git push origin "v{{version}}"
+    echo
+    echo "Pushed v{{version}}. Installing onto this machine's kelpied and restarting."
+    just deploy
