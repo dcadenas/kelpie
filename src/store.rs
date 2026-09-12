@@ -56,7 +56,7 @@ fn optional_id_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Stri
         .transpose()
 }
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 /// Backstop interval for unanswered asks, including initial launch asks.
 pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 2_700_000;
 
@@ -112,6 +112,17 @@ const NO_IN_FLIGHT_FINAL: &str = "AND NOT EXISTS (
     WHERE inflight.kind = 'reply'
       AND inflight.disposition = 'final'
       AND inflight.reply_to_message_id = r.ask_message_id
+      AND inflight_d.outcome IN ('queued','submitted','accepted','unknown')
+)";
+
+/// A final reply whose delivery is still in flight holds orphan settlement:
+/// an accepted delivery can still resolve the ask, so absence is not final yet.
+const NO_IN_FLIGHT_FINAL_ASK: &str = "AND NOT EXISTS (
+    SELECT 1 FROM messages inflight
+    JOIN deliveries inflight_d ON inflight_d.message_id = inflight.id
+    WHERE inflight.kind = 'reply'
+      AND inflight.disposition = 'final'
+      AND inflight.reply_to_message_id = o.ask_message_id
       AND inflight_d.outcome IN ('queued','submitted','accepted','unknown')
 )";
 
@@ -293,6 +304,21 @@ pub struct AskPullEvent {
 pub struct ClaimedAskPullLease {
     pub lease_id: i64,
     pub ask_message_id: MessageId,
+}
+
+/// One active socket waiter whose claiming connection has been absent past grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredWaiter {
+    pub logical_agent_id: LogicalAgentId,
+    pub last_seen_at_ms: i64,
+}
+
+/// One open obligation whose required party has been absent past grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrandedAsk {
+    pub ask_message_id: MessageId,
+    pub waiting_agent_id: LogicalAgentId,
+    pub owing_agent_id: LogicalAgentId,
 }
 
 /// Non-destructive poll of one ask-pull log.
@@ -523,11 +549,12 @@ type AskReplyRow = (
     Option<i64>,
 );
 
-/// One of the agent's waits that was cancelled while it had no Ready
-/// incarnation.
+/// One of the agent's waits that was cancelled or orphaned while it had no
+/// Ready incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelledWhileAway {
     pub ask_message_id: String,
+    pub state: ObligationState,
     pub reason: String,
     pub cancelled_by: Option<String>,
     pub cancelled_at_ms: i64,
@@ -2185,7 +2212,7 @@ impl Store {
         &mut self,
         logical_agent_id: LogicalAgentId,
     ) -> Result<EndedWaiter, StoreError> {
-        self.end_socket_waiter_with_owing_due(logical_agent_id, &HashMap::new())
+        self.end_socket_waiter_with_owing_due(logical_agent_id, &HashMap::new(), "waiter retired")
     }
 
     /// Open and in-progress asks this waiter is waiting on, oldest first.
@@ -2228,8 +2255,8 @@ impl Store {
         &mut self,
         logical_agent_id: LogicalAgentId,
         owing_due_at_ms: &HashMap<MessageId, Option<i64>>,
+        reason: &str,
     ) -> Result<EndedWaiter, StoreError> {
-        const REASON: &str = "waiter retired";
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         require_active_socket_waiter(&tx, logical_agent_id)?;
@@ -2271,25 +2298,25 @@ impl Store {
         for (ask, owing) in asks {
             let ask_id = parse_message_id(&ask)?;
             let owing_agent = parse_logical_agent_id(&owing)?;
-            if supersede_unsubmitted_ask_delivery(&tx, ask_id, logical_agent_id, REASON, now)? {
+            if supersede_unsubmitted_ask_delivery(&tx, ask_id, logical_agent_id, reason, now)? {
                 cancelled_ask_ids.push(ask_id);
                 continue;
             }
             let waiting_body = format!(
-                "Your ask {ask_id} was cancelled by {public_name}. Reason: {REASON}. \
+                "Your ask {ask_id} was cancelled by {public_name}. Reason: {reason}. \
                  No reply is owed. Re-ask the current holder of the name if the question \
                  still matters."
             );
             let owing_body = format!(
                 "Stop working on ask {ask_id}. It was cancelled by {public_name}. \
-                 Reason: {REASON}. No reply is owed."
+                 Reason: {reason}. No reply is owed."
             );
             let due_at_ms = owing_due_at_ms.get(&ask_id).copied().flatten();
             let (waiting_message_id, _) = record_cancellation_side(
                 &tx,
                 logical_agent_id,
                 ask_id,
-                REASON,
+                reason,
                 &waiting_body,
                 CancellationAudience::Waiting,
                 None,
@@ -2300,7 +2327,7 @@ impl Store {
                 &tx,
                 owing_agent,
                 ask_id,
-                REASON,
+                reason,
                 &owing_body,
                 CancellationAudience::Owing,
                 due_at_ms,
@@ -2325,7 +2352,7 @@ impl Store {
                 params![
                     now,
                     logical_agent_id.to_string(),
-                    REASON,
+                    reason,
                     ask_id.to_string()
                 ],
             )?;
@@ -6107,9 +6134,9 @@ impl Store {
         }
         let mut statement = self.connection.prepare(
             "SELECT o.ask_message_id, o.cancellation_reason,
-                    o.cancellation_requester_agent_id, o.last_activity_at_ms
+                    o.cancellation_requester_agent_id, o.last_activity_at_ms, o.state
              FROM obligations o
-             WHERE o.waiting_agent_id = ?1 AND o.state = 'cancelled'
+             WHERE o.waiting_agent_id = ?1 AND o.state IN ('cancelled', 'orphaned')
                AND NOT EXISTS (SELECT 1 FROM deliveries d
                                WHERE d.message_id = o.cancellation_response_message_id
                                  AND d.outcome = 'accepted')
@@ -6128,16 +6155,24 @@ impl Store {
              LIMIT 20",
         )?;
         let rows = statement.query_map([waiting_agent_id.to_string()], |row| {
-            Ok(CancelledWhileAway {
-                ask_message_id: id_text(row, 0)?,
-                reason: row.get(1)?,
-                cancelled_by: optional_id_text(row, 2)?,
-                cancelled_at_ms: row.get(3)?,
-            })
+            Ok((
+                id_text(row, 0)?,
+                row.get::<_, String>(1)?,
+                optional_id_text(row, 2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?;
         let mut cancelled = Vec::new();
         for row in rows {
-            cancelled.push(row?);
+            let (ask_message_id, reason, cancelled_by, cancelled_at_ms, state) = row?;
+            cancelled.push(CancelledWhileAway {
+                ask_message_id,
+                state: parse_obligation_state(&state)?,
+                reason,
+                cancelled_by,
+                cancelled_at_ms,
+            });
         }
         Ok(cancelled)
     }
@@ -6165,9 +6200,9 @@ impl Store {
         }
         let mut statement = self.connection.prepare(
             "SELECT o.ask_message_id, o.cancellation_reason,
-                    o.cancellation_requester_agent_id, o.last_activity_at_ms
+                    o.cancellation_requester_agent_id, o.last_activity_at_ms, o.state
              FROM obligations o
-             WHERE o.owing_agent_id = ?1 AND o.state = 'cancelled'
+             WHERE o.owing_agent_id = ?1 AND o.state IN ('cancelled', 'orphaned')
                AND o.cancellation_owing_message_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM deliveries d
                                WHERE d.message_id = o.cancellation_owing_message_id
@@ -6187,16 +6222,24 @@ impl Store {
              LIMIT 20",
         )?;
         let rows = statement.query_map([owing_agent_id.to_string()], |row| {
-            Ok(CancelledWhileAway {
-                ask_message_id: id_text(row, 0)?,
-                reason: row.get(1)?,
-                cancelled_by: optional_id_text(row, 2)?,
-                cancelled_at_ms: row.get(3)?,
-            })
+            Ok((
+                id_text(row, 0)?,
+                row.get::<_, String>(1)?,
+                optional_id_text(row, 2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?;
         let mut cancelled = Vec::new();
         for row in rows {
-            cancelled.push(row?);
+            let (ask_message_id, reason, cancelled_by, cancelled_at_ms, state) = row?;
+            cancelled.push(CancelledWhileAway {
+                ask_message_id,
+                state: parse_obligation_state(&state)?,
+                reason,
+                cancelled_by,
+                cancelled_at_ms,
+            });
         }
         Ok(cancelled)
     }
@@ -6416,6 +6459,326 @@ impl Store {
             });
         }
         Ok(due)
+    }
+
+    /// Record server-observed contact with a socket waiter's claiming connection.
+    ///
+    /// Only an active socket waiter can be touched. Returns whether the row was
+    /// an active waiter; a waiter retired between observation and this write is
+    /// not an error and must not be revived.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn touch_waiter_seen(
+        &mut self,
+        logical_agent_id: LogicalAgentId,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE logical_agents SET waiter_last_seen_at_ms = ?1
+             WHERE id = ?2 AND delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL",
+            params![now_ms, logical_agent_id.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Move every claimed waiter's clock forward after a daemon restart.
+    ///
+    /// The daemon cannot have observed a client during its own downtime, so
+    /// preserving the pre-restart clock would false-retire a client that is
+    /// about to reconnect. Never-claimed waiters stay NULL and exempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn boot_reset_waiter_seen(&mut self, now_ms: i64) -> Result<usize, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE logical_agents SET waiter_last_seen_at_ms = ?1
+             WHERE delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL
+               AND waiter_last_seen_at_ms IS NOT NULL",
+            [now_ms],
+        )?;
+        Ok(changed)
+    }
+
+    /// Whether any obligation is open or in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn has_open_obligations(&self) -> Result<bool, StoreError> {
+        let exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM obligations WHERE state IN ('open', 'in_progress'))",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Whether any active socket waiter has ever claimed its inbox.
+    ///
+    /// Never-claimed waiters are exempt from absence expiry, so they do not
+    /// keep the sweep running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn has_claimed_waiters(&self) -> Result<bool, StoreError> {
+        let exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM logical_agents
+             WHERE delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL
+               AND waiter_last_seen_at_ms IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Active socket waiters whose claiming connection has been absent past grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durable IDs are malformed.
+    pub fn expired_waiters(
+        &self,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> Result<Vec<ExpiredWaiter>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, waiter_last_seen_at_ms FROM logical_agents
+             WHERE delivery_transport = 'socket_inbox'
+               AND targeting_ended_at_ms IS NULL
+               AND waiter_last_seen_at_ms IS NOT NULL
+               AND ?1 - waiter_last_seen_at_ms >= ?2
+             ORDER BY created_at_ms, id",
+        )?;
+        let rows = statement.query_map(params![now_ms, grace_ms], |row| {
+            Ok((id_text(row, 0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut expired = Vec::new();
+        for row in rows {
+            let (id, last_seen_at_ms) = row?;
+            expired.push(ExpiredWaiter {
+                logical_agent_id: parse_logical_agent_id(&id)?,
+                last_seen_at_ms,
+            });
+        }
+        Ok(expired)
+    }
+
+    /// Refresh each open obligation's counterparty-absence clock from durable state.
+    ///
+    /// A required party is present when it has a Ready or starting incarnation,
+    /// an active renew cycle, an in-flight lifecycle operation (`start`,
+    /// `adopt`, `clear`, or `retire`), or is an active socket waiter. The clock
+    /// is set on the first observation of absence and cleared on presence, so
+    /// `stranded_asks` measures how long absence has held, not age.
+    ///
+    /// Returns the number of obligations whose clock actually changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or update fails.
+    pub fn observe_ask_availability(&mut self, now_ms: i64) -> Result<usize, StoreError> {
+        let waiting = party_present_expression("o.waiting_agent_id");
+        let owing = party_present_expression("o.owing_agent_id");
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT o.ask_message_id, o.unavailable_since_ms, ({waiting} AND {owing})
+             FROM obligations o
+             WHERE o.state IN ('open', 'in_progress')"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                id_text(row, 0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (ask, unavailable_since, present) = row?;
+            match (present, unavailable_since) {
+                (true, Some(_)) => updates.push((ask, None)),
+                (false, None) => updates.push((ask, Some(now_ms))),
+                _ => {}
+            }
+        }
+        drop(statement);
+        let tx = self.connection.transaction()?;
+        let mut changed = 0;
+        for (ask, value) in updates {
+            changed += tx.execute(
+                "UPDATE obligations SET unavailable_since_ms = ?1 WHERE ask_message_id = ?2",
+                params![value, ask],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Open obligations whose required party has been absent past grace.
+    ///
+    /// Renew prepare asks are excluded: their cycle owns settling them, and
+    /// `refuse_renew_prepare_ask_cancel` enforces the same boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durable IDs are malformed.
+    pub fn stranded_asks(
+        &self,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> Result<Vec<StrandedAsk>, StoreError> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT o.ask_message_id, o.waiting_agent_id, o.owing_agent_id
+             FROM obligations o
+             WHERE o.state IN ('open', 'in_progress')
+               AND o.unavailable_since_ms IS NOT NULL
+               AND ?1 - o.unavailable_since_ms >= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM renews r WHERE r.ask_message_id = o.ask_message_id
+                     AND r.phase NOT IN ('done', 'aborted', 'terminated')
+               )
+               {NO_IN_FLIGHT_FINAL_ASK}
+             ORDER BY o.creation_sequence"
+        ))?;
+        let rows = statement.query_map(params![now_ms, grace_ms], |row| {
+            Ok((id_text(row, 0)?, id_text(row, 1)?, id_text(row, 2)?))
+        })?;
+        let mut stranded = Vec::new();
+        for row in rows {
+            let (ask, waiting, owing) = row?;
+            stranded.push(StrandedAsk {
+                ask_message_id: parse_message_id(&ask)?,
+                waiting_agent_id: parse_logical_agent_id(&waiting)?,
+                owing_agent_id: parse_logical_agent_id(&owing)?,
+            });
+        }
+        Ok(stranded)
+    }
+
+    /// Settle one stranded ask `orphaned` with notices recorded for both sides.
+    ///
+    /// Returns `Ok(None)` when the obligation is absent, already terminal, or
+    /// both parties are present again: the sweep re-observes inside the
+    /// transaction, so a recovered party is never orphaned by a stale read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the ask is the prepare obligation of an active
+    /// renew, or when the obligation changes before this commits.
+    #[allow(clippy::too_many_lines)]
+    pub fn orphan_ask(
+        &mut self,
+        ask_message_id: MessageId,
+    ) -> Result<Option<CreatedCancellation>, StoreError> {
+        let now = now_millis()?;
+        let tx = self.connection.transaction()?;
+        let obligation: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT waiting_agent_id, owing_agent_id, state
+                 FROM obligations WHERE ask_message_id = ?1",
+                [ask_message_id.to_string()],
+                |row| Ok((id_text(row, 0)?, id_text(row, 1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((waiting, owing, state)) = obligation else {
+            return Ok(None);
+        };
+        if !matches!(state.as_str(), "open" | "in_progress") {
+            return Ok(None);
+        }
+        refuse_renew_prepare_ask_cancel(&tx, ask_message_id)?;
+        let in_flight_final: i64 = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages inflight
+                 JOIN deliveries inflight_d ON inflight_d.message_id = inflight.id
+                 WHERE inflight.kind = 'reply'
+                   AND inflight.disposition = 'final'
+                   AND inflight.reply_to_message_id = ?1
+                   AND inflight_d.outcome IN ('queued','submitted','accepted','unknown'))",
+            [ask_message_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if in_flight_final != 0 {
+            return Ok(None);
+        }
+        let waiting_agent = parse_logical_agent_id(&waiting)?;
+        let owing_agent = parse_logical_agent_id(&owing)?;
+        let waiting_present = party_present_in_tx(&tx, waiting_agent)?;
+        let owing_present = party_present_in_tx(&tx, owing_agent)?;
+        if waiting_present && owing_present {
+            return Ok(None);
+        }
+        let missing = match (waiting_present, owing_present) {
+            (false, false) => "both parties",
+            (false, true) => "the asker",
+            (true, false) => "the responder",
+            (true, true) => unreachable!("presence checked above"),
+        };
+        let reason = format!("{missing} is no longer running");
+        let waiting_body = format!(
+            "Your ask {ask_message_id} was closed by Kelpie because {missing} is no longer \
+             running. No reply is owed. Re-ask if it still matters."
+        );
+        let owing_body = format!(
+            "Stop working on ask {ask_message_id}. It was closed by Kelpie because {missing} \
+             is no longer running. No reply is owed."
+        );
+        let (message_id, delivery) = record_cancellation_side(
+            &tx,
+            waiting_agent,
+            ask_message_id,
+            &reason,
+            &waiting_body,
+            CancellationAudience::Waiting,
+            None,
+            now,
+            "ambiguous ready incarnation for waiting agent",
+        )?;
+        let (owing_message_id, owing_delivery) = record_cancellation_side(
+            &tx,
+            owing_agent,
+            ask_message_id,
+            &reason,
+            &owing_body,
+            CancellationAudience::Owing,
+            None,
+            now,
+            "ambiguous ready incarnation for owing agent",
+        )?;
+        tx.execute(
+            "UPDATE obligations SET cancellation_response_message_id = ?1,
+             cancellation_owing_message_id = ?2
+             WHERE ask_message_id = ?3",
+            params![
+                message_id.to_string(),
+                owing_message_id.to_string(),
+                ask_message_id.to_string()
+            ],
+        )?;
+        let changed = tx.execute(
+            "UPDATE obligations SET state = 'orphaned', last_activity_at_ms = ?1,
+             cancellation_requester_agent_id = NULL, cancellation_reason = ?2
+             WHERE ask_message_id = ?3 AND state IN ('open', 'in_progress')",
+            params![now, reason, ask_message_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "obligation changed before orphan committed".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(Some(CreatedCancellation {
+            message_id,
+            delivery,
+            owing_message_id,
+            owing_delivery,
+        }))
     }
 
     /// Return overdue reminders bound to one exact Ready owing incarnation.
@@ -9361,6 +9724,39 @@ impl Store {
 /// A renew prepare ask is not a same-user `cancel`. Ending it through `cancel`
 /// would skip `renew.cancel`'s requester-or-target check, its operator notice,
 /// and leave the cycle to time out or clear without a checkpoint.
+/// SQL expression: the logical agent named by `agent` is a present party.
+///
+/// `agent` is a column reference or bind parameter. Presence is durable-state
+/// evidence only; the caller refreshes incarnation states from a snapshot
+/// before trusting absence.
+fn party_present_expression(agent: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM logical_agents la WHERE la.id = {agent}
+                    AND la.delivery_transport = 'socket_inbox'
+                    AND la.targeting_ended_at_ms IS NULL)
+          OR EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id = {agent}
+                     AND i.state IN ('ready', 'starting'))
+          OR EXISTS (SELECT 1 FROM operations o
+                     JOIN incarnations oi ON oi.id = o.target_incarnation_id
+                     WHERE oi.logical_agent_id = {agent}
+                       AND o.kind IN ('start', 'adopt', 'clear', 'retire')
+                       AND o.outcome IN ('pending', 'accepted'))
+          OR EXISTS (SELECT 1 FROM renews r WHERE r.logical_agent_id = {agent}
+                     AND r.phase NOT IN ('done', 'aborted', 'terminated')))"
+    )
+}
+
+/// Evaluate [`party_present_expression`] for one logical agent in a transaction.
+fn party_present_in_tx(tx: &Transaction<'_>, agent: LogicalAgentId) -> Result<bool, StoreError> {
+    let expression = party_present_expression("?1");
+    let present: i64 = tx.query_row(
+        &format!("SELECT {expression}"),
+        [agent.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(present != 0)
+}
+
 fn refuse_renew_prepare_ask_cancel(
     tx: &Transaction<'_>,
     ask_message_id: MessageId,
@@ -9863,6 +10259,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 30 {
         connection.execute_batch(include_str!("../migrations/031_ask_pull.sql"))?;
         version = 31;
+    }
+    if version == 31 {
+        connection.execute_batch(include_str!("../migrations/032_ask_orphan.sql"))?;
+        version = 32;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
@@ -18280,6 +18680,243 @@ mod tests {
                 .expect_err("already ended")
                 .to_string()
                 .contains("not an active socket waiter")
+        );
+    }
+
+    #[test]
+    fn waiter_lease_expires_only_after_claim_and_grace() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "lease-waiter")
+            .expect("register");
+        assert!(
+            store
+                .expired_waiters(1_000_000, 600_000)
+                .expect("expired")
+                .is_empty(),
+            "a never-claimed waiter is exempt"
+        );
+        assert!(
+            store
+                .touch_waiter_seen(waiter.logical_agent_id, 1_000)
+                .expect("touch")
+        );
+        assert!(
+            store
+                .expired_waiters(1_000 + 599_999, 600_000)
+                .expect("expired")
+                .is_empty()
+        );
+        let expired = store
+            .expired_waiters(1_000 + 600_000, 600_000)
+            .expect("expired");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].logical_agent_id, waiter.logical_agent_id);
+        assert_eq!(expired[0].last_seen_at_ms, 1_000);
+        assert_eq!(
+            store.boot_reset_waiter_seen(2_000_000).expect("boot"),
+            1,
+            "boot moves a claimed waiter forward"
+        );
+        assert!(
+            store
+                .expired_waiters(2_000_000 + 1, 600_000)
+                .expect("expired")
+                .is_empty()
+        );
+        store
+            .end_socket_waiter(waiter.logical_agent_id)
+            .expect("retire");
+        assert!(
+            !store
+                .touch_waiter_seen(waiter.logical_agent_id, 3_000_000)
+                .expect("touch"),
+            "an ended waiter is not revived by contact"
+        );
+    }
+
+    #[test]
+    fn absence_clock_tracks_presence_and_respects_grace() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "absence-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "absence-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = waiter_ask(
+            &mut store,
+            waiter.logical_agent_id,
+            owing,
+            "question",
+            "absence-ask",
+        );
+        assert_eq!(
+            store.observe_ask_availability(1_000).expect("observe"),
+            0,
+            "both parties present"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'lost' WHERE id = ?1",
+                [owing.incarnation_id.to_string()],
+            )
+            .expect("lose responder");
+        assert_eq!(store.observe_ask_availability(1_000).expect("observe"), 1);
+        assert!(
+            store
+                .stranded_asks(1_000 + 599_999, 600_000)
+                .expect("stranded")
+                .is_empty()
+        );
+        let stranded = store
+            .stranded_asks(1_000 + 600_000, 600_000)
+            .expect("stranded");
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].ask_message_id, ask.message_id);
+        assert_eq!(
+            store.observe_ask_availability(2_000).expect("observe"),
+            0,
+            "a repeated absence observation must not restart the clock"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'ready' WHERE id = ?1",
+                [owing.incarnation_id.to_string()],
+            )
+            .expect("recover responder");
+        assert_eq!(store.observe_ask_availability(3_000).expect("observe"), 1);
+        assert!(
+            store
+                .stranded_asks(3_000 + 600_000, 600_000)
+                .expect("stranded")
+                .is_empty(),
+            "a recovered party clears absence"
+        );
+    }
+
+    #[test]
+    fn orphan_ask_settles_notice_and_refuses_later_final() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "orphan-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "orphan-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = waiter_ask(
+            &mut store,
+            waiter.logical_agent_id,
+            owing,
+            "question",
+            "orphan-ask",
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'lost' WHERE id = ?1",
+                [owing.incarnation_id.to_string()],
+            )
+            .expect("lose responder");
+        store.observe_ask_availability(1_000).expect("observe");
+        assert_eq!(
+            store.stranded_asks(61_000, 60_000).expect("stranded").len(),
+            1
+        );
+        let created = store
+            .orphan_ask(ask.message_id)
+            .expect("orphan")
+            .expect("settled");
+        assert_eq!(
+            store.obligation_state(ask.message_id).expect("state"),
+            ObligationState::Orphaned
+        );
+        let (reason, requester): (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT cancellation_reason, cancellation_requester_agent_id
+                 FROM obligations WHERE ask_message_id = ?1",
+                [ask.message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reason");
+        assert!(reason.contains("the responder"), "{reason}");
+        assert_eq!(requester, None);
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("inbox");
+        assert!(
+            queued.iter().any(|delivery| {
+                delivery.message_id == created.message_id
+                    && delivery.kind == MessageKind::Cancellation
+            }),
+            "the surviving waiter gets a durable Kelpie-authored notice"
+        );
+        let later = store
+            .reply_receive_path(ask.message_id, owing.logical_agent_id)
+            .expect_err("closed")
+            .to_string();
+        assert!(
+            later.contains("does not name an open obligation"),
+            "later final must fail as not open: {later}"
+        );
+        assert!(
+            store
+                .orphan_ask(ask.message_id)
+                .expect("orphan again")
+                .is_none(),
+            "a terminal ask is never settled twice"
+        );
+    }
+
+    #[test]
+    fn in_flight_final_holds_orphan_settlement() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "held-waiter")
+            .expect("register");
+        let owing = store
+            .declare_start(&intent("owing", "term-b", "held-owing"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-b");
+        let ask = waiter_ask(
+            &mut store,
+            waiter.logical_agent_id,
+            owing,
+            "question",
+            "held-ask",
+        );
+        store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "held-final",
+            )
+            .expect("final recorded but not accepted");
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'lost' WHERE id = ?1",
+                [owing.incarnation_id.to_string()],
+            )
+            .expect("lose responder");
+        store.observe_ask_availability(1_000).expect("observe");
+        assert!(
+            store
+                .stranded_asks(61_000, 60_000)
+                .expect("stranded")
+                .is_empty(),
+            "an in-flight final can still resolve the ask"
+        );
+        assert!(
+            store.orphan_ask(ask.message_id).expect("orphan").is_none(),
+            "settlement waits for the in-flight final"
         );
     }
 }

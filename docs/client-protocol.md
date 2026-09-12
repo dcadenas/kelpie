@@ -131,7 +131,12 @@ authentication boundary.
   `alias`, so ending a waiter never requires reading Kelpie's database.
 - `inbox.claim` holds a reconnectable inbox for that waiter id. Deliveries
   arrive as `inbox.delivery` on that socket. `inbox.ack` marks the named
-  delivery `accepted`. Persist is not acceptance.
+  delivery `accepted`. Persist is not acceptance. The daemon records the last
+  server-observed contact with a claimed connection; a waiter claimed at least
+  once and absent past the connection grace is retired as `waiter.retire`
+  retires it, reason `waiter connection lost`, with an operator notice and its
+  open asks cancelled. A never-claimed waiter never expires, and a missing
+  connection within the grace is normal queued delivery.
 
 ## Messaging methods
 
@@ -357,7 +362,12 @@ Wrong or stale correlation fails closed. Progress sets the obligation
 `in_progress` when the reply is recorded and does not resolve it. A final reply
 resolves the obligation only when delivery is accepted; rejected or unknown
 final deliveries leave the obligation open/in-progress and report the delivery
-outcome without claiming the waiter received the answer. Ambiguous submitted
+outcome without claiming the waiter received the answer. An ask whose required
+party loses its runtime with no lifecycle operation in flight, and stays that
+way past the grace, is settled `orphaned` with a reason and a Kelpie-authored
+notice recorded for both parties. It is terminal like `cancelled` and no
+longer appears in `pending` or receives reminders; renew prepare asks are
+settled by their cycle instead. Ambiguous submitted
 reply prompts are never blindly resent. On success the result includes
 `message_id`, `delivery_outcome`, and `obligation_state`. Pane replies also
 include `operation_id` and `recipient_incarnation`.

@@ -44,6 +44,10 @@ const MAX_REPLIES_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOT_CONTINUE_WINDOW: Duration = Duration::from_mins(2);
 /// Pause between boot recover snapshots. Recover is idempotent.
 const BOOT_CONTINUE_INTERVAL: Duration = Duration::from_secs(5);
+/// How long an ask may wait on a required party that is gone before it is orphaned.
+const ASK_ORPHAN_GRACE_MS: i64 = 10 * 60 * 1000;
+/// Pause between absence sweeps. Runs only while obligations or claimed waiters exist.
+const ASK_SWEEP_INTERVAL: Duration = Duration::from_mins(2);
 
 fn boot_continue_should_start(now: Instant, until: Instant, next: Instant, inflight: bool) -> bool {
     !inflight && now < until && now >= next
@@ -293,6 +297,8 @@ pub struct Daemon {
     boot_continue_until: Instant,
     boot_continue_job: Option<u64>,
     next_boot_continue: Instant,
+    obligation_sweep_job: Option<u64>,
+    next_obligation_sweep: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +313,7 @@ enum HerdrOwner {
     Rename,
     Retire,
     BootRecover,
+    ObligationSweep,
 }
 
 #[derive(Debug, Clone)]
@@ -467,9 +474,25 @@ impl Daemon {
     ///
     /// Returns an I/O error if the exact path cannot be bound. Existing paths
     /// are never removed automatically.
-    pub fn bind(socket_path: impl AsRef<Path>, kelpie: Kelpie) -> Result<Self, DaemonError> {
+    pub fn bind(socket_path: impl AsRef<Path>, mut kelpie: Kelpie) -> Result<Self, DaemonError> {
         let socket_path = socket_path.as_ref().to_path_buf();
         let listener = UnixListener::bind(&socket_path)?;
+        // The daemon cannot have observed a client during its own downtime, so
+        // a pre-restart waiter clock would false-retire a client that is about
+        // to reconnect. Move every claimed waiter forward once before serving.
+        let boot_now_ms = crate::store::store_clock_ms().map_err(|error| {
+            DaemonError::Io(std::io::Error::other(format!(
+                "waiter clock read failed: {error}"
+            )))
+        })?;
+        kelpie
+            .store_mut()
+            .boot_reset_waiter_seen(boot_now_ms)
+            .map_err(|error| {
+                DaemonError::Io(std::io::Error::other(format!(
+                    "waiter clock reset failed: {error}"
+                )))
+            })?;
         let herdr_exec = HerdrExec::spawn(kelpie.herdr_client().clone());
         Ok(Self {
             listener,
@@ -502,6 +525,8 @@ impl Daemon {
             boot_continue_until: Instant::now() + BOOT_CONTINUE_WINDOW,
             boot_continue_job: None,
             next_boot_continue: Instant::now() + BOOT_CONTINUE_INTERVAL,
+            obligation_sweep_job: None,
+            next_obligation_sweep: Instant::now() + ASK_SWEEP_INTERVAL,
         })
     }
 
@@ -540,6 +565,8 @@ impl Daemon {
         log_slow_phase("herdr_events", &mut phase);
         self.schedule_boot_continue();
         log_slow_phase("boot_continue", &mut phase);
+        self.schedule_obligation_sweep();
+        log_slow_phase("obligation_sweep", &mut phase);
         if let Err(error) = self.kelpie.fire_due_schedules() {
             let _ = self
                 .kelpie
@@ -642,7 +669,8 @@ impl Daemon {
             || !self.awaiting_adopts.is_empty()
             || !self.awaiting_renames.is_empty()
             || !self.awaiting_retires.is_empty()
-            || self.boot_continue_job.is_some())
+            || self.boot_continue_job.is_some()
+            || self.obligation_sweep_job.is_some())
     }
 
     fn accept_waiting(&mut self) -> Result<bool, DaemonError> {
@@ -2674,6 +2702,118 @@ impl Daemon {
         }
     }
 
+    /// Start an absence sweep when obligations or claimed waiters exist.
+    ///
+    /// Touches every open inbox session first so the durable waiter clock sees
+    /// a live connection, then snapshots Herdr so absence is observed rather
+    /// than assumed. A failed snapshot is never evidence of absence.
+    fn schedule_obligation_sweep(&mut self) {
+        if self.obligation_sweep_job.is_some() || Instant::now() < self.next_obligation_sweep {
+            return;
+        }
+        match self.kelpie.has_sweepable_state() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.next_obligation_sweep = Instant::now() + ASK_SWEEP_INTERVAL;
+                return;
+            }
+            Err(error) => {
+                eprintln!("kelpied: absence sweep check failed: {error}");
+                self.next_obligation_sweep = Instant::now() + ASK_SWEEP_INTERVAL;
+                return;
+            }
+        }
+        let now_ms = match crate::store::store_clock_ms() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                eprintln!("kelpied: absence sweep clock failed: {error}");
+                self.next_obligation_sweep = Instant::now() + ASK_SWEEP_INTERVAL;
+                return;
+            }
+        };
+        let waiters: Vec<LogicalAgentId> = self
+            .inboxes
+            .iter()
+            .map(|session| session.waiter_id)
+            .collect();
+        for waiter_id in waiters {
+            let _ = self.kelpie.store_mut().touch_waiter_seen(waiter_id, now_ms);
+        }
+        let job_id = self.alloc_job();
+        self.submit_owned(
+            HerdrJob::Snapshot {
+                job_id,
+                negotiate: true,
+            },
+            HerdrOwner::ObligationSweep,
+        );
+        self.obligation_sweep_job = Some(job_id);
+    }
+
+    fn on_obligation_sweep_done(
+        &mut self,
+        job_id: u64,
+        result: Result<HerdrJobResult, HerdrError>,
+    ) {
+        if self.obligation_sweep_job != Some(job_id) {
+            return;
+        }
+        self.obligation_sweep_job = None;
+        self.next_obligation_sweep = Instant::now() + ASK_SWEEP_INTERVAL;
+        let snapshot = match result {
+            Ok(HerdrJobResult::Snapshot(snapshot)) => snapshot,
+            Ok(_) => {
+                let _ = self
+                    .kelpie
+                    .store_mut()
+                    .create_operator_notice("absence sweep returned a non-snapshot Herdr result");
+                return;
+            }
+            Err(error) => {
+                // A snapshot failure is not evidence of absence.
+                eprintln!("kelpied: absence sweep snapshot failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.kelpie.recover_with_snapshot(&snapshot) {
+            let _ = self
+                .kelpie
+                .store_mut()
+                .create_operator_notice(&format!("absence sweep recover failed: {error}"));
+            return;
+        }
+        let now_ms = match crate::store::store_clock_ms() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                eprintln!("kelpied: absence sweep clock failed: {error}");
+                return;
+            }
+        };
+        match self.kelpie.sweep_absent_asks(now_ms, ASK_ORPHAN_GRACE_MS) {
+            Ok(sweep) => {
+                for notice in sweep.prompts {
+                    self.park_prompt(AwaitingPrompt {
+                        request_id: String::new(),
+                        stream: None,
+                        prepared: notice.prepared,
+                        result_json: Value::Null,
+                        reply_to: None,
+                        lease: None,
+                        intent_committed: false,
+                        owner: PromptOwner::Internal,
+                        reminder: None,
+                    });
+                }
+            }
+            Err(error) => {
+                let _ = self
+                    .kelpie
+                    .store_mut()
+                    .create_operator_notice(&format!("absence sweep failed: {error}"));
+            }
+        }
+    }
+
     fn schedule_reminders(&mut self) {
         if self.reminder_job.is_some() || !self.reminder_inflight.is_empty() {
             return;
@@ -2810,6 +2950,9 @@ impl Daemon {
                         Some(HerdrOwner::Rename) => self.on_rename_done(job_id, result),
                         Some(HerdrOwner::Retire) => self.on_retire_done(job_id, result),
                         Some(HerdrOwner::BootRecover) => self.on_boot_continue_done(job_id, result),
+                        Some(HerdrOwner::ObligationSweep) => {
+                            self.on_obligation_sweep_done(job_id, result);
+                        }
                         None => {}
                     }
                 }
@@ -2842,6 +2985,9 @@ impl Daemon {
                     }
                     Some(HerdrOwner::BootRecover) => {
                         self.on_boot_continue_done(job_id, Err(error));
+                    }
+                    Some(HerdrOwner::ObligationSweep) => {
+                        self.on_obligation_sweep_done(job_id, Err(error));
                     }
                     None => {}
                 },
@@ -4656,7 +4802,7 @@ fn serve_parsed_line(
                     return Ok(Served::Answered);
                 }
             };
-            match kelpie.prepare_retire_waiter(logical_agent_id) {
+            match kelpie.prepare_retire_waiter(logical_agent_id, "waiter retired") {
                 Ok(prepared) => {
                     return Ok(Served::AwaitingWaiterRetire(Box::new(
                         PendingWaiterRetire {
@@ -4946,13 +5092,18 @@ fn dispatch_replies_ack(params: Value, kelpie: &mut Kelpie) -> Result<Value, Sli
     }))
 }
 
-fn claim_inbox(request: &ClientRequest, kelpie: &Kelpie) -> Result<LogicalAgentId, SliceError> {
+fn claim_inbox(request: &ClientRequest, kelpie: &mut Kelpie) -> Result<LogicalAgentId, SliceError> {
     let params = serde_json::from_value::<InboxClaimParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     kelpie
         .store()
         .claim_socket_waiter(params.logical_agent_id)
         .map_err(SliceError::Store)?;
+    if let Ok(now_ms) = crate::store::store_clock_ms() {
+        let _ = kelpie
+            .store_mut()
+            .touch_waiter_seen(params.logical_agent_id, now_ms);
+    }
     Ok(params.logical_agent_id)
 }
 
@@ -6938,19 +7089,19 @@ fn dispatch_pending(params: Value, kelpie: &Kelpie) -> Result<Value, SliceError>
     obligations.extend(cancelled.into_iter().map(|entry| {
         serde_json::json!({
             "ask_message_id": entry.ask_message_id,
-            "state": "cancelled",
+            "state": entry.state,
             "audience": "waiting",
             "cancellation_reason": entry.reason,
             "cancellation_requester_agent_id": entry.cancelled_by,
             "cancelled_at_ms": entry.cancelled_at_ms,
         })
     }));
-    // Asks this agent was answering, cancelled while it had no Ready
-    // binding: the stop-notice it never received.
+    // Asks this agent was answering, cancelled or orphaned while it had no
+    // Ready binding: the stop-notice it never received.
     obligations.extend(cancelled_owing.into_iter().map(|entry| {
         serde_json::json!({
             "ask_message_id": entry.ask_message_id,
-            "state": "cancelled",
+            "state": entry.state,
             "audience": "owing",
             "cancellation_reason": entry.reason,
             "cancellation_requester_agent_id": entry.cancelled_by,
@@ -10589,6 +10740,84 @@ mod tests {
                 .as_str()
                 .expect("body")
                 .contains("obsolete")
+        );
+    }
+
+    #[test]
+    fn absence_sweep_orphans_a_dead_responder_and_queues_the_waiter_notice() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "sweep-waiter")
+            .expect("register");
+        let owing = seed_ready(&mut store, "owing", "w1:p2", "term-2", "sweep-owing");
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "sweep-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let released = store
+            .release_absent_alias_binding(
+                "owing",
+                &crate::herdr::Snapshot {
+                    protocol: 20,
+                    panes: vec![],
+                    agents: vec![],
+                },
+            )
+            .expect("lose responder");
+        assert_eq!(released, Some(owing.incarnation_id));
+        let now = crate::store::store_clock_ms().expect("clock");
+        store
+            .observe_ask_availability(now - 601_000)
+            .expect("seed absence");
+        let mut daemon = Daemon::bind(
+            &kelpie_socket,
+            Kelpie::new(
+                store,
+                HerdrClient::new(&herdr_socket, Duration::from_secs(1)),
+            ),
+        )
+        .expect("bind");
+        daemon.obligation_sweep_job = Some(42);
+        daemon.on_obligation_sweep_done(
+            42,
+            Ok(HerdrJobResult::Snapshot(crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })),
+        );
+        assert_eq!(
+            daemon
+                .kelpie
+                .store()
+                .obligation_state(ask.message_id)
+                .expect("state"),
+            crate::domain::ObligationState::Orphaned
+        );
+        let queued = daemon
+            .kelpie
+            .store()
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("inbox");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, crate::domain::MessageKind::Cancellation);
+        assert!(
+            queued[0]
+                .body
+                .contains("the responder is no longer running"),
+            "{}",
+            queued[0].body
         );
     }
 }

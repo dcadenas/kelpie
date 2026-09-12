@@ -583,6 +583,17 @@ pub(crate) struct PreparedWaiterRetire {
     pub owing_notices: Vec<PreparedWaiterRetireNotice>,
 }
 
+/// Durable effects and prepared notices from one absence sweep.
+#[derive(Debug, Default)]
+pub struct AbsenceSweep {
+    /// Socket waiters retired because their claiming connection stayed absent.
+    pub expired_waiters: Vec<LogicalAgentId>,
+    /// Obligations settled `orphaned` because a required party was absent.
+    pub orphaned_asks: Vec<MessageId>,
+    /// Cancellation notices ready to write after a Herdr connection exists.
+    pub prompts: Vec<PreparedCancellation>,
+}
+
 /// Result of declaring a start and attempting `agent.start` once.
 ///
 /// `BusyRetry` means Herdr refused with a retryable busy pane; the daemon parks
@@ -4070,7 +4081,7 @@ impl Kelpie {
         &mut self,
         logical_agent_id: LogicalAgentId,
     ) -> Result<WaiterRetireOutcome, SliceError> {
-        let prepared = self.prepare_retire_waiter(logical_agent_id)?;
+        let prepared = self.prepare_retire_waiter(logical_agent_id, "waiter retired")?;
         let mut owing_notices = Vec::with_capacity(prepared.owing_notices.len());
         for notice in prepared.owing_notices {
             let delivered = match notice.prepared {
@@ -4092,6 +4103,7 @@ impl Kelpie {
     pub(crate) fn prepare_retire_waiter(
         &mut self,
         logical_agent_id: LogicalAgentId,
+        reason: &str,
     ) -> Result<PreparedWaiterRetire, SliceError> {
         let asks = self
             .store
@@ -4115,7 +4127,7 @@ impl Kelpie {
         }
         let ended = self
             .store
-            .end_socket_waiter_with_owing_due(logical_agent_id, &owing_due)
+            .end_socket_waiter_with_owing_due(logical_agent_id, &owing_due, reason)
             .map_err(SliceError::Store)?;
         let mut owing_notices = Vec::new();
         for notice in ended.owing_notices {
@@ -4129,7 +4141,7 @@ impl Kelpie {
                     envelope::render_owing_cancellation(
                         &owing_name,
                         &notice.ask_message_id.to_string(),
-                        "waiter retired",
+                        reason,
                     )?,
                 )?)
             } else {
@@ -4145,6 +4157,88 @@ impl Kelpie {
             cancelled_ask_ids: ended.cancelled_ask_ids,
             owing_notices,
         })
+    }
+
+    /// Whether an absence sweep has anything to observe.
+    ///
+    /// # Errors
+    ///
+    /// Store errors.
+    pub fn has_sweepable_state(&self) -> Result<bool, SliceError> {
+        Ok(self
+            .store
+            .has_open_obligations()
+            .map_err(SliceError::Store)?
+            || self
+                .store
+                .has_claimed_waiters()
+                .map_err(SliceError::Store)?)
+    }
+
+    /// Prepare one absence sweep: retire expired socket waiters, then orphan
+    /// asks whose required party has been absent past the grace.
+    ///
+    /// The caller refreshes incarnation state from a successful snapshot and
+    /// touches every open inbox session before calling, so absence is observed
+    /// rather than assumed. Durable settlement happens here; returned prompts
+    /// are parked by the daemon. Read-only on Herdr: no write happens in this
+    /// method.
+    ///
+    /// # Errors
+    ///
+    /// Store or envelope errors.
+    pub fn sweep_absent_asks(
+        &mut self,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> Result<AbsenceSweep, SliceError> {
+        let mut sweep = AbsenceSweep::default();
+        let expired = self
+            .store
+            .expired_waiters(now_ms, grace_ms)
+            .map_err(SliceError::Store)?;
+        for waiter in expired {
+            let address = self.store.agent_address(waiter.logical_agent_id)?;
+            let prepared =
+                self.prepare_retire_waiter(waiter.logical_agent_id, "waiter connection lost")?;
+            self.store
+                .create_operator_notice(&format!(
+                    "socket waiter {} ({address}) was retired because its claiming connection \
+                     was absent past the grace; {} ask(s) cancelled",
+                    waiter.logical_agent_id,
+                    prepared.cancelled_ask_ids.len(),
+                ))
+                .map_err(SliceError::Store)?;
+            sweep.expired_waiters.push(waiter.logical_agent_id);
+            for notice in prepared.owing_notices {
+                if let Some(prepared) = notice.prepared {
+                    sweep.prompts.push(PreparedCancellation {
+                        waiting: false,
+                        prepared,
+                    });
+                }
+            }
+        }
+        self.store
+            .observe_ask_availability(now_ms)
+            .map_err(SliceError::Store)?;
+        let stranded = self
+            .store
+            .stranded_asks(now_ms, grace_ms)
+            .map_err(SliceError::Store)?;
+        for ask in stranded {
+            let Some(created) = self
+                .store
+                .orphan_ask(ask.ask_message_id)
+                .map_err(SliceError::Store)?
+            else {
+                continue;
+            };
+            let (_, prompts) = self.cancellation_prompts(created, false, false)?;
+            sweep.orphaned_asks.push(ask.ask_message_id);
+            sweep.prompts.extend(prompts);
+        }
+        Ok(sweep)
     }
 
     fn prepare_cancellation_notice(
@@ -7614,5 +7708,85 @@ mod tests {
             DeliveryOutcome::Accepted
         );
         server.join().expect("fake Herdr server");
+    }
+
+    #[test]
+    fn absence_sweep_orphans_after_grace_and_retires_expired_waiters() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "sweep-waiter")
+            .expect("register");
+        let owing = store
+            .declare_adopt(
+                &foobar_pane_adopt_intent("sweep-owing"),
+                &foobar_pane_evidence(),
+            )
+            .expect("ready owing");
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "sweep-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let released = store
+            .release_absent_alias_binding(
+                "foobar",
+                &crate::herdr::Snapshot {
+                    protocol: 20,
+                    panes: vec![],
+                    agents: vec![],
+                },
+            )
+            .expect("lose responder");
+        assert_eq!(released, Some(owing.incarnation_id));
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+        let early = kelpie.sweep_absent_asks(1_000, 600_000).expect("sweep");
+        assert!(early.orphaned_asks.is_empty(), "grace has not elapsed");
+        let sweep = kelpie.sweep_absent_asks(601_000, 600_000).expect("sweep");
+        assert_eq!(sweep.orphaned_asks, vec![ask.message_id]);
+        assert_eq!(
+            kelpie
+                .store()
+                .obligation_state(ask.message_id)
+                .expect("state"),
+            ObligationState::Orphaned
+        );
+        assert!(
+            sweep.prompts.is_empty(),
+            "the surviving waiter is a socket inbox; the dead responder gets no prompt"
+        );
+        let queued = kelpie
+            .store()
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("inbox");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, MessageKind::Cancellation);
+
+        let stale = kelpie
+            .store_mut()
+            .register_socket_waiter("stale", Parent::Parentless, "sweep-stale")
+            .expect("register stale");
+        kelpie
+            .store_mut()
+            .touch_waiter_seen(stale.logical_agent_id, 1_000)
+            .expect("touch");
+        let sweep = kelpie.sweep_absent_asks(601_000, 600_000).expect("sweep");
+        assert_eq!(sweep.expired_waiters, vec![stale.logical_agent_id]);
+        assert!(
+            kelpie
+                .store()
+                .active_socket_waiter_for_alias("stale")
+                .expect("lookup")
+                .is_none(),
+            "an expired waiter is no longer an active delivery target"
+        );
     }
 }

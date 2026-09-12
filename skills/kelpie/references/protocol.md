@@ -18,7 +18,11 @@ Contents: [Method details](#method-details), [typed client examples](#typed-clie
   is sender attribution only; `waiting_agent_id` is the waiter, and occupant
   `from=` is the waiter's public name. The host receives deliveries on a
   long-lived `inbox.claim` connection for that waiter id, then `inbox.ack`.
-  `pending` and `ask.info` are not the socket-waiter receive path.
+  `pending` and `ask.info` are not the socket-waiter receive path. Kelpie
+  records the last contact with a claimed connection: a waiter claimed at least
+  once and absent past the connection grace is retired like `waiter.retire`,
+  reason `waiter connection lost`, with an operator notice and its open asks
+  cancelled. A never-claimed waiter never expires.
 - `replies.claim`, `replies`, `replies.ack`: ask-scoped pull sink for reverse
   traffic when the ask used `reply_delivery=pull`. Not `inbox.claim`. `replies`
   is a non-destructive log for that ask only. Poll authorization is the waiting

@@ -213,7 +213,9 @@ name MUST NOT equal a Ready Herdr alias or another socket waiter's public name.
 Start, adopt, and rename MUST refuse a name a socket waiter holds. Alias
 resolution MUST fail closed when more than one agent could match. Snapshot
 absence MUST NOT release a socket waiter's name. That name is released only by
-`waiter.retire`, which ends that LogicalAgent as a delivery target. `delivery_transport`
+`waiter.retire`, or by the daemon expiring a claimed waiter connection under the
+bounded lease below, either of which ends that LogicalAgent as a delivery
+target. `delivery_transport`
 MUST remain `socket_inbox` after that end. Start-continue and adopt MUST still
 refuse the agent. `waiter.retire` with no `open` or `in_progress` asks waiting
 on that agent MUST only end targeting. With such asks, it MUST cancel them in
@@ -232,6 +234,16 @@ contain a public name, explicit parent or parentless marker, and an idempotency
 key. It MUST NOT contain a pane, terminal, backend, or incarnation. Replay of
 the same idempotency key MUST return the same logical-agent id. The result is
 the logical-agent id. Creating it MUST NOT insert an incarnation.
+
+The daemon MUST record the last server-observed contact with a claimed inbox
+connection. A socket waiter that has been claimed at least once and whose
+recorded contact is older than the connection grace MUST be retired as
+`waiter.retire` retires it, using a reason distinct from `waiter retired`, and
+MUST raise an operator notice. A waiter never claimed MUST NOT expire. Daemon
+startup MUST move every claimed waiter's clock forward before serving, because
+the daemon cannot have observed a client during its own downtime. A missing
+connection alone MUST NOT end a waiter within the grace: queued inbox delivery
+is durable, and reconnecting is normal.
 
 On `ask`, `from_operator` is message-sender attribution only. The obligation's
 `waiting_agent_id` MUST be the waiter LogicalAgent named as `sender`. Occupant
@@ -387,6 +399,20 @@ reply from the asker or any third party MUST be refused without mutating the
 obligation or delivering anything. A reply from the wrong sender or to the wrong
 message MUST NOT clear another obligation.
 
+An open or in-progress ask whose required party is absent longer than the ask
+grace MUST be settled `orphaned` in a durable transaction, with a reason
+recorded and a Kelpie-authored cancellation notice recorded for both parties,
+delivered to whichever is addressable. A party is absent only when durable
+state, refreshed from a successful Herdr snapshot, shows no `ready` or
+`starting` incarnation, no non-terminal renew cycle, and no `pending` or
+`accepted` `start`, `adopt`, `clear`, or `retire` operation for that agent, and
+the agent is not an active socket waiter. A failed snapshot MUST NOT count as
+absence, and absence MUST be observed for the full grace before settling. The
+settlement MUST NOT require either party's acknowledgement and MUST NOT resolve
+the obligation. An orphaned obligation is terminal: `pending`, reminder
+eligibility, and a later final MUST treat it as closed. Renew prepare asks are
+settled by their renew cycle, not by this rule.
+
 Progress and final replies are durable messages with their own delivery attempts
 to the waiting logical agent. Kelpie MUST resolve the owing and waiting agents
 from the obligation named by `reply_to`. When send intent is recorded, Kelpie
@@ -471,7 +497,8 @@ MAY increase the stored interval, but MUST NOT decrease it. An increase MUST
 schedule the next reminder no earlier than the new interval from now and MUST
 retain later deadlines and snoozes. Expired snoozes allow normal reminders at
 the stored interval. Mutation receipts and ask inspection MUST expose the
-effective interval, snooze deadline, and next eligible time. Disabled policies
+effective interval, snooze deadline, and next eligible time. An obligation
+settled `orphaned` MUST NOT receive further reminders. Disabled policies
 remain disabled. A snooze MUST NOT retract a submitted reminder; completion of
 that attempt MUST preserve timing changes made while it was in flight. A recorded final reply
 whose delivery is `queued`, `submitted`, `accepted`, or `unknown` MUST NOT

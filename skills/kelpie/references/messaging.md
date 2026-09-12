@@ -47,7 +47,9 @@ Contents: [Method details](#method-details); [ask vs tell](#ask-vs-tell).
 - `pending`: list the recipient's `open` and `in_progress` obligations in
   creation order, followed by cancellation notices recorded while unaddressable.
   Cancellation notices cover asks the agent sent and asks it was answering.
-  Tells and Herdr task state are not reply obligations.
+  Tells and Herdr task state are not reply obligations. An ask whose required
+  party is gone past the grace is settled `orphaned` with a reason; it is
+  terminal like `cancelled` and no longer listed or reminded.
 - `cancel`: supply `requester_agent_id`, `ask_message_id`, and a non-empty
   reason. Queued messages can be cancelled only before the first Herdr write.
   After submission, reconcile ambiguous delivery without resending. An
