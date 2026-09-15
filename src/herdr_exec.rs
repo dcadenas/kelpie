@@ -49,6 +49,13 @@ pub enum LeaseCmd {
         method: String,
         params: Value,
         after_write_pause: &'static str,
+        /// Override the connection's read budget for this request.
+        ///
+        /// A submission-observed prompt is answered only after Herdr watches
+        /// the target's lifecycle, which outlives the client's fast-fail
+        /// default. The override applies to the rest of this lease, which
+        /// serves one parked operation.
+        read_timeout: Option<Duration>,
     },
     /// Close the socket and return the worker to the pool.
     Drop,
@@ -443,7 +450,18 @@ fn run_lease(
                 method,
                 params,
                 after_write_pause,
+                read_timeout,
             }) => {
+                if let Some(timeout) = read_timeout
+                    && let Err(error) = stream.set_read_timeout(Some(timeout))
+                {
+                    let _ = event_tx.send(HerdrEvent::Failed {
+                        job_id,
+                        phase: FailPhase::Connect,
+                        error: HerdrError::Unavailable(error),
+                    });
+                    return;
+                }
                 let written_tx = event_tx.clone();
                 let wrote = Cell::new(false);
                 let raw = request_over_stream(

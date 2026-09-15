@@ -71,6 +71,13 @@ queued, or unknown effects. Keep one idempotency key per intended prompt; do not
 change it to bypass a duplicate refusal. The CLI writes `last-response.ndjson`
 under `$XDG_RUNTIME_DIR/kelpie/` (override: `KELPIE_RECEIPT_PATH`).
 
+A `herdr_prompt` receipt may carry `submission=stalled` or
+`submission=unobserved`: Herdr wrote the message but observed no agent activity
+afterwards. That is not a failure to resend. Do not repeat the message: the
+body is durable, the obligation stays open, and the recipient may still see it.
+Wait for the reply, or reconcile with `pending` and `ask-info`. A stall also
+raises an operator notice.
+
 `no ready agent for alias` does not prove absence. Before replacing or rebinding
 an agent, read [lifecycle](references/lifecycle.md) and reconcile its recorded
 logical identity with the exact live pane and terminal. Read runtime-start and

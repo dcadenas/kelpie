@@ -426,6 +426,31 @@ impl HerdrConnection {
         .and_then(|result| parse_agent_result(&result))
     }
 
+    /// Write one submission-observed `agent.prompt` request.
+    ///
+    /// The request carries Herdr's `wait` options, so the response describes
+    /// what the target did after the write rather than only that the bytes
+    /// were queued. `read_timeout` must outlive the wait window: Herdr answers
+    /// a stalled submission only after observing it, and a premature read
+    /// timeout would turn that evidence into an unknown outcome.
+    ///
+    /// # Errors
+    ///
+    /// Any returned transport or response error occurs at or after the external
+    /// write boundary and therefore has an unknown operation outcome.
+    pub fn prompt_agent_waiting(
+        self,
+        request_id: &str,
+        params: &Value,
+        read_timeout: Duration,
+    ) -> Result<AgentObservation, HerdrError> {
+        self.stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(HerdrError::Unavailable)?;
+        self.request(request_id, "agent.prompt", params)
+            .and_then(|result| parse_agent_result(&result))
+    }
+
     fn request(mut self, id: &str, method: &str, params: &Value) -> Result<Value, HerdrError> {
         request_over_stream(&mut self.stream, id, method, params, true, None)
     }

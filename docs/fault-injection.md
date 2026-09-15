@@ -23,7 +23,10 @@ The compiled points are test infrastructure, not a public operational API:
   are `submitted`; a Herdr connection exists; and no `agent.prompt` request byte
   has been written.
 - `ask_after_write_before_response`: the complete ask `agent.prompt` request has
-  been written and flushed, while no response has been read or decoded.
+  been written and flushed, while no response has been read or decoded. The
+  request asks Herdr to observe the target's submission, so this window covers
+  the lifecycle observation too; a kill here is still an unknown outcome, never
+  a stall.
 - `ask_after_response_before_commit`: a structured `agent.prompt` acceptance
   response has been decoded, while the prompt operation remains `pending`, its
   request attempt and delivery remain `submitted`, and its obligation remains

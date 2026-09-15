@@ -376,6 +376,30 @@ resent because the recipient may already have received the message. Draining a
 still-queued `socket_inbox` delivery on reconnect is that same attempt
 completing. It is not a resend.
 
+#### Submission observation
+
+A `herdr_prompt` delivery MAY ask Herdr to observe the target's lifecycle after
+the write. When it does, the response MUST distinguish whether agent activity
+followed the write, and that evidence MUST be recorded on the delivery attempt
+separately from the delivery outcome:
+
+- `observed`: the target produced a working or blocked state; the prompt was
+  consumed.
+- `stalled`: Herdr accepted the write and observed no agent activity within its
+  window. The delivery outcome is still `accepted`; the text may be sitting
+  unsubmitted, and a later turn can still consume it.
+- `unobserved`: the request returned without either observation.
+
+A stalled or unobserved submission MUST NOT be treated as a rejection, MUST NOT
+resolve, cancel, or orphan any obligation, and MUST NOT be resent. A stall MUST
+raise an operator notice. A receipt for the delivery MUST surface a
+non-observed submission; an observed submission is the normal case and MUST NOT
+change an existing receipt.
+
+Detection MUST be Herdr's live lifecycle observation, not Kelpie's inference:
+Kelpie MUST NOT inspect terminal contents, agent transcripts, or backend stores
+to decide whether a prompt was consumed.
+
 ### Obligation
 
 An `Obligation` records that one logical agent owes a final reply to a specific
@@ -1147,7 +1171,9 @@ success flag. The initial message MUST have its own immutable message ID,
 operation, delivery attempt, and outcome. Its semantic kind and reply
 expectation MUST be explicit `tell` or `ask` data and MUST NOT be inferred from
 message text. An unknown initial-message delivery MUST remain durable,
-operator-visible, and MUST NOT be automatically resent.
+operator-visible, and MUST NOT be automatically resent. Its submission
+evidence, when the transport observed it, MUST follow Submission observation
+and MUST be exposed in the launch response when it is not `observed`.
 
 ## Persistence
 

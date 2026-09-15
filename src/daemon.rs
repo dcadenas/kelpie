@@ -893,6 +893,7 @@ impl Daemon {
             method: "pane.close".into(),
             params: serde_json::json!({"pane_id": work.pane}),
             after_write_pause: "retire_after_write_before_response",
+            read_timeout: None,
         };
         if lease.send(send).is_err() {
             self.fail_retire_at(
@@ -1078,6 +1079,7 @@ impl Daemon {
                     } else {
                         ""
                     },
+                    read_timeout: None,
                 };
                 if lease.send(send).is_err() {
                     let source = HerdrError::Unexpected("herdr lease closed before rename".into());
@@ -1333,6 +1335,7 @@ impl Daemon {
                     method: "agent.rename".into(),
                     params: serde_json::json!({ "target": pane_id, "name": name }),
                     after_write_pause: "adopt_rename_after_write_before_response",
+                    read_timeout: None,
                 };
                 if lease.send(send).is_err() {
                     let source =
@@ -2385,6 +2388,7 @@ impl Daemon {
             method: "agent.prompt".into(),
             params: serde_json::json!({ "target": pane_id, "text": text }),
             after_write_pause: "",
+            read_timeout: None,
         };
         if lease.send(send).is_err() {
             self.fail_parked_renew(
@@ -3009,11 +3013,12 @@ impl Daemon {
                 let send = LeaseCmd::Send {
                     request_id: reminder.request_id,
                     method: "agent.prompt".into(),
-                    params: serde_json::json!({
-                        "target": reminder.reminder.pane_id,
-                        "text": reminder.envelope,
-                    }),
+                    params: crate::slice::message_prompt_params(
+                        &reminder.reminder.pane_id,
+                        &reminder.envelope,
+                    ),
                     after_write_pause: "",
+                    read_timeout: Some(crate::slice::PROMPT_WAIT_READ_TIMEOUT),
                 };
                 if lease.send(send).is_err() {
                     self.fail_parked_prompt(
@@ -3040,11 +3045,12 @@ impl Daemon {
                 let send = LeaseCmd::Send {
                     request_id: awaiting.prepared.request_id.clone(),
                     method: "agent.prompt".into(),
-                    params: serde_json::json!({
-                        "target": awaiting.prepared.pane_id,
-                        "text": awaiting.prepared.envelope,
-                    }),
+                    params: crate::slice::message_prompt_params(
+                        &awaiting.prepared.pane_id,
+                        &awaiting.prepared.envelope,
+                    ),
                     after_write_pause: awaiting.prepared.after_write_pause,
+                    read_timeout: Some(crate::slice::PROMPT_WAIT_READ_TIMEOUT),
                 };
                 if lease.send(send).is_err() {
                     self.fail_parked_prompt(
@@ -3106,6 +3112,7 @@ impl Daemon {
                     method: "agent.start".into(),
                     params: Kelpie::start_params(&start.intent),
                     after_write_pause: "start_after_write_before_response",
+                    read_timeout: None,
                 };
                 if lease.send(send).is_err() {
                     self.fail_parked_start(
@@ -3384,11 +3391,9 @@ impl Daemon {
             let send = LeaseCmd::Send {
                 request_id: prepared.request_id.clone(),
                 method: "agent.prompt".into(),
-                params: serde_json::json!({
-                    "target": prepared.pane_id,
-                    "text": prepared.envelope,
-                }),
+                params: crate::slice::message_prompt_params(&prepared.pane_id, &prepared.envelope),
                 after_write_pause: prepared.after_write_pause,
+                read_timeout: Some(crate::slice::PROMPT_WAIT_READ_TIMEOUT),
             };
             if lease.send(send).is_err() {
                 self.answer_initial_without_write(index);
@@ -3511,7 +3516,7 @@ impl Daemon {
         if let Err(error) = &result {
             self.kelpie.note_undelivered_brief(&start.intent, error);
         }
-        let response = respond(&start.request_id, result.map(launch_result));
+        let response = respond(&start.request_id, launch_result(result));
         if let Err(error) = write_response(&mut start.stream, &response) {
             eprintln!("kelpied: parked start response failed: {error}");
         }
@@ -3598,6 +3603,7 @@ impl Daemon {
                     method: "agent.prompt".into(),
                     params: serde_json::json!({ "target": pane_id, "text": command }),
                     after_write_pause: "clear_after_write_before_response",
+                    read_timeout: None,
                 };
                 if lease.send(send).is_err() {
                     self.fail_parked_clear(
@@ -4205,7 +4211,7 @@ impl Daemon {
             // than leaving a caller waiting on a response nothing will send.
             Served::AwaitingStart(mut awaiting) => {
                 let settled = settle_start_inline(&mut self.kelpie, &mut awaiting);
-                let response = respond(&awaiting.request_id, settled.map(launch_result));
+                let response = respond(&awaiting.request_id, launch_result(settled));
                 write_response(&mut awaiting.stream, &response)
             }
             Served::Inbox(session) => {
@@ -5305,20 +5311,27 @@ fn prepare_start(params: Value, kelpie: &mut Kelpie) -> Result<StartIntent, Slic
     Ok(intent)
 }
 
-fn launch_result(created: crate::slice::LaunchResult) -> Value {
-    serde_json::json!({
+fn launch_result(
+    created: Result<crate::slice::LaunchResult, SliceError>,
+) -> Result<Value, SliceError> {
+    let created = created?;
+    let mut initial_message = serde_json::json!({
+        "message_id": created.initial_message_id,
+        "operation_id": created.initial_message_operation_id,
+        "outcome": created.initial_message_outcome
+    });
+    if let Some(submission) = unobserved_submission(created.initial_message_submission.as_ref()) {
+        initial_message["submission"] = serde_json::json!(submission);
+    }
+    Ok(serde_json::json!({
         "logical_agent_id": created.logical_agent_id,
         "incarnation_id": created.incarnation_id,
         "runtime_start": {
             "operation_id": created.start_operation_id,
             "outcome": created.start_outcome
         },
-        "initial_message": {
-            "message_id": created.initial_message_id,
-            "operation_id": created.initial_message_operation_id,
-            "outcome": created.initial_message_outcome
-        }
-    })
+        "initial_message": initial_message
+    }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5442,7 +5455,7 @@ fn respond(request_id: &str, result: Result<Value, SliceError>) -> ClientRespons
 fn dispatch_start(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let intent = serde_json::from_value::<StartIntent>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-    kelpie.launch(&intent).map(launch_result)
+    launch_result(kelpie.launch(&intent))
 }
 
 fn dispatch_adopt(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
@@ -6312,6 +6325,18 @@ fn drop_lease(lease: Option<std::sync::mpsc::Sender<LeaseCmd>>) {
     }
 }
 
+/// The non-observed submission word recorded for an accepted prompt, if any.
+///
+/// An observed submission is the normal case and stays out of receipts so the
+/// happy-path output is unchanged. A stalled or unobserved write is reported
+/// so a sender learns the recipient may not have seen the message.
+fn unobserved_submission(evidence: Option<&Value>) -> Option<&str> {
+    evidence
+        .and_then(|evidence| evidence.get("submission"))
+        .and_then(Value::as_str)
+        .filter(|word| *word != "observed")
+}
+
 fn fill_prompt_result(kelpie: &mut Kelpie, awaiting: &mut AwaitingPrompt, delivered_ok: bool) {
     if !delivered_ok {
         return;
@@ -6321,6 +6346,21 @@ fn fill_prompt_result(kelpie: &mut Kelpie, awaiting: &mut AwaitingPrompt, delive
         .delivery_outcome(awaiting.prepared.operation_id)
     {
         awaiting.result_json["delivery_outcome"] = serde_json::json!(outcome);
+    }
+    if let Ok(evidence) = kelpie
+        .store_mut()
+        .operation_attempt_evidence(awaiting.prepared.operation_id)
+    {
+        if let Some(submission) = unobserved_submission(evidence.as_ref()) {
+            awaiting.result_json["submission"] = serde_json::json!(submission);
+        }
+        if let Some(detail) = evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("detail"))
+            .and_then(Value::as_str)
+        {
+            awaiting.result_json["submission_detail"] = serde_json::json!(detail);
+        }
     }
     if let Some(reply_to) = awaiting.reply_to
         && let Ok(state) = kelpie.store_mut().obligation_state(reply_to)

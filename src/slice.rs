@@ -235,7 +235,7 @@ const PROMPT_SETTLE_DELAY_MS: i64 = 5_000;
 const CLEAR_PROOF_ABANDON_MS: i64 = 10 * 60 * 1_000;
 
 /// Separate durable receipts for runtime readiness and initial-message delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchResult {
     pub logical_agent_id: LogicalAgentId,
     pub incarnation_id: IncarnationId,
@@ -244,6 +244,9 @@ pub struct LaunchResult {
     pub initial_message_id: MessageId,
     pub initial_message_operation_id: crate::domain::OperationId,
     pub initial_message_outcome: DeliveryOutcome,
+    /// Submission evidence recorded for the initial prompt, when Herdr was
+    /// asked to observe it. `None` when nothing was recorded.
+    pub initial_message_submission: Option<serde_json::Value>,
 }
 
 /// Durable receipt for one standalone backend clear.
@@ -627,6 +630,83 @@ pub struct PreparedPrompt {
     pub pause_before_write: &'static str,
     pub after_write_pause: &'static str,
     pub pause_before_commit: &'static str,
+}
+
+/// How long Herdr may spend observing one message prompt's submission before it
+/// reports that no agent activity followed the write.
+///
+/// Herdr's own effect window is five seconds; the caller budget sits above it
+/// so the answer is a stall, not a caller timeout.
+const PROMPT_SUBMISSION_WAIT_MS: u64 = 8_000;
+
+/// Read budget for a submission-observed prompt request.
+///
+/// The prompt is written before Herdr begins watching, so a stall is reported
+/// only after the observation window. The read must outlive that window or a
+/// silent submission would surface as a transport failure instead of evidence.
+pub(crate) const PROMPT_WAIT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// What Herdr observed after a prompt write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionObservation {
+    /// The target produced a working or blocked state; the prompt was consumed.
+    Observed,
+    /// The write was accepted but no agent activity followed within the window.
+    Stalled,
+    /// Herdr returned before observing either, e.g. a caller timeout.
+    Unobserved,
+}
+
+impl SubmissionObservation {
+    /// Serializable evidence recorded beside one accepted delivery attempt.
+    fn evidence(self, detail: Option<&str>) -> serde_json::Value {
+        let mut evidence = serde_json::json!({
+            "submission": match self {
+                Self::Observed => "observed",
+                Self::Stalled => "stalled",
+                Self::Unobserved => "unobserved",
+            }
+        });
+        if let Some(detail) = detail {
+            evidence["detail"] = serde_json::Value::String(detail.to_string());
+        }
+        evidence
+    }
+}
+
+/// Classify a post-write prompt error as submission evidence.
+///
+/// `agent_prompt_stalled` and the wait-phase `timeout` are emitted only after
+/// Herdr wrote the prompt and matched its identity; they describe what the
+/// target did afterwards, so they are evidence, never a pre-write rejection.
+fn post_write_observation(error: &HerdrError) -> Option<SubmissionObservation> {
+    match error {
+        HerdrError::Rejected { code, .. } if code == "agent_prompt_stalled" => {
+            Some(SubmissionObservation::Stalled)
+        }
+        HerdrError::Rejected { code, .. } if code == "timeout" => {
+            Some(SubmissionObservation::Unobserved)
+        }
+        _ => None,
+    }
+}
+
+/// Herdr prompt params for one message delivery.
+///
+/// `wait` asks Herdr to observe the target's lifecycle after the write: an
+/// already-working target matches immediately, an idle one matches when it
+/// starts working, and a write that produces no activity returns a stall
+/// error instead of a bare acceptance. The recipient still receives exactly
+/// the same bytes; Herdr only watches.
+pub(crate) fn message_prompt_params(target: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "target": target,
+        "text": text,
+        "wait": {
+            "until": ["working", "blocked"],
+            "timeout_ms": PROMPT_SUBMISSION_WAIT_MS,
+        },
+    })
 }
 
 impl Kelpie {
@@ -1424,10 +1504,10 @@ impl Kelpie {
         let (prepared, message_id) = self.begin_initial_message(intent, started)?;
         if let Ok(connection) = self.blocking_connect() {
             self.commit_prompt_intent(&prepared)?;
-            let result = connection.prompt_agent(
+            let result = connection.prompt_agent_waiting(
                 &prepared.request_id,
-                &prepared.pane_id,
-                &prepared.envelope,
+                &message_prompt_params(&prepared.pane_id, &prepared.envelope),
+                PROMPT_WAIT_READ_TIMEOUT,
             );
             self.complete_initial_delivery(&prepared, started, message_id, result)?;
         }
@@ -1487,31 +1567,50 @@ impl Kelpie {
         match result {
             Ok(agent) => {
                 crate::test_fault::pause(prepared.pause_before_commit);
-                self.store.accept_delivery(
+                self.store.accept_delivery_with_submission(
                     prepared.operation_id,
                     prepared.recipient_incarnation,
                     &agent.pane_id,
                     &agent.terminal_id,
-                )?;
-            }
-            Err(source) if matches!(&source, HerdrError::Rejected { .. }) => {
-                self.store.mark_rejected(
-                    prepared.operation_id,
-                    prepared.recipient_incarnation,
-                    &source.to_string(),
-                    DeliveryOutcome::Rejected,
+                    Some(&SubmissionObservation::Observed.evidence(None)),
                 )?;
             }
             Err(source) => {
-                self.store.mark_unknown(
-                    prepared.operation_id,
-                    prepared.recipient_incarnation,
-                    &source.to_string(),
-                )?;
-                self.store.create_operator_notice(&format!(
-                    "initial message {message_id} has unknown delivery outcome for incarnation {}",
-                    started.incarnation_id
-                ))?;
+                if let Some(observation) = post_write_observation(&source) {
+                    let detail = source.to_string();
+                    let binding = self.store.ready_binding(prepared.recipient_incarnation)?;
+                    crate::test_fault::pause(prepared.pause_before_commit);
+                    self.store.accept_delivery_with_submission(
+                        prepared.operation_id,
+                        prepared.recipient_incarnation,
+                        &binding.pane_id,
+                        &binding.terminal_id,
+                        Some(&observation.evidence(Some(&detail))),
+                    )?;
+                    if observation == SubmissionObservation::Stalled {
+                        self.store.create_operator_notice(&format!(
+                            "initial message {message_id} to incarnation {} on pane {} was written but produced no observed agent activity ({detail}); nothing was resent",
+                            started.incarnation_id, prepared.pane_id
+                        ))?;
+                    }
+                } else if matches!(&source, HerdrError::Rejected { .. }) {
+                    self.store.mark_rejected(
+                        prepared.operation_id,
+                        prepared.recipient_incarnation,
+                        &source.to_string(),
+                        DeliveryOutcome::Rejected,
+                    )?;
+                } else {
+                    self.store.mark_unknown(
+                        prepared.operation_id,
+                        prepared.recipient_incarnation,
+                        &source.to_string(),
+                    )?;
+                    self.store.create_operator_notice(&format!(
+                        "initial message {message_id} has unknown delivery outcome for incarnation {}",
+                        started.incarnation_id
+                    ))?;
+                }
             }
         }
         Ok(())
@@ -1536,6 +1635,9 @@ impl Kelpie {
             initial_message_id: message_id,
             initial_message_operation_id: message_operation_id,
             initial_message_outcome: self.store.delivery_outcome(message_operation_id)?,
+            initial_message_submission: self
+                .store
+                .operation_attempt_evidence(message_operation_id)?,
         })
     }
 
@@ -3310,7 +3412,7 @@ impl Kelpie {
                 self.store.resolve_reminder_attempt(
                     &prepared.request_id,
                     "accepted",
-                    None,
+                    Some(&SubmissionObservation::Observed.evidence(None).to_string()),
                     now_ms,
                 )?;
                 Ok(())
@@ -3326,26 +3428,44 @@ impl Kelpie {
                     "reminder response belongs to a replacement runtime".into(),
                 )))
             }
-            Err(source @ HerdrError::Rejected { .. }) => {
-                self.store.resolve_reminder_attempt(
-                    &prepared.request_id,
-                    "rejected",
-                    Some(&source.to_string()),
-                    now_ms,
-                )?;
-                Err(SliceError::Herdr(source))
-            }
             Err(source) => {
-                self.store.resolve_reminder_attempt(
-                    &prepared.request_id,
-                    "unknown",
-                    Some(&source.to_string()),
-                    now_ms,
-                )?;
-                Err(SliceError::UnknownOutcome {
-                    operation_id: prepared.request_id.clone(),
-                    source,
-                })
+                if let Some(observation) = post_write_observation(&source) {
+                    let detail = source.to_string();
+                    self.store.resolve_reminder_attempt(
+                        &prepared.request_id,
+                        "accepted",
+                        Some(&observation.evidence(Some(&detail)).to_string()),
+                        now_ms,
+                    )?;
+                    if observation == SubmissionObservation::Stalled {
+                        self.store.create_operator_notice(&format!(
+                            "reminder {} for ask {} on pane {} was written but produced no observed agent activity ({detail}); nothing was resent",
+                            prepared.request_id,
+                            prepared.reminder.ask_message_id,
+                            prepared.reminder.pane_id
+                        ))?;
+                    }
+                    Ok(())
+                } else if matches!(&source, HerdrError::Rejected { .. }) {
+                    self.store.resolve_reminder_attempt(
+                        &prepared.request_id,
+                        "rejected",
+                        Some(&source.to_string()),
+                        now_ms,
+                    )?;
+                    Err(SliceError::Herdr(source))
+                } else {
+                    self.store.resolve_reminder_attempt(
+                        &prepared.request_id,
+                        "unknown",
+                        Some(&source.to_string()),
+                        now_ms,
+                    )?;
+                    Err(SliceError::UnknownOutcome {
+                        operation_id: prepared.request_id.clone(),
+                        source,
+                    })
+                }
             }
         }
     }
@@ -4041,7 +4161,11 @@ impl Kelpie {
         self.commit_prompt_intent(prepared)?;
         match self.complete_prompt_delivery(
             prepared,
-            connection.prompt_agent(&prepared.request_id, &prepared.pane_id, &prepared.envelope),
+            connection.prompt_agent_waiting(
+                &prepared.request_id,
+                &message_prompt_params(&prepared.pane_id, &prepared.envelope),
+                PROMPT_WAIT_READ_TIMEOUT,
+            ),
         ) {
             Ok(()) => Ok(true),
             Err(SliceError::Herdr(_) | SliceError::UnknownOutcome { .. }) => Ok(false),
@@ -5025,8 +5149,11 @@ impl Kelpie {
     ) -> Result<(), SliceError> {
         let connection = self.blocking_connect()?;
         self.commit_prompt_intent(prepared)?;
-        let result =
-            connection.prompt_agent(&prepared.request_id, &prepared.pane_id, &prepared.envelope);
+        let result = connection.prompt_agent_waiting(
+            &prepared.request_id,
+            &message_prompt_params(&prepared.pane_id, &prepared.envelope),
+            PROMPT_WAIT_READ_TIMEOUT,
+        );
         self.complete_prompt_delivery(prepared, result)
     }
 
@@ -5188,47 +5315,82 @@ impl Kelpie {
         prepared: &PreparedPrompt,
         result: Result<AgentObservation, HerdrError>,
     ) -> Result<(), SliceError> {
-        match result {
-            Ok(agent) => {
-                crate::test_fault::pause(prepared.pause_before_commit);
-                self.store.accept_delivery(
-                    prepared.operation_id,
-                    prepared.recipient_incarnation,
-                    &agent.pane_id,
-                    &agent.terminal_id,
-                )?;
-                Ok(())
-            }
-            Err(source) if matches!(&source, HerdrError::Rejected { .. }) => {
-                let target_absent = matches!(
-                    &source,
-                    HerdrError::Rejected { code, .. } if code.contains("not_found")
-                );
-                let delivery_outcome = if target_absent {
-                    DeliveryOutcome::TargetUnavailable
-                } else {
-                    DeliveryOutcome::Rejected
-                };
-                self.store.mark_rejected(
-                    prepared.operation_id,
-                    prepared.recipient_incarnation,
-                    &source.to_string(),
-                    delivery_outcome,
-                )?;
-                Err(SliceError::Herdr(source))
-            }
-            Err(source) => {
-                self.store.mark_unknown(
-                    prepared.operation_id,
-                    prepared.recipient_incarnation,
-                    &source.to_string(),
-                )?;
-                Err(SliceError::UnknownOutcome {
-                    operation_id: prepared.operation_id.to_string(),
-                    source,
-                })
-            }
+        let agent = match result {
+            Ok(agent) => agent,
+            Err(source) => return self.apply_prompt_error(prepared, source),
+        };
+        crate::test_fault::pause(prepared.pause_before_commit);
+        self.store.accept_delivery_with_submission(
+            prepared.operation_id,
+            prepared.recipient_incarnation,
+            &agent.pane_id,
+            &agent.terminal_id,
+            Some(&SubmissionObservation::Observed.evidence(None)),
+        )?;
+        Ok(())
+    }
+
+    /// Apply a post-write prompt failure that is evidence, not a rejection.
+    ///
+    /// A stalled submission is still a write Herdr accepted: the target simply
+    /// produced no observed activity. The delivery stays accepted, the evidence
+    /// is durable, and nothing is resent — the text may be sitting unsubmitted
+    /// or land later, so a late turn can still resolve the obligation.
+    fn apply_prompt_error(
+        &mut self,
+        prepared: &PreparedPrompt,
+        source: HerdrError,
+    ) -> Result<(), SliceError> {
+        let Some(observation) = post_write_observation(&source) else {
+            return match source {
+                source if matches!(&source, HerdrError::Rejected { .. }) => {
+                    let target_absent = matches!(
+                        &source,
+                        HerdrError::Rejected { code, .. } if code.contains("not_found")
+                    );
+                    let delivery_outcome = if target_absent {
+                        DeliveryOutcome::TargetUnavailable
+                    } else {
+                        DeliveryOutcome::Rejected
+                    };
+                    self.store.mark_rejected(
+                        prepared.operation_id,
+                        prepared.recipient_incarnation,
+                        &source.to_string(),
+                        delivery_outcome,
+                    )?;
+                    Err(SliceError::Herdr(source))
+                }
+                source => {
+                    self.store.mark_unknown(
+                        prepared.operation_id,
+                        prepared.recipient_incarnation,
+                        &source.to_string(),
+                    )?;
+                    Err(SliceError::UnknownOutcome {
+                        operation_id: prepared.operation_id.to_string(),
+                        source,
+                    })
+                }
+            };
+        };
+        crate::test_fault::pause(prepared.pause_before_commit);
+        let detail = source.to_string();
+        let binding = self.store.ready_binding(prepared.recipient_incarnation)?;
+        self.store.accept_delivery_with_submission(
+            prepared.operation_id,
+            prepared.recipient_incarnation,
+            &binding.pane_id,
+            &binding.terminal_id,
+            Some(&observation.evidence(Some(&detail))),
+        )?;
+        if observation == SubmissionObservation::Stalled {
+            self.store.create_operator_notice(&format!(
+                "prompt {} to incarnation {} on pane {} was written but produced no observed agent activity ({detail}); nothing was resent and any obligation stays open",
+                prepared.request_id, prepared.recipient_incarnation, prepared.pane_id
+            ))?;
         }
+        Ok(())
     }
 
     fn fire_one_reminder(&mut self, reminder: &DueReminder, now_ms: i64) -> Result<(), SliceError> {
@@ -5239,13 +5401,21 @@ impl Kelpie {
         self.store
             .prepare_reminder_attempt(reminder, &request_id, now_ms)?;
         self.store.submit_reminder_attempt(&request_id)?;
-        match connection.prompt_agent(&request_id, &reminder.pane_id, &envelope) {
+        match connection.prompt_agent_waiting(
+            &request_id,
+            &message_prompt_params(&reminder.pane_id, &envelope),
+            PROMPT_WAIT_READ_TIMEOUT,
+        ) {
             Ok(agent)
                 if agent.pane_id == reminder.pane_id
                     && agent.terminal_id == reminder.terminal_id =>
             {
-                self.store
-                    .resolve_reminder_attempt(&request_id, "accepted", None, now_ms)?;
+                self.store.resolve_reminder_attempt(
+                    &request_id,
+                    "accepted",
+                    Some(&SubmissionObservation::Observed.evidence(None).to_string()),
+                    now_ms,
+                )?;
                 Ok(())
             }
             Ok(_) => {
@@ -5259,26 +5429,42 @@ impl Kelpie {
                     "reminder response belongs to a replacement runtime".into(),
                 )))
             }
-            Err(source @ HerdrError::Rejected { .. }) => {
-                self.store.resolve_reminder_attempt(
-                    &request_id,
-                    "rejected",
-                    Some(&source.to_string()),
-                    now_ms,
-                )?;
-                Err(SliceError::Herdr(source))
-            }
             Err(source) => {
-                self.store.resolve_reminder_attempt(
-                    &request_id,
-                    "unknown",
-                    Some(&source.to_string()),
-                    now_ms,
-                )?;
-                Err(SliceError::UnknownOutcome {
-                    operation_id: request_id,
-                    source,
-                })
+                if let Some(observation) = post_write_observation(&source) {
+                    let detail = source.to_string();
+                    self.store.resolve_reminder_attempt(
+                        &request_id,
+                        "accepted",
+                        Some(&observation.evidence(Some(&detail)).to_string()),
+                        now_ms,
+                    )?;
+                    if observation == SubmissionObservation::Stalled {
+                        self.store.create_operator_notice(&format!(
+                            "reminder {request_id} for ask {} on pane {} was written but produced no observed agent activity ({detail}); nothing was resent",
+                            reminder.ask_message_id, reminder.pane_id
+                        ))?;
+                    }
+                    Ok(())
+                } else if matches!(&source, HerdrError::Rejected { .. }) {
+                    self.store.resolve_reminder_attempt(
+                        &request_id,
+                        "rejected",
+                        Some(&source.to_string()),
+                        now_ms,
+                    )?;
+                    Err(SliceError::Herdr(source))
+                } else {
+                    self.store.resolve_reminder_attempt(
+                        &request_id,
+                        "unknown",
+                        Some(&source.to_string()),
+                        now_ms,
+                    )?;
+                    Err(SliceError::UnknownOutcome {
+                        operation_id: request_id,
+                        source,
+                    })
+                }
             }
         }
     }
@@ -6981,7 +7167,141 @@ mod tests {
                 .expect("delivery"),
             DeliveryOutcome::Accepted
         );
-        server.join().expect("server");
+        server.join().expect("fake Herdr server");
+    }
+
+    /// One fake Herdr exchange for a prompt whose response is a post-write
+    /// observation error rather than an acceptance.
+    fn serve_prompt_error(socket: &std::path::Path, code: &'static str) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind fake Herdr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept prompt");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut line)
+                .expect("read request");
+            let request: Value = serde_json::from_str(&line).expect("request JSON");
+            assert_eq!(request["method"], "agent.prompt");
+            let wait = &request["params"]["wait"];
+            assert_eq!(wait["until"], serde_json::json!(["working", "blocked"]));
+            assert_eq!(wait["timeout_ms"], 8_000);
+            let response = serde_json::json!({
+                "id": request["id"],
+                "error": {"code": code, "message": "no activity observed"}
+            });
+            serde_json::to_writer(&mut stream, &response).expect("response");
+            stream.write_all(b"\n").expect("finish response");
+        })
+    }
+
+    fn ready_worker(store: &mut Store) -> DeclaredStart {
+        let declared = store.declare_start(&e2e_intent()).expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, "start")
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                declared.operation_id,
+                declared.incarnation_id,
+                &crate::herdr::AgentObservation {
+                    terminal_id: "term-1".into(),
+                    pane_id: "w1:p1".into(),
+                    name: Some("worker".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        declared
+    }
+
+    #[test]
+    fn stalled_prompt_stays_accepted_with_evidence_and_a_notice() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let server = serve_prompt_error(&socket, "agent_prompt_stalled");
+
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_worker(&mut store);
+        let herdr = HerdrClient::new(&socket, Duration::from_secs(1));
+        let mut kelpie = Kelpie::new(store, herdr);
+        let tell = kelpie
+            .tell(
+                declared.logical_agent_id,
+                declared.logical_agent_id,
+                declared.incarnation_id,
+                "may not arrive",
+                "tell-stalled",
+                None,
+            )
+            .expect("tell");
+        assert_eq!(
+            kelpie
+                .store_mut()
+                .delivery_outcome(tell.operation_id)
+                .expect("delivery"),
+            DeliveryOutcome::Accepted
+        );
+        let evidence = kelpie
+            .store_mut()
+            .operation_attempt_evidence(tell.operation_id)
+            .expect("evidence")
+            .expect("recorded");
+        assert_eq!(evidence["submission"], "stalled");
+        let notices = kelpie.store_mut().operator_notices().expect("notices");
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].body.contains("no observed agent activity"),
+            "{}",
+            notices[0].body
+        );
+        server.join().expect("fake Herdr server");
+    }
+
+    #[test]
+    fn caller_timeout_is_unobserved_evidence_without_a_notice() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let server = serve_prompt_error(&socket, "timeout");
+
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_worker(&mut store);
+        let herdr = HerdrClient::new(&socket, Duration::from_secs(1));
+        let mut kelpie = Kelpie::new(store, herdr);
+        let tell = kelpie
+            .tell(
+                declared.logical_agent_id,
+                declared.logical_agent_id,
+                declared.incarnation_id,
+                "may not arrive",
+                "tell-timeout",
+                None,
+            )
+            .expect("tell");
+        assert_eq!(
+            kelpie
+                .store_mut()
+                .delivery_outcome(tell.operation_id)
+                .expect("delivery"),
+            DeliveryOutcome::Accepted
+        );
+        let evidence = kelpie
+            .store_mut()
+            .operation_attempt_evidence(tell.operation_id)
+            .expect("evidence")
+            .expect("recorded");
+        assert_eq!(evidence["submission"], "unobserved");
+        assert!(
+            kelpie
+                .store_mut()
+                .operator_notices()
+                .expect("notices")
+                .is_empty()
+        );
+        server.join().expect("fake Herdr server");
     }
 
     #[test]

@@ -178,7 +178,17 @@ Herdr's own rejection code passed through unaltered, or a Kelpie code such as
 outcome. `initial_message` contains its immutable message ID, independent
 operation ID, and delivery outcome. A Ready incarnation does not imply that the
 initial message was delivered, and an `unknown` delivery is never resent
-automatically.
+automatically. When Herdr observed the initial prompt's submission and it was
+not `observed`, `initial_message` also carries `submission`.
+
+`herdr_prompt` deliveries carry submission evidence from Herdr's own lifecycle
+observation. A receipt reports a non-`observed` submission as
+`submission=stalled` or `submission=unobserved` (JSON `submission`, plus
+`submission_detail` when Herdr names the current status). An `observed`
+submission is the normal case and is not printed. A stalled submission is still
+an `accepted` delivery: nothing was resent, the obligation stays open, and a
+later turn can still resolve it. A stall also raises an operator notice. Kelpie
+never inspects terminal contents, transcripts, or backend stores to decide this.
 
 The client accepts `--due-in 10m` (units `s`, `m`, `h`, `d`) and `--due-at`
 with a UTC RFC3339 timestamp ending in `Z` or `+00:00`, resolving both to

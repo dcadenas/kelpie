@@ -1887,6 +1887,34 @@ impl Store {
         pane_id: &str,
         terminal_id: &str,
     ) -> Result<(), StoreError> {
+        self.accept_delivery_with_submission(
+            operation_id,
+            incarnation_id,
+            pane_id,
+            terminal_id,
+            None,
+        )
+    }
+
+    /// Commit Herdr acceptance with the prompt's submission evidence.
+    ///
+    /// `submission` is what the prompt response carried when Herdr was asked to
+    /// watch the target's lifecycle: whether agent activity was observed after
+    /// the write, a stalled submission, or neither. It is recorded on the
+    /// attempt beside the acceptance and never changes the delivery outcome: a
+    /// stalled submission is still a write Herdr accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the Herdr response identifies a replacement runtime.
+    pub fn accept_delivery_with_submission(
+        &mut self,
+        operation_id: OperationId,
+        incarnation_id: IncarnationId,
+        pane_id: &str,
+        terminal_id: &str,
+        submission: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         let binding: Option<(String, String)> = tx
@@ -1922,11 +1950,16 @@ impl Store {
             params![now, operation_id.to_string(), incarnation_id.to_string()],
         )?;
         tx.execute(
-            "UPDATE operation_attempts SET phase = 'response_committed', resolved_at_ms = ?1
-             WHERE operation_id = ?2 AND attempt_number = (
-                SELECT MAX(attempt_number) FROM operation_attempts WHERE operation_id = ?2
+            "UPDATE operation_attempts SET phase = 'response_committed', resolved_at_ms = ?1,
+                    evidence_json = COALESCE(?2, evidence_json)
+             WHERE operation_id = ?3 AND attempt_number = (
+                SELECT MAX(attempt_number) FROM operation_attempts WHERE operation_id = ?3
              )",
-            params![now, operation_id.to_string()],
+            params![
+                now,
+                submission.map(ToString::to_string),
+                operation_id.to_string()
+            ],
         )?;
         tx.execute(
             "UPDATE obligation_reminders SET next_due_at_ms = ?1 + interval_ms,
@@ -5098,6 +5131,35 @@ impl Store {
             |row| row.get(0),
         )?;
         parse_delivery_outcome(&value)
+    }
+
+    /// Read the newest attempt evidence recorded for one operation, if any.
+    ///
+    /// Prompt attempts carry submission evidence here: whether Herdr observed
+    /// agent activity after the write (`observed`), reported a stalled
+    /// submission (`stalled`), or returned before observing either
+    /// (`unobserved`). A rejected or unknown attempt records its error instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails or the recorded JSON is malformed.
+    pub fn operation_attempt_evidence(
+        &self,
+        id: OperationId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let raw: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM operation_attempts
+                 WHERE operation_id = ?1
+                 ORDER BY attempt_number DESC LIMIT 1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|text| serde_json::from_str(&text).map_err(|error| invalid_json(&error)))
+            .transpose()
     }
 
     /// Persist an operator notice before any best-effort display attempt.

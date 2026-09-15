@@ -452,20 +452,22 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
                 String::new()
             };
             format!(
-                "{method} message={} operation={} recipient={} delivery={}{due}{reminder}\n",
+                "{method} message={} operation={} recipient={} delivery={}{due}{reminder}{submission}\n",
                 field(&result, "message_id"),
                 field(&result, "operation_id"),
                 field(&result, "recipient"),
-                field(&result, "delivery_outcome")
+                field(&result, "delivery_outcome"),
+                submission = submission_suffix(&result)
             )
         }
         "renew" => format_renew_receipt(&result),
         "clear" => format_clear_receipt(&result),
         "reply" => format!(
-            "reply message={} delivery={} obligation={}\n",
+            "reply message={} delivery={} obligation={}{submission}\n",
             field(&result, "message_id"),
             field(&result, "delivery_outcome"),
-            field(&result, "obligation_state")
+            field(&result, "obligation_state"),
+            submission = submission_suffix(&result)
         ),
         "replies.claim" => format!(
             "replies-claim lease={} ask={}\n",
@@ -487,12 +489,13 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
         ),
         "who" => render_who(&result),
         "start" => format!(
-            "start agent={} incarnation={} runtime={} message={} delivery={}\n",
+            "start agent={} incarnation={} runtime={} message={} delivery={}{submission}\n",
             field(&result, "logical_agent_id"),
             field(&result, "incarnation_id"),
             nested_field(&result, "runtime_start", "outcome"),
             field(&result["initial_message"], "message_id"),
-            nested_field(&result, "initial_message", "outcome")
+            nested_field(&result, "initial_message", "outcome"),
+            submission = submission_suffix(&result["initial_message"])
         ),
         "adopt" => format!(
             "adopt agent={} incarnation={} outcome={}\n",
@@ -2105,6 +2108,19 @@ fn field(value: &Value, name: &str) -> String {
         Value::Bool(flag) => flag.to_string(),
         Value::Null => "-".into(),
         other => other.to_string(),
+    }
+}
+
+/// Render ` submission=…` for a prompt whose submission was not observed.
+///
+/// Observed submissions are the normal case and render nothing, so ordinary
+/// receipts are unchanged. A stalled or unobserved write is shown because the
+/// sender may need to act: the message was not resent and the recipient may
+/// never have seen it.
+fn submission_suffix(value: &Value) -> String {
+    match value.get("submission").and_then(Value::as_str) {
+        Some(submission) => format!(" submission={submission}"),
+        None => String::new(),
     }
 }
 
@@ -3808,6 +3824,37 @@ mod tests {
             );
             assert!(text.contains(&format!("delivery={outcome}")), "{text}");
         }
+    }
+
+    #[test]
+    fn receipt_shows_only_non_observed_submission_evidence() {
+        let observed = format_receipt(
+            "tell",
+            &json!({"result":{"message_id":"m","operation_id":"o","recipient":"r","delivery_outcome":"accepted"}}),
+        );
+        assert!(!observed.contains("submission="), "{observed}");
+
+        let stalled = format_receipt(
+            "tell",
+            &json!({"result":{"message_id":"m","operation_id":"o","recipient":"r","delivery_outcome":"accepted","submission":"stalled"}}),
+        );
+        assert!(stalled.contains("submission=stalled"), "{stalled}");
+
+        let unobserved = format_receipt(
+            "reply",
+            &json!({"result":{"message_id":"m","delivery_outcome":"accepted","obligation_state":"open","submission":"unobserved"}}),
+        );
+        assert!(unobserved.contains("submission=unobserved"), "{unobserved}");
+
+        let start = format_receipt(
+            "start",
+            &json!({"result":{
+                "logical_agent_id":1,"incarnation_id":2,
+                "runtime_start":{"outcome":"succeeded"},
+                "initial_message":{"message_id":"m","outcome":"accepted","submission":"stalled"}
+            }}),
+        );
+        assert!(start.contains("submission=stalled"), "{start}");
     }
 
     fn start_args() -> Vec<String> {
