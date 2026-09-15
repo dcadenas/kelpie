@@ -6,6 +6,15 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.8
+
+Message prompts ask Herdr to watch the target after the write. A receipt can
+now carry `submission=stalled` or `submission=unobserved`, and a stalled write
+raises an operator notice. Nothing is resent and the obligation stays open: a
+stalled word means Herdr wrote the message but observed no agent activity, and
+the recipient may still see it later. Do not resend on that word. Observed
+submissions change nothing in the receipt. No schema change; restart kelpied.
+
 ## 0.2.0-alpha.7
 
 Reverse replies can stay off the waiting pane. At `ask` or `start --ask` time,
