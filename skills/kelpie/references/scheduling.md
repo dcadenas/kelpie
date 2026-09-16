@@ -62,6 +62,16 @@ Contents: [Method details](#method-details); [writing renew prompts](#writing-re
   preparing or clearing continues when the agent becomes idle. Completed,
   skipped, aborted, and abandoned cycles re-arm the recurring policy.
 
+  Choose the clock by what makes the context grow. An agent that idles between
+  bursts belongs on `--every`: idle time adds no context, while a `--due-in`
+  chain spends a checkpoint and a resume on a context that never grew. Size
+  the interval from measured growth, not wall-clock habit -- a chat agent can
+  append on the order of 100 tokens per second of work, so an hours-long
+  active interval arrives after the window is already gone. Read the target's
+  token growth per active second and keep the interval well under what its
+  window can absorb. `--due-in` suits a refresh that is owed by a deadline
+  regardless of occupancy.
+
   The policy ends when its incarnation stops being Ready or an authorized
   cancellation ends it. Incarnation termination raises an operator notice naming
   agent, incarnation, and renew. Adoption restores addressing, not the policy.
