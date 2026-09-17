@@ -6,6 +6,16 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.9
+
+`KELPIE_SOCKET` now selects the Kelpie socket for both binaries when set (an
+empty value is ignored), with `--socket` still winning. If you set the variable
+while it was ignored, unset it or point it at the daemon you mean. Repeating a
+`tell` or `reply` idempotency key aimed at a socket waiter now returns the
+stored message and its current delivery outcome instead of an internal UNIQUE
+error, so a client that retried with a fresh key can retry with the original
+one. No schema change; restart kelpied.
+
 ## 0.2.0-alpha.8
 
 Message prompts ask Herdr to watch the target after the write. A receipt can
