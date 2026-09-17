@@ -739,3 +739,85 @@ fn waiter_retire_cancels_open_ask_and_refuses_later_final_as_not_open() {
     daemon.kill().expect("stop");
     daemon.wait().expect("reap");
 }
+
+#[test]
+fn repeated_socket_inbox_keys_replay_instead_of_conflicting() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let (_waiter, owing, ask) = seed_waiter_and_ask(&database);
+    let _herdr = spawn_startup_herdr(&herdr_socket);
+    let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
+
+    let tell = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "method": "tell",
+            "params": {
+                "sender": owing.logical_agent_id,
+                "recipient_alias": "inbox",
+                "body": "hello",
+                "idempotency_key": "replay-tell"
+            }
+        })
+    };
+    let first_tell = send_request(&kelpie_socket, &tell("tell-1"));
+    assert_eq!(first_tell["result"]["delivery_outcome"], "queued");
+    let repeated_tell = send_request(&kelpie_socket, &tell("tell-2"));
+    assert!(
+        repeated_tell.get("error").is_none(),
+        "repeat must replay, not fail: {repeated_tell}"
+    );
+    assert_eq!(
+        repeated_tell["result"]["message_id"],
+        first_tell["result"]["message_id"]
+    );
+    assert_eq!(repeated_tell["result"]["delivery_outcome"], "queued");
+
+    let reply = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "method": "reply",
+            "params": {
+                "reply_to": ask,
+                "requester_agent_id": owing.logical_agent_id,
+                "body": "done",
+                "disposition": "final",
+                "idempotency_key": "replay-final"
+            }
+        })
+    };
+    let first_reply = send_request(&kelpie_socket, &reply("reply-1"));
+    assert_eq!(first_reply["result"]["delivery_outcome"], "queued");
+    let repeated_reply = send_request(&kelpie_socket, &reply("reply-2"));
+    assert!(
+        repeated_reply.get("error").is_none(),
+        "repeat must replay, not fail: {repeated_reply}"
+    );
+    assert_eq!(
+        repeated_reply["result"]["message_id"],
+        first_reply["result"]["message_id"]
+    );
+    assert_eq!(repeated_reply["result"]["delivery_outcome"], "queued");
+    assert_eq!(repeated_reply["result"]["obligation_state"], "open");
+
+    let counts: (i64, i64) = Connection::open(&database)
+        .expect("db")
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM messages WHERE kind = 'tell'),
+                (SELECT COUNT(*) FROM messages WHERE kind = 'reply')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("counts");
+    assert_eq!(
+        counts,
+        (1, 1),
+        "a repeated key must not create a second row"
+    );
+    daemon.kill().expect("stop");
+    daemon.wait().expect("reap");
+}

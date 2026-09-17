@@ -220,6 +220,12 @@ keys remain reserved after every outcome: an operation-specific replay may
 return a recorded result, but a refusal reports the prior operation and outcome
 rather than creating another identity or effect.
 
+A `tell` or `reply` queued to a socket waiter replays the same way: repeating
+its idempotency key returns the stored message and its current delivery outcome
+without a second inbox row, and a kind, sender, or reply-correlation mismatch is
+refused. There is no operation to reconcile, so the stored message is the whole
+record.
+
 On a `tell`, optional `due_at_ms` (Unix epoch milliseconds, same store
 `SystemTime` clock as other timestamps) persists the delivery as `queued` and
 fires it once when

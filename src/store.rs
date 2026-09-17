@@ -342,6 +342,16 @@ pub struct CreatedSocketTell {
     pub message_id: MessageId,
 }
 
+/// One socket-inbox idempotency key joined to its stored message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SocketInboxKeyMessage {
+    message_id: MessageId,
+    kind: MessageKind,
+    sender: LogicalAgentId,
+    reply_to: Option<MessageId>,
+    disposition: Option<String>,
+}
+
 /// IDs atomically created for one progress or final reply and its delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreatedReply {
@@ -3300,6 +3310,9 @@ impl Store {
         idempotency_key: &str,
         due_at_ms: Option<i64>,
     ) -> Result<CreatedSocketTell, StoreError> {
+        if let Some(replay) = self.replay_socket_inbox_tell(idempotency_key, sender)? {
+            return Ok(replay);
+        }
         let now = now_millis()?;
         let schedule = delivery_schedule(now, due_at_ms)?;
         let tx = self.connection.transaction()?;
@@ -3865,6 +3878,109 @@ impl Store {
         }))
     }
 
+    /// Look up one socket-inbox idempotency key's stored message.
+    fn socket_inbox_key_message(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SocketInboxKeyMessage>, StoreError> {
+        type SocketInboxRow = (String, String, String, Option<String>, Option<String>);
+        let row: Option<SocketInboxRow> = self
+            .connection
+            .query_row(
+                "SELECT k.message_id, m.kind, m.sender_agent_id,
+                        CAST(m.reply_to_message_id AS TEXT), m.disposition
+                   FROM socket_inbox_keys k
+                   JOIN messages m ON m.id = k.message_id
+                  WHERE k.idempotency_key = ?1",
+                [idempotency_key],
+                |row| {
+                    Ok((
+                        id_text(row, 0)?,
+                        row.get(1)?,
+                        id_text(row, 2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((message_id, kind, sender, reply_to, disposition)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(SocketInboxKeyMessage {
+            message_id: parse_message_id(&message_id)?,
+            kind: parse_message_kind(&kind)?,
+            sender: parse_logical_agent_id(&sender)?,
+            reply_to: reply_to.as_deref().map(parse_message_id).transpose()?,
+            disposition,
+        }))
+    }
+
+    /// Replay a tell queued to a socket waiter under a repeated key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the key belongs to a different kind or sender.
+    fn replay_socket_inbox_tell(
+        &self,
+        idempotency_key: &str,
+        sender: LogicalAgentId,
+    ) -> Result<Option<CreatedSocketTell>, StoreError> {
+        let Some(stored) = self.socket_inbox_key_message(idempotency_key)? else {
+            return Ok(None);
+        };
+        if stored.kind != MessageKind::Tell || stored.sender != sender {
+            return Err(StoreError::Conflict(format!(
+                "idempotency key {idempotency_key} already belongs to socket-inbox message {} \
+                 with a different kind or sender; refusing replay",
+                stored.message_id
+            )));
+        }
+        Ok(Some(CreatedSocketTell {
+            message_id: stored.message_id,
+        }))
+    }
+
+    /// Replay a reply queued to a socket waiter under a repeated key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the key belongs to a different kind, sender, or
+    /// reply correlation, and an invalid-record error when the stored reply has
+    /// no disposition.
+    fn replay_socket_inbox_reply(
+        &self,
+        idempotency_key: &str,
+        requester_agent_id: LogicalAgentId,
+        reply_to: MessageId,
+    ) -> Result<Option<CreatedReply>, StoreError> {
+        let Some(stored) = self.socket_inbox_key_message(idempotency_key)? else {
+            return Ok(None);
+        };
+        if stored.kind != MessageKind::Reply
+            || stored.sender != requester_agent_id
+            || stored.reply_to != Some(reply_to)
+        {
+            return Err(StoreError::Conflict(format!(
+                "idempotency key {idempotency_key} already belongs to socket-inbox message {} \
+                 with a different kind, sender, or reply correlation; refusing replay",
+                stored.message_id
+            )));
+        }
+        let disposition = stored.disposition.ok_or_else(|| {
+            StoreError::InvalidRecord(format!(
+                "replayed socket-inbox reply {} has no disposition",
+                stored.message_id
+            ))
+        })?;
+        Ok(Some(CreatedReply {
+            message_id: stored.message_id,
+            operation_id: None,
+            recipient_incarnation: None,
+            disposition: parse_reply_disposition(&disposition)?,
+        }))
+    }
+
     /// Persist a correlated progress or final reply and its delivery intent.
     ///
     /// The ask message ID alone resolves the exact owing sender and waiting
@@ -3933,6 +4049,11 @@ impl Store {
         }
         if let Some(replay) =
             self.replay_ask_pull_reply(idempotency_key, requester_agent_id, reply_to)?
+        {
+            return Ok(replay);
+        }
+        if let Some(replay) =
+            self.replay_socket_inbox_reply(idempotency_key, requester_agent_id, reply_to)?
         {
             return Ok(replay);
         }
@@ -18078,6 +18199,108 @@ mod tests {
         assert_eq!(transport, "socket_inbox");
         assert_eq!(incarnation, None);
         assert_eq!(agent, waiter.logical_agent_id.to_string());
+    }
+
+    #[test]
+    fn repeated_socket_inbox_keys_replay_instead_of_conflicting() {
+        let mut store = Store::in_memory().expect("store");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "replay-waiter")
+            .expect("waiter");
+        let owing = store
+            .declare_start(&intent("owing", "term-replay", "replay-start"))
+            .expect("owing");
+        mark_ready(&mut store, owing, "owing", "term-replay");
+
+        let tell = store
+            .create_socket_tell(
+                owing.logical_agent_id,
+                waiter.logical_agent_id,
+                "hello",
+                "replay-tell",
+                None,
+            )
+            .expect("tell");
+        let replayed = store
+            .create_socket_tell(
+                owing.logical_agent_id,
+                waiter.logical_agent_id,
+                "hello",
+                "replay-tell",
+                None,
+            )
+            .expect("replayed tell");
+        assert_eq!(replayed.message_id, tell.message_id);
+        assert_eq!(
+            store
+                .delivery_outcome_for_message(replayed.message_id)
+                .expect("outcome"),
+            DeliveryOutcome::Queued
+        );
+        let tells: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind = 'tell'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tells");
+        assert_eq!(tells, 1);
+
+        let ask = store
+            .create_ask_with_schedule(
+                waiter.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "question",
+                "replay-ask",
+                None,
+                None,
+                true,
+            )
+            .expect("ask");
+        let reply = store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "replay-reply",
+            )
+            .expect("reply");
+        assert_eq!(reply.operation_id, None);
+        let replayed = store
+            .create_reply(
+                ask.message_id,
+                owing.logical_agent_id,
+                "done",
+                ReplyDisposition::Final,
+                "replay-reply",
+            )
+            .expect("replayed reply");
+        assert_eq!(replayed.message_id, reply.message_id);
+        assert_eq!(replayed.disposition, ReplyDisposition::Final);
+        let replies: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind = 'reply'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count replies");
+        assert_eq!(replies, 1);
+
+        // The key stays bound to its recorded sender.
+        let error = store
+            .create_socket_tell(
+                waiter.logical_agent_id,
+                waiter.logical_agent_id,
+                "hello",
+                "replay-tell",
+                None,
+            )
+            .expect_err("different sender");
+        assert!(error.to_string().contains("refusing replay"), "{error}");
     }
 
     #[test]
