@@ -23,9 +23,20 @@ pub fn database_path() -> Result<PathBuf, PathError> {
 }
 
 /// Default live Kelpie client/daemon socket path.
+///
+/// `KELPIE_SOCKET` overrides the XDG runtime convention for both binaries, so
+/// an isolated daemon and its clients agree on one socket without repeating
+/// `--socket`. An empty value is treated as unset.
 #[must_use]
 pub fn kelpie_socket_path() -> PathBuf {
-    runtime_root_with(|name| env::var_os(name)).join("kelpie.sock")
+    kelpie_socket_path_with(|name| env::var_os(name))
+}
+
+fn kelpie_socket_path_with(mut get: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
+    if let Some(path) = nonempty(get("KELPIE_SOCKET")) {
+        return PathBuf::from(path);
+    }
+    runtime_root_with(&mut get).join("kelpie.sock")
 }
 
 /// Active Herdr API socket using Herdr's documented override and default path.
@@ -127,6 +138,24 @@ mod tests {
             ]))
             .expect("Herdr"),
             PathBuf::from("/tmp/custom.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_kelpie_socket_wins_and_empty_falls_back() {
+        assert_eq!(
+            kelpie_socket_path_with(getter(&[
+                ("KELPIE_SOCKET", "/tmp/isolated.sock"),
+                ("XDG_RUNTIME_DIR", "/run/user/1"),
+            ])),
+            PathBuf::from("/tmp/isolated.sock")
+        );
+        assert_eq!(
+            kelpie_socket_path_with(getter(&[
+                ("KELPIE_SOCKET", ""),
+                ("XDG_RUNTIME_DIR", "/run/user/1"),
+            ])),
+            PathBuf::from("/run/user/1/kelpie/kelpie.sock")
         );
     }
 }

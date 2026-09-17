@@ -8,11 +8,14 @@ kelpied
 ```
 
 The database defaults to `$XDG_STATE_HOME/kelpie/kelpie.sqlite3` (or
-`~/.local/state/kelpie/kelpie.sqlite3`), and the local socket defaults to
-`$XDG_RUNTIME_DIR/kelpie/kelpie.sock`. Herdr uses `$HERDR_SOCKET_PATH` when set,
-then `$XDG_CONFIG_HOME/herdr/herdr.sock` (or `~/.config/herdr/herdr.sock`).
-`--database`, `--socket`, and `--herdr-socket` override these conventions for
-isolated instances. An existing Kelpie socket is never removed automatically.
+`~/.local/state/kelpie/kelpie.sqlite3`). The local socket defaults to
+`$XDG_RUNTIME_DIR/kelpie/kelpie.sock`; `KELPIE_SOCKET` overrides it for both
+binaries, so an isolated daemon and its clients agree on one path without
+repeating a flag (an empty value is ignored). Herdr uses `$HERDR_SOCKET_PATH`
+when set, then `$XDG_CONFIG_HOME/herdr/herdr.sock` (or
+`~/.config/herdr/herdr.sock`). `--database`, `--socket`, and `--herdr-socket`
+override these conventions for isolated instances, and `--socket` beats
+`KELPIE_SOCKET`. An existing Kelpie socket is never removed automatically.
 
 Herdr's socket appears when Herdr starts, which under a supervisor can be later
 than `kelpied` starts. Startup waits up to `--herdr-wait-ms` (default 120000)

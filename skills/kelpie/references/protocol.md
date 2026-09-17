@@ -41,7 +41,8 @@ decimal integers; UUIDs and zero fail before the request is sent.
 
 
 Ordinary use is typed commands. The CLI builds request IDs, idempotency keys,
-and NDJSON internally. Default the socket to `$XDG_RUNTIME_DIR/kelpie/kelpie.sock`.
+and NDJSON internally. Default the socket to `$KELPIE_SOCKET` when set, else
+`$XDG_RUNTIME_DIR/kelpie/kelpie.sock`; `--socket` beats both.
 Read multiline or agent-generated bodies with `--stdin` or `--file` so the
 shell never re-evaluates the text. `--body` is only for short trusted text.
 

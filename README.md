@@ -115,7 +115,7 @@ Default paths, all overridable by flag:
 | | Path |
 | --- | --- |
 | Database | `$XDG_STATE_HOME/kelpie/kelpie.sqlite3` |
-| Kelpie socket | `$XDG_RUNTIME_DIR/kelpie/kelpie.sock` |
+| Kelpie socket | `KELPIE_SOCKET`, else `$XDG_RUNTIME_DIR/kelpie/kelpie.sock` |
 | Herdr socket | `$HERDR_SOCKET_PATH`, else `$XDG_CONFIG_HOME/herdr/herdr.sock` |
 
 ## Verify
