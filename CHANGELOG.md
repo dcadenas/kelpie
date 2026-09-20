@@ -6,6 +6,14 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.10
+
+`inbox.delivery` now includes `scheduled_at_ms` and `created_at_ms`. `message_id`
+is create order, not offer order: a delayed tell can arrive with a lower id than
+traffic you already ACKed. Do not treat `message_id` as a high-water cursor;
+ACKed rows are never re-offered. If a socket waiter dropped delayed tells that
+way, stop. No schema change; restart kelpied.
+
 ## 0.2.0-alpha.9
 
 `KELPIE_SOCKET` now selects the Kelpie socket for both binaries when set (an
