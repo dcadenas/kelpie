@@ -371,6 +371,14 @@ That drain is not a resend. This transport MUST NOT record `unknown` for an
 inbox write. Persist of the delivery record is not acceptance. Success of any
 publish outside Kelpie is not acceptance.
 
+A `socket_inbox` tell MAY carry a future due time. Kelpie MUST offer every due,
+still-queued row that this claimed connection has not already offered, and MUST
+NOT re-offer a row after `inbox.ack`. `message_id` MUST be assigned at create
+time. A later-due row MAY therefore have a lower `message_id` than a row
+already offered. Hosts MUST NOT treat `message_id` as a high-water cursor. An
+overdue socket-inbox row whose due time elapsed while kelpied was down MUST
+remain `queued` and MUST be offered after restart.
+
 `submitted`, `accepted`, `queued`, and `unknown` MUST NOT be blindly
 resent because the recipient may already have received the message. Draining a
 still-queued `socket_inbox` delivery on reconnect is that same attempt
@@ -488,7 +496,9 @@ limited to delayed message delivery, repeating opaque tells, reminders, and
 renew policies. It MUST NOT encode workflow phases, application verdicts, or
 automatic next actions.
 
-A delivery due time is one-shot. A repeating tell schedule is bound to a logical
+A delivery due time is one-shot. A one-shot due time applies to `herdr_prompt`
+and `socket_inbox`. For `socket_inbox` the delivery is an ordinary queued inbox
+row, offered when due, and accepted only on `inbox.ack`. A repeating tell schedule is bound to a logical
 agent, advances on the host wall clock, survives incarnation replacement, and is
 cancellable by its requester or target. `schedule.list` MUST expose stored
 repeating-tell intent for inspection: `requester_agent_id`, the exact tell

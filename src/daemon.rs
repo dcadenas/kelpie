@@ -5198,6 +5198,8 @@ fn offer_queued_inbox(session: &mut InboxSession, kelpie: &Kelpie) -> Result<boo
                 "attempt_number": delivery.attempt_number,
                 "sender_agent_id": delivery.sender_agent_id,
                 "sender_public_name": delivery.sender_public_name,
+                "scheduled_at_ms": delivery.scheduled_at_ms,
+                "created_at_ms": delivery.created_at_ms,
             }
         });
         enqueue_json_line(&mut session.write_buf, &event)?;

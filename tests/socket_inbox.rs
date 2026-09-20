@@ -821,3 +821,98 @@ fn repeated_socket_inbox_keys_replay_instead_of_conflicting() {
     daemon.kill().expect("stop");
     daemon.wait().expect("reap");
 }
+
+#[test]
+fn delayed_socket_tell_is_offered_after_an_immediate_ack() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("kelpie.sqlite3");
+    let kelpie_socket = directory.path().join("kelpie.sock");
+    let herdr_socket = directory.path().join("herdr.sock");
+    let fault_socket = directory.path().join("fault.sock");
+    let mut store = Store::open(&database).expect("store");
+    let waiter = store
+        .register_socket_waiter("inbox", Parent::Parentless, "due-waiter")
+        .expect("waiter");
+    let owing = seed_ready_owing(&mut store);
+    drop(store);
+    let _herdr = spawn_startup_herdr(&herdr_socket);
+    let (mut daemon, _fault) = boot(&database, &kelpie_socket, &herdr_socket, &fault_socket);
+
+    let due_at = kelpie::store::store_clock_ms().expect("clock") + 3_600_000;
+    let delayed = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "tell-later",
+            "method": "tell",
+            "params": {
+                "sender": owing.logical_agent_id,
+                "recipient_alias": "inbox",
+                "body": "later",
+                "idempotency_key": "due-later",
+                "due_at_ms": due_at
+            }
+        }),
+    );
+    assert_eq!(delayed["result"]["delivery_outcome"], "queued");
+    let delayed_id = delayed["result"]["message_id"].clone();
+    let immediate = send_request(
+        &kelpie_socket,
+        &serde_json::json!({
+            "id": "tell-now",
+            "method": "tell",
+            "params": {
+                "sender": owing.logical_agent_id,
+                "recipient_alias": "inbox",
+                "body": "now",
+                "idempotency_key": "due-now"
+            }
+        }),
+    );
+    assert_eq!(immediate["result"]["delivery_outcome"], "queued");
+    let immediate_id = immediate["result"]["message_id"].clone();
+    assert!(
+        delayed_id.as_i64().expect("delayed id") < immediate_id.as_i64().expect("immediate id")
+    );
+
+    let mut inbox = claim_inbox(&kelpie_socket, waiter.logical_agent_id, "claim-due");
+    let first = read_json(&mut inbox.reader);
+    assert_eq!(first["method"], "inbox.delivery");
+    assert_eq!(first["params"]["message_id"], immediate_id);
+    assert_eq!(first["params"]["body"], "now");
+    assert!(first["params"]["scheduled_at_ms"].as_i64().expect("due") > 0);
+    assert!(first["params"]["created_at_ms"].as_i64().expect("created") > 0);
+    serde_json::to_writer(
+        &mut inbox.stream,
+        &serde_json::json!({
+            "id": "ack-now",
+            "method": "inbox.ack",
+            "params": {"message_id": immediate_id},
+        }),
+    )
+    .expect("ack");
+    inbox.stream.write_all(b"\n").expect("nl");
+    let ack = read_json(&mut inbox.reader);
+    assert_eq!(ack["result"]["outcome"], "accepted");
+
+    Connection::open(&database)
+        .expect("db")
+        .execute(
+            "UPDATE deliveries SET scheduled_at_ms = 0 WHERE message_id = ?1",
+            [delayed_id.as_i64().expect("id")],
+        )
+        .expect("due now");
+    inbox
+        .reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let later = read_json(&mut inbox.reader);
+    assert_eq!(later["method"], "inbox.delivery");
+    assert_eq!(later["params"]["message_id"], delayed_id);
+    assert_eq!(later["params"]["body"], "later");
+    assert_eq!(later["params"]["scheduled_at_ms"], 0);
+    assert!(later["params"]["created_at_ms"].as_i64().expect("created") > 0);
+
+    daemon.kill().expect("stop");
+    daemon.wait().expect("reap");
+}

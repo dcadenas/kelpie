@@ -130,8 +130,9 @@ const NO_IN_FLIGHT_FINAL_ASK: &str = "AND NOT EXISTS (
 ///
 /// A delivery is due when `now_ms >= scheduled_at_ms`. This is the same
 /// `SystemTime` source as `created_at_ms` and other durable timestamps.
-/// A due time that elapses while kelpied is down is reconciled as `unknown`;
-/// restart must not fire that delivery without a new attempt record.
+/// A `herdr_prompt` due time that elapses while kelpied is down is
+/// reconciled as `unknown`. A `socket_inbox` row stays `queued` and is
+/// offered late after restart.
 ///
 /// # Errors
 ///
@@ -274,7 +275,8 @@ pub struct EndedWaiter {
 /// `sender_agent_id` is the sending logical agent and `sender_public_name`
 /// is that agent's public name as of the query, not as of the send. Both are
 /// `None` when the message has no agent sender: operator-attributed messages
-/// and host-authored cancellations.
+/// and host-authored cancellations. `scheduled_at_ms` and `created_at_ms` are
+/// for staleness, not for host-side dedup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketInboxDelivery {
     pub message_id: MessageId,
@@ -285,6 +287,8 @@ pub struct SocketInboxDelivery {
     pub attempt_number: i64,
     pub sender_agent_id: Option<LogicalAgentId>,
     pub sender_public_name: Option<String>,
+    pub scheduled_at_ms: i64,
+    pub created_at_ms: i64,
 }
 
 /// One reverse event on an ask-scoped pull sink.
@@ -2522,7 +2526,7 @@ impl Store {
         require_active_socket_waiter(&self.connection, recipient_agent_id)?;
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.kind, m.body, m.reply_to_message_id, m.disposition, d.attempt_number,
-                    m.sender_agent_id, s.public_name
+                    m.sender_agent_id, s.public_name, d.scheduled_at_ms, m.created_at_ms
                FROM deliveries d
                JOIN messages m ON m.id = d.message_id
                LEFT JOIN logical_agents s ON s.id = m.sender_agent_id
@@ -2543,6 +2547,8 @@ impl Store {
                 row.get::<_, i64>(5)?,
                 optional_id_text(row, 6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
             ))
         })?;
         let mut deliveries = Vec::new();
@@ -2556,6 +2562,8 @@ impl Store {
                 attempt_number,
                 sender_agent_id,
                 sender_public_name,
+                scheduled_at_ms,
+                created_at_ms,
             ) = row?;
             deliveries.push(SocketInboxDelivery {
                 message_id: parse_message_id(&message_id)?,
@@ -2572,6 +2580,8 @@ impl Store {
                     .map(parse_logical_agent_id)
                     .transpose()?,
                 sender_public_name,
+                scheduled_at_ms,
+                created_at_ms,
             });
         }
         Ok(deliveries)
@@ -18115,6 +18125,72 @@ mod tests {
                 .expect("durably queued"),
             DeliveryOutcome::Queued
         );
+    }
+
+    #[test]
+    fn delayed_socket_tell_stays_queued_until_due_after_an_immediate_ack() {
+        let mut store = Store::in_memory().expect("store");
+        let sender = store
+            .declare_start(&intent("sender", "term-sender", "sender-start"))
+            .expect("sender");
+        mark_ready(&mut store, sender, "sender", "term-sender");
+        let waiter = store
+            .register_socket_waiter("inbox", Parent::Parentless, "delayed-waiter")
+            .expect("waiter");
+        let delayed = store
+            .create_socket_tell(
+                sender.logical_agent_id,
+                waiter.logical_agent_id,
+                "later",
+                "delayed-tell",
+                Some(i64::MAX),
+            )
+            .expect("delayed");
+        let immediate = store
+            .create_socket_tell(
+                sender.logical_agent_id,
+                waiter.logical_agent_id,
+                "now",
+                "immediate-tell",
+                None,
+            )
+            .expect("immediate");
+        let delayed_n: u64 = delayed.message_id.to_string().parse().expect("id");
+        let immediate_n: u64 = immediate.message_id.to_string().parse().expect("id");
+        assert!(delayed_n < immediate_n);
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("due now");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, immediate.message_id);
+        assert!(queued[0].scheduled_at_ms > 0);
+        assert!(queued[0].created_at_ms > 0);
+        assert_eq!(
+            store
+                .ack_socket_inbox_delivery(waiter.logical_agent_id, immediate.message_id)
+                .expect("ack immediate"),
+            DeliveryOutcome::Accepted
+        );
+        assert!(
+            store
+                .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+                .expect("delayed still not due")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE deliveries SET scheduled_at_ms = 0 WHERE message_id = ?1",
+                [delayed.message_id.to_string()],
+            )
+            .expect("due now");
+        let queued = store
+            .queued_socket_inbox_deliveries(waiter.logical_agent_id)
+            .expect("delayed due");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, delayed.message_id);
+        assert_eq!(queued[0].scheduled_at_ms, 0);
+        assert!(queued[0].created_at_ms > 0);
     }
 
     #[test]

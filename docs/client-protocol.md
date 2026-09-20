@@ -54,7 +54,8 @@ deliveries `queued`. Claiming an id that is not an active socket waiter is
 
 Each `inbox.delivery` event's `params` carry `message_id`, `kind` (`tell`,
 `ask`, `reply`, or `cancellation`), `body`, `reply_to`, `disposition`,
-`attempt_number`, `sender_agent_id`, and `sender_public_name`.
+`attempt_number`, `sender_agent_id`, `sender_public_name`, `scheduled_at_ms`,
+and `created_at_ms`.
 `sender_agent_id` is the sending logical agent's id and `sender_public_name`
 is that agent's public name at delivery time, so a host can attribute a `tell`
 to a known occupant rather than correlating only replies by `reply_to`.
@@ -62,8 +63,17 @@ to a known occupant rather than correlating only replies by `reply_to`.
 checks that the agent exists, not who sent the request, so both fields carry
 the local socket's same-user attribution and are not authentication. Both
 are `null` when the message has no agent sender: operator-attributed messages
-and host-generated cancellations. Neither field changes ordering, ACK
-semantics, or the fault-injection points.
+and host-generated cancellations. Neither field changes ACK semantics or the
+fault-injection points.
+
+`message_id` is assigned when the message is created, not when it is offered.
+Kelpie offers every due, still-`queued` row this claimed connection has not
+already offered. An ACKed row is never re-offered, so a host needs no cursor.
+A lower `message_id` after a higher one is a delayed tell arriving when due,
+not a replay. The only dedup a host may need is a membership test of
+`message_id`s it has acted on but not yet ACKed, for the mid-line-disconnect
+window. `scheduled_at_ms` and `created_at_ms` are for staleness — whether a
+reminder is hours late — not for dedup.
 
 `kelpie adopt --pane ID --terminal ID [--logical-id ID]` is the client form.
 `--logical-id` continues that exact logical agent in a new incarnation, keeping
@@ -228,17 +238,23 @@ record.
 
 On a `tell`, optional `due_at_ms` (Unix epoch milliseconds, same store
 `SystemTime` clock as other timestamps) persists the delivery as `queued` and
-fires it once when
-`now_ms >= due_at_ms` against that exact Ready incarnation. A reminder is a
-delayed tell. There is no receiver ack. Cancel of a
-queued delivery is legal only before the first Herdr write; after submit, the
-existing no-resend and unknown rules apply. If the due time elapses while
-`kelpied` is down, recover marks the delivery `unknown` instead of firing it
-on restart. `kelpied` uses a non-blocking accept timeout so due work runs with
-no client connected. Durable attempt intent is recorded before the Herdr
-write. A due-vs-accepted race is resolved in one SQLite writer: submit
-requires the row still `queued` and due; cancel requires the row still
-`queued` with no submitted attempt.
+fires it once when `now_ms >= due_at_ms`. A reminder is a delayed tell. This
+applies to both transports.
+
+For `herdr_prompt`, the delivery is bound to that exact Ready incarnation.
+There is no receiver ack. Cancel of a queued delivery is legal only before the
+first Herdr write; after submit, the existing no-resend and unknown rules
+apply. If the due time elapses while `kelpied` is down, recover marks the
+delivery `unknown` instead of firing it on restart. `kelpied` uses a
+non-blocking accept timeout so due work runs with no client connected.
+Durable attempt intent is recorded before the Herdr write. A due-vs-accepted
+race is resolved in one SQLite writer: submit requires the row still `queued`
+and due; cancel requires the row still `queued` with no submitted attempt.
+
+For `socket_inbox`, the delivery is a normal queued inbox row offered when due
+and accepted only on `inbox.ack`. If the due time elapses while `kelpied` is
+down, the row stays `queued` and is offered late after restart. This transport
+does not record `unknown` for an inbox write.
 
 Alternatively, `every_ms` arms a repeating wall-clock tell schedule and cannot
 be combined with `due_at_ms`. The initial firing is one interval away. The
