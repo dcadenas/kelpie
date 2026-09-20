@@ -75,12 +75,14 @@ terminal failure permits a fresh attempt. Refused pending, accepted, superseded,
 or unknown outcomes require reconciliation; changing the key must not bypass
 the refusal because the original effect may have landed.
 
-After sending an ask, read its delivery outcome and end the turn. For the
-default inject path, Kelpie pushes the correlated answer into the sender's pane,
-waking it when idle. This applies to children and human decisions relayed
-through agents. Do not sleep, poll `pending`, or use `herdr agent wait` for an
-answer. `pending` lists what you owe; Herdr `idle` or `done` is not a reply. Do
-not invent side work to keep the turn open while waiting.
+After sending an ask, read its delivery outcome. Do not sleep, poll `pending`,
+or use `herdr agent wait` for that answer. `pending` lists what you owe; Herdr
+`idle` or `done` is not a reply. If other work remains, do that work. If only
+waiting remains, end the turn. Do not invent side work to keep the turn open.
+For the default inject path, Kelpie pushes the correlated answer into the
+sender's pane, waking it when idle. This applies to children and human
+decisions relayed through agents. An envelope that arrives in this pane is
+work to handle.
 
 When the ask used `--reply-delivery pull`, reverse traffic does not wake the
 asker pane. Claim, poll, and ACK the sink instead:

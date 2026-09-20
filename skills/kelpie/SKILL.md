@@ -29,9 +29,11 @@ Never use Ouija as an alternate transport in a Herdr session.
   or a material update, not as routine narration.
 - An accepted final resolves only its correlated obligation. Delivery acceptance
   proves submission to a pane or ACK by a socket inbox, never task completion.
-- After sending, inspect the receipt and end the turn if only waiting remains.
-  Replies wake you. Do not sleep, poll, or wait on a child's runtime status.
-  Yielding keeps the agent available; retiring or closing it does not.
+- After sending, inspect the receipt. If other work remains, do that work. If
+  only waiting remains, end the turn. Replies wake you. Do not sleep, poll, or
+  wait on a child's runtime status. Do not invent side work to keep the turn
+  open. An envelope that arrives in this pane is work to handle. Yielding
+  keeps the agent available; retiring or closing it does not.
 
 Supply bodies through exactly one of `--file`, `--stdin`, or `--body`.
 Use `--file` or quoted stdin for generated/multiline text; `--body` is for short
