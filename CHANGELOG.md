@@ -6,6 +6,12 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.11
+
+`kelpie replies-ack` now sends `message_id` as a JSON number. The previous
+client always failed with `invalid_request` (string id), so a pull-reply ask
+never resolved. Install the new `kelpie` client. No schema change.
+
 ## 0.2.0-alpha.10
 
 `inbox.delivery` now includes `scheduled_at_ms` and `created_at_ms`. `message_id`
