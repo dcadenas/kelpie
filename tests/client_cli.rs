@@ -970,3 +970,59 @@ fn json_schedules_preserves_multiline_tell_body_and_null_renew_fields() {
     assert!(renew["idempotency_key"].is_null());
     assert_eq!(renew["requester_agent_id"], 11);
 }
+
+#[test]
+fn typed_replies_ack_sends_message_id_as_a_json_number() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("kelpie.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("read");
+        let request: Value = serde_json::from_str(&line).expect("request JSON");
+        assert_eq!(request["method"], "replies.ack");
+        assert!(
+            request["params"]["message_id"].is_number(),
+            "message_id must be a JSON number, got {}",
+            request["params"]["message_id"]
+        );
+        assert_eq!(request["params"]["message_id"], 27369);
+        assert_eq!(request["params"]["ask_message_id"], 27368);
+        assert_eq!(request["params"]["requester_agent_id"], 11);
+        assert_eq!(request["params"]["lease_id"], 7);
+        serde_json::to_writer(
+            &mut stream,
+            &json!({
+                "id": request["id"],
+                "result": {
+                    "message_id": 27369,
+                    "outcome": "accepted",
+                    "obligation_state": "resolved"
+                }
+            }),
+        )
+        .expect("response");
+        stream.write_all(b"\n").expect("newline");
+    });
+
+    let output = run_cli(&[
+        "--socket",
+        socket.to_str().expect("socket"),
+        "replies-ack",
+        "27368",
+        "27369",
+        "--lease",
+        "7",
+        "--sender-id",
+        SENDER,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("server");
+}

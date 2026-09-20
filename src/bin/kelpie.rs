@@ -1099,6 +1099,7 @@ fn normalize_durable_ids(value: &mut Value) -> Result<(), Box<dyn std::error::Er
         "ask_message_id",
         "incarnation_id",
         "logical_agent_id",
+        "message_id",
         "recipient",
         "recipient_incarnation",
         "renew_id",
@@ -1191,5 +1192,26 @@ impl ClientTrace {
         if let Ok(bytes) = serde_json::to_vec_pretty(&body) {
             let _ = atomic_write(&path, &bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_durable_ids_coerces_replies_ack_message_id() {
+        let mut params = json!({
+            "ask_message_id": "27368",
+            "requester_agent_id": "11",
+            "message_id": "27369",
+            "lease_id": 7
+        });
+        normalize_durable_ids(&mut params).expect("normalize");
+        assert!(params["message_id"].is_number());
+        assert_eq!(params["message_id"], 27369);
+        assert_eq!(params["ask_message_id"], 27368);
+        assert_eq!(params["requester_agent_id"], 11);
+        assert_eq!(params["lease_id"], 7);
     }
 }
