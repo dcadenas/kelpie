@@ -17,9 +17,12 @@ When `HERDR_ENV=1`, use Kelpie for inter-agent communication. Use raw
 binding is invalid, or the operation cannot be represented. State that reason.
 Never use Ouija as an alternate transport in a Herdr session.
 
-- Use `tell` for information that needs no durable answer. Do not acknowledge a
-  tell unless its content independently requires a response.
+- Use `tell` for information that needs no durable answer. Kelpie creates no
+  obligation and sends no reminders.
 - Use `ask` for work or a decision requiring an answer. Preserve its returned ID.
+- On a tell envelope (no `reply-to`), no reply is owed. If the content is
+  pertinent and you have useful information, send it with `kelpie tell`. Do
+  not send an empty acknowledgement.
 - On an ask envelope (`reply-to=ID`), answer with `kelpie reply ID --final` when
   done. Only the owing agent can reply. A progress reply leaves the obligation
   open; use it when the task's communication policy requires an acknowledgement

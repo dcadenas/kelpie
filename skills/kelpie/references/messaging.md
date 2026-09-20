@@ -6,8 +6,8 @@ Contents: [Method details](#method-details); [ask vs tell](#ask-vs-tell).
 
 ## Method details
 
-- `tell`: send a one-way message to `recipient` + `recipient_incarnation`, or
-  `recipient_alias`. An alias resolves once to a unique active logical agent.
+- `tell`: send a message with no reply obligation to `recipient` +
+  `recipient_incarnation`, or `recipient_alias`. An alias resolves once to a unique active logical agent.
   Herdr delivery binds its exact Ready incarnation; a socket waiter receives
   through its logical inbox and accepts on ACK. Supply exactly one of `--body`,
   `--stdin`, or `--file`; there is no positional body. Keep message and delivery
@@ -63,7 +63,10 @@ Contents: [Method details](#method-details); [ask vs tell](#ask-vs-tell).
 ## Ask vs tell
 
 Use `tell` to inform and `ask` when the sender needs a durable answer or receipt
-of completion. An ask's delivery outcome describes transport, not the answer.
+of completion. A tell creates no obligation and sends no reminders. If the
+content is pertinent and the recipient has useful information, that recipient
+sends it back with `kelpie tell`. An ask's delivery outcome describes transport,
+not the answer.
 Text written only in a recipient's TUI does not reach the sender.
 
 Keep one idempotency key per intended prompt. Replaying a successful operation
@@ -112,8 +115,9 @@ ACK. Never resend an ambiguous submitted attempt.
 
 Handle received envelopes as follows:
 
-- A tell (`<kelpie from=alice>` without `reply-to`) owes no reply or ack unless
-  its body independently calls for a new message.
+- A tell (`<kelpie from=alice>` without `reply-to`) owes no reply or
+  acknowledgement. If the body is pertinent and you have useful information,
+  send it with `kelpie tell`. Do not send an empty acknowledgement.
 - An ask (`<kelpie from=alice reply-to=ID>`) owes `kelpie reply ID --final` when
   done. Only the owing agent can reply. Use progress only for an acknowledgement
   or material update required by the task's communication policy. Use
