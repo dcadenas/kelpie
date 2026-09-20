@@ -6,6 +6,12 @@ Notable changes per released version, newest first. Versions are the ones
 Entries say what an operator has to do, not what a commit touched. `just
 release` refuses a version with no section here.
 
+## 0.2.0-alpha.12
+
+After sending an ask, keep doing other real work. End the turn only when waiting
+is all that remains. An envelope that arrives in this pane is work to handle.
+Reinstall the skill from this version (`kelpie --skill`). No schema change.
+
 ## 0.2.0-alpha.11
 
 `kelpie replies-ack` now sends `message_id` as a JSON number. The previous
