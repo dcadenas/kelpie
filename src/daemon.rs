@@ -6096,7 +6096,8 @@ fn recover_result(report: crate::store::RecoveryReport) -> Value {
         "incarnations_marked_lost": report.incarnations_marked_lost,
         "incarnations_continued": report.incarnations_continued,
         "native_sessions_refreshed": report.native_sessions_refreshed,
-        "names_reprojected": report.names_reprojected
+        "names_reprojected": report.names_reprojected,
+        "unbound_unknown_starts_settled": report.unbound_unknown_starts_settled
     })
 }
 

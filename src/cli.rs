@@ -504,12 +504,14 @@ pub fn format_receipt(method: &str, response: &Value) -> String {
             field(&result, "outcome")
         ),
         "recover" => format!(
-            "recover lost={} continued={} repaired-names={} unknown={} starts={}\n",
+            "recover lost={} continued={} repaired-names={} unknown={} starts={} \
+             settled-unbound-starts={}\n",
             field(&result, "incarnations_marked_lost"),
             field(&result, "incarnations_continued"),
             field(&result, "names_reprojected"),
             field(&result, "outcomes_marked_unknown"),
-            field(&result, "starts_recovered")
+            field(&result, "starts_recovered"),
+            field(&result, "unbound_unknown_starts_settled")
         ),
         "attribution" => render_attribution(&result),
         "report" => render_report(&result),

@@ -769,7 +769,15 @@ same recorded seat continues its logical agent without requiring the backend to
 match. Native sessions are refreshed observations while the seat remains
 Ready. After that seat is gone, a unique native-session match continues the
 same logical agent onto the Herdr-restored occupant and reports the count as
-`incarnations_continued`. kelpied retries recover for two minutes after bind
+`incarnations_continued`. A start whose readiness never resolved leaves an
+incarnation `unknown` with no observed seat, which no other command can move.
+When the snapshot has no live agent anywhere under the name that start was
+claiming, recovery settles that incarnation Lost, records an operator notice,
+and reports the count as `unbound_unknown_starts_settled`. The operation's own
+outcome stays `unknown`; only the runtime binding is settled. A live agent
+still carrying that name is left alone, because it may be what that start
+produced — adopt it on its seat to continue the same logical agent.
+kelpied retries recover for two minutes after bind
 so occupants that appear after Herdr native restore can still unique-continue.
 Recovery preserves logical identity, messages, obligations, and the recorded
 working directory. It does not auto-adopt agents Kelpie never bound.

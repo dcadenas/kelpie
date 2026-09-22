@@ -449,6 +449,9 @@ pub struct RecoveryReport {
     pub native_sessions_refreshed: usize,
     /// Missing Herdr name projections restored from Kelpie's durable identity.
     pub names_reprojected: usize,
+    /// Never-bound `unknown` starts settled `lost` because no live agent
+    /// carries the name they were trying to claim.
+    pub unbound_unknown_starts_settled: usize,
 }
 
 #[derive(Debug)]
@@ -5795,8 +5798,9 @@ impl Store {
             return Err(StoreError::Conflict("obligation is absent".into()));
         };
         if !matches!(state.as_str(), "open" | "in_progress") {
-            return Err(StoreError::Conflict(format!(
-                "obligation in {state} state is not cancellable"
+            return Err(StoreError::Conflict(settled_obligation_refusal(
+                ask_message_id,
+                &state,
             )));
         }
         refuse_renew_prepare_ask_cancel(&tx, ask_message_id)?;
@@ -5974,8 +5978,9 @@ impl Store {
             return Err(StoreError::Conflict("obligation is absent".into()));
         };
         if !matches!(state.as_str(), "open" | "in_progress") {
-            return Err(StoreError::Conflict(format!(
-                "obligation in {state} state is not cancellable"
+            return Err(StoreError::Conflict(settled_obligation_refusal(
+                ask_message_id,
+                &state,
             )));
         }
         refuse_renew_prepare_ask_cancel(&tx, ask_message_id)?;
@@ -9221,6 +9226,89 @@ impl Store {
         Ok((marked_lost, sessions_refreshed))
     }
 
+    /// Settle `unknown` starts that never bound a runtime and never will.
+    ///
+    /// A start whose readiness never resolved leaves an incarnation in
+    /// `unknown` with no observed pane. That is the honest outcome at the time
+    /// — Kelpie cannot tell a slow launch from a dead one — but it is also a
+    /// state no command moves: `retire` needs a ready binding, adoption keys
+    /// off an observed seat this row never recorded, and continuation needs a
+    /// recorded native session it never saw. The row then sits in the active
+    /// report forever, unsettled and unaddressable.
+    ///
+    /// Recovery has the evidence the poll lacked. An authoritative snapshot
+    /// with no agent anywhere under the name that start was claiming proves
+    /// Herdr holds nothing this incarnation could be, so the binding is absent
+    /// for the same reason a vanished Ready binding is, and it is marked
+    /// `lost`. This is not coercing `unknown` into failure: the operation's
+    /// own outcome stays `unknown`, the attempt history is untouched, and only
+    /// the runtime binding is settled. A live agent still carrying that name
+    /// is left alone, because it may be exactly what this start produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable record cannot be read or updated.
+    fn settle_unbound_unknown_starts(&mut self, snapshot: &Snapshot) -> Result<usize, StoreError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT i.id, i.logical_agent_id, l.public_name, i.intended_pane_id
+                 FROM incarnations i JOIN logical_agents l ON l.id = i.logical_agent_id
+                 WHERE i.state = 'unknown'
+                   AND i.observed_pane_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM operations o
+                     WHERE o.target_incarnation_id = i.id
+                       AND o.outcome IN ('pending', 'accepted')
+                   )",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    id_text(row, 0)?,
+                    id_text(row, 1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut settled = 0;
+        for (incarnation_id, logical_agent_id, public_name, intended_pane_id) in rows {
+            if snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.name.as_deref() == Some(public_name.as_str()))
+            {
+                continue;
+            }
+            let now = now_millis()?;
+            let tx = self.connection.transaction()?;
+            let changed = tx.execute(
+                "UPDATE incarnations SET state = 'lost', terminal_at_ms = ?1,
+                 terminal_reason = 'unknown_start_never_bound'
+                 WHERE id = ?2 AND state = 'unknown' AND observed_pane_id IS NULL",
+                params![now, incarnation_id],
+            )?;
+            if changed != 1 {
+                continue;
+            }
+            insert_restore_notice(
+                &tx,
+                now,
+                &format!(
+                    "recovery settled incarnation {incarnation_id} of logical agent \
+                     {logical_agent_id} ({public_name}) as lost: its start outcome stayed \
+                     unknown and no live agent carries that name{}",
+                    intended_pane_id
+                        .map(|pane| format!(" (intended pane {pane})"))
+                        .unwrap_or_default()
+                ),
+            )?;
+            tx.commit()?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
+
     /// Release a Ready alias binding the snapshot says is no longer live.
     ///
     /// Adoption refuses a public name that a Ready incarnation already holds.
@@ -9763,10 +9851,12 @@ impl Store {
         let (incarnations_marked_lost, native_sessions_refreshed) =
             self.reconcile_ready_incarnations(snapshot)?;
         let incarnations_continued = self.continue_restored_occupants(snapshot)?;
+        let unbound_unknown_starts_settled = self.settle_unbound_unknown_starts(snapshot)?;
         let mut report = RecoveryReport {
             incarnations_marked_lost,
             incarnations_continued,
             native_sessions_refreshed,
+            unbound_unknown_starts_settled,
             outcomes_marked_unknown: self.reconcile_missed_due_wakes(now)?,
             ..RecoveryReport::default()
         };
@@ -9948,6 +10038,27 @@ fn party_present_in_tx(tx: &Transaction<'_>, agent: LogicalAgentId) -> Result<bo
         |row| row.get(0),
     )?;
     Ok(present != 0)
+}
+
+/// Explain a cancel refused because the obligation is already settled.
+///
+/// The state alone reads as a door the caller has not found yet, so each
+/// terminal state says what settled it and what, if anything, is left to do.
+/// Nothing here is a new fact: every one of these obligations is finished.
+fn settled_obligation_refusal(ask_message_id: MessageId, state: &str) -> String {
+    let detail = match state {
+        "resolved" => "a final reply already resolved it",
+        "cancelled" => "it was already cancelled",
+        "orphaned" => {
+            "Kelpie already closed it because a party stopped running; both sides were \
+             notified and no reply is owed"
+        }
+        _ => "it is no longer open",
+    };
+    format!(
+        "obligation {ask_message_id} is already settled ({state}): {detail}. \
+         Nothing is left to cancel; `kelpie pending` shows what is still open."
+    )
 }
 
 fn refuse_renew_prepare_ask_cancel(
@@ -14571,6 +14682,96 @@ mod tests {
         );
     }
 
+    /// A start whose readiness never resolved leaves a row no command can
+    /// move. Recovery is the only place that sees Herdr's whole fleet, so it
+    /// is where the row stops being a dead end.
+    #[test]
+    fn recovery_settles_an_unknown_start_no_live_agent_answers_for() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&intent("worker", "term-1", "stalled-start"))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, "request")
+            .expect("attempt");
+        store
+            .mark_unknown(
+                declared.operation_id,
+                declared.incarnation_id,
+                "readiness timeout",
+            )
+            .expect("unknown");
+        let mut other = observed_agent("term-1");
+        other.name = Some("somebody-else".into());
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![other],
+            })
+            .expect("reconcile");
+        assert_eq!(report.unbound_unknown_starts_settled, 1);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+        // The external effect's own outcome is evidence, not bookkeeping: it
+        // stays unknown because nothing proved what the launch did.
+        assert_eq!(
+            store
+                .operation_outcome(declared.operation_id)
+                .expect("outcome"),
+            OperationOutcome::Unknown
+        );
+        assert!(
+            store
+                .operator_notices()
+                .expect("notices")
+                .iter()
+                .any(|notice| notice.body.contains("stayed unknown")),
+            "settling an unbound start must leave an operator notice"
+        );
+    }
+
+    /// The same row is left alone while something live still answers to its
+    /// name: that agent may be exactly what the start produced, and adopting
+    /// it is the caller's call, not recovery's.
+    #[test]
+    fn recovery_leaves_an_unknown_start_whose_name_is_still_live() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&intent("worker", "term-1", "stalled-but-live"))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, "request")
+            .expect("attempt");
+        store
+            .mark_unknown(
+                declared.operation_id,
+                declared.incarnation_id,
+                "readiness timeout",
+            )
+            .expect("unknown");
+        let mut stalled = observed_agent("term-1");
+        stalled.interactive_ready = false;
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![stalled],
+            })
+            .expect("reconcile");
+        assert_eq!(report.unbound_unknown_starts_settled, 0);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Unknown
+        );
+    }
+
     #[test]
     fn recovery_keeps_exact_ready_binding_despite_readiness_hint_change() {
         let mut store = Store::in_memory().expect("store");
@@ -15510,6 +15711,7 @@ mod tests {
                 incarnations_continued: 0,
                 native_sessions_refreshed: 0,
                 names_reprojected: 0,
+                unbound_unknown_starts_settled: 0,
             }
         );
         assert_eq!(
@@ -19231,6 +19433,19 @@ mod tests {
                 .expect("orphan again")
                 .is_none(),
             "a terminal ask is never settled twice"
+        );
+        // Naming only the state sent callers looking for a door that does not
+        // exist. The refusal says what settled the obligation and that nothing
+        // is left to do.
+        let refused = store
+            .cancel_obligation(waiter.logical_agent_id, ask.message_id, "give up")
+            .expect_err("already settled")
+            .to_string();
+        assert!(
+            refused.contains("already settled (orphaned)")
+                && refused.contains("no reply is owed")
+                && refused.contains("Nothing is left to cancel"),
+            "the refusal must explain the settlement: {refused}"
         );
     }
 
