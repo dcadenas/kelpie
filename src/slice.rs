@@ -439,6 +439,36 @@ fn describe_pane(observed: Option<&crate::herdr::AgentObservation>, pane_id: &st
     )
 }
 
+/// Name the next door for a start that timed out with a launched agent in the
+/// pane.
+///
+/// `unknown` is the honest outcome and stays one. But the shape below —
+/// Herdr's launch record still present, the backend never reaching interactive
+/// — is overwhelmingly a backend prompt nobody answered: a trust-this-folder
+/// or permission dialog waiting on a keystroke in a pane no human is watching.
+/// Kelpie cannot see that dialog and MUST NOT claim it; what it can do is stop
+/// the caller from concluding the pane is empty and starting a duplicate on
+/// top of a live runtime.
+fn stalled_start_next_step(
+    observed: Option<&crate::herdr::AgentObservation>,
+    intent: &StartIntent,
+    declared: &DeclaredStart,
+) -> String {
+    let Some(agent) = observed else {
+        return String::new();
+    };
+    if agent.interactive_ready {
+        return String::new();
+    }
+    format!(
+        "; a runtime is present but never became interactive, so the pane may be waiting \
+         on a backend prompt (trust-this-folder, permissions). Kelpie cannot see it. \
+         Answer it in pane {}, then `kelpie adopt --pane {} --terminal {} --logical-id {}` \
+         to bind this same agent rather than starting a second one.",
+        intent.pane_id, intent.pane_id, intent.expected_terminal_id, declared.logical_agent_id
+    )
+}
+
 /// Whether one Herdr start rejection is provably worth attempting again.
 ///
 /// An allowlist, never a denylist: every other documented start rejection
@@ -5644,8 +5674,9 @@ impl Kelpie {
                 declared.operation_id,
                 declared.incarnation_id,
                 &format!(
-                    "{source}; last observation {}",
-                    describe_pane(observed.as_ref(), &intent.pane_id)
+                    "{source}; last observation {}{}",
+                    describe_pane(observed.as_ref(), &intent.pane_id),
+                    stalled_start_next_step(observed.as_ref(), intent, declared)
                 ),
             )?;
             return Err(SliceError::UnknownOutcome {
@@ -7715,6 +7746,42 @@ mod tests {
             crate::domain::OperationOutcome::Unknown
         );
         server.join().expect("fake Herdr server");
+    }
+
+    /// A pane holding a runtime that never turned interactive is the shape a
+    /// caller misreads as an empty pane, and starting a second agent on top of
+    /// a live one is the damage. The evidence names the door out instead.
+    #[test]
+    fn a_stalled_start_records_the_adopt_door_and_a_clean_one_records_nothing() {
+        let intent = e2e_intent();
+        let declared = crate::store::DeclaredStart {
+            logical_agent_id: crate::domain::LogicalAgentId::parse("7").expect("agent id"),
+            incarnation_id: crate::domain::IncarnationId::parse("9").expect("incarnation id"),
+            operation_id: crate::domain::OperationId::parse("11").expect("operation id"),
+        };
+        let stalled = crate::herdr::AgentObservation {
+            terminal_id: "term-1".into(),
+            pane_id: "w1:p1".into(),
+            name: Some("worker".into()),
+            agent: Some("codex".into()),
+            interactive_ready: false,
+            launch_pending: true,
+            agent_session: None,
+        };
+        let hint = stalled_start_next_step(Some(&stalled), &intent, &declared);
+        assert!(
+            hint.contains("kelpie adopt --pane w1:p1 --terminal term-1 --logical-id 7"),
+            "{hint}"
+        );
+        assert!(hint.contains("never became interactive"), "{hint}");
+        // Nothing observed is nothing to say: Kelpie does not guess at a pane
+        // it has no reading of.
+        assert!(stalled_start_next_step(None, &intent, &declared).is_empty());
+        let ready = crate::herdr::AgentObservation {
+            interactive_ready: true,
+            ..stalled
+        };
+        assert!(stalled_start_next_step(Some(&ready), &intent, &declared).is_empty());
     }
 
     #[test]
