@@ -2202,10 +2202,12 @@ fn render_name_info(result: &Value) -> String {
         let transport = claimant["delivery_transport"]
             .as_str()
             .unwrap_or("herdr_prompt");
+        let archived = claimant["archived"].as_bool().unwrap_or(false);
         let state = match (transport, live, addressable) {
             ("socket_inbox", _, true) => "active-waiter",
             ("socket_inbox", _, false) => "retired-waiter",
             (_, true, _) => "live",
+            _ if archived => "archived",
             _ => "not-live",
         };
         let _ = write!(

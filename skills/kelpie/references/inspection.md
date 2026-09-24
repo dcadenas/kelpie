@@ -10,7 +10,8 @@ Contents: [Method details](#method-details).
   with a live name, `--pane`, `--agent-id`, or `--incarnation-id`; the default
   is your own pane. It also resolves an active socket waiter by name, where
   `incarnation_id` and attribution are absent. Add `--history` to a name to see
-  every claimant and unresolved obligation. `requested` is what a launch asked
+  every claimant and unresolved obligation, including identities kelpied
+  archived after a day wholly dead; `--resolve` still continues those. `requested` is what a launch asked
   for and is never proof of
   what served a turn; `observed` is adapter evidence. `observed none` means
   nothing was observed, which is not the same as an observed `undetermined`

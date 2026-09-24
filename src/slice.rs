@@ -3941,13 +3941,14 @@ impl Kelpie {
             .map_err(SliceError::Store)
     }
 
-    /// Everything known about the holders of one public name. Read-only.
+    /// Everything known about the holders of one public name, archived
+    /// identities included and flagged. Read-only.
     ///
     /// # Errors
     ///
     /// Returns store errors from the underlying queries.
-    pub fn name_info(&self, public_name: &str) -> Result<crate::store::NameInfo, SliceError> {
-        Ok(self.store.name_info(public_name)?)
+    pub fn name_history(&self, public_name: &str) -> Result<crate::store::NameInfo, SliceError> {
+        Ok(self.store.name_history(public_name)?)
     }
 
     /// Cancel one unresolved obligation with a durable reason, and deliver

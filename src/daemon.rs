@@ -48,6 +48,15 @@ const BOOT_CONTINUE_INTERVAL: Duration = Duration::from_secs(5);
 const ASK_ORPHAN_GRACE_MS: i64 = 10 * 60 * 1000;
 /// Pause between absence sweeps. Runs only while obligations or claimed waiters exist.
 const ASK_SWEEP_INTERVAL: Duration = Duration::from_mins(2);
+/// How long an identity must have been wholly terminal before it is archived.
+/// Long enough to span a Herdr restart and native restore, an overnight pause,
+/// and a leaf woken again the next working day, so routine continuation never
+/// meets an archived identity. Archiving is reversible anyway: a new
+/// incarnation clears it.
+const IDENTITY_ARCHIVE_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
+/// Pause between identity archive passes. Terminal rows age by hours, so a
+/// finer cadence would only repeat the same query.
+const IDENTITY_ARCHIVE_INTERVAL: Duration = Duration::from_mins(15);
 
 fn boot_continue_should_start(now: Instant, until: Instant, next: Instant, inflight: bool) -> bool {
     !inflight && now < until && now >= next
@@ -299,6 +308,7 @@ pub struct Daemon {
     next_boot_continue: Instant,
     obligation_sweep_job: Option<u64>,
     next_obligation_sweep: Instant,
+    next_identity_archive: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,6 +548,7 @@ impl Daemon {
             next_boot_continue: Instant::now() + BOOT_CONTINUE_INTERVAL,
             obligation_sweep_job: None,
             next_obligation_sweep: Instant::now() + ASK_SWEEP_INTERVAL,
+            next_identity_archive: Instant::now(),
         })
     }
 
@@ -578,6 +589,8 @@ impl Daemon {
         log_slow_phase("boot_continue", &mut phase);
         self.schedule_obligation_sweep();
         log_slow_phase("obligation_sweep", &mut phase);
+        self.archive_dead_identities();
+        log_slow_phase("identity_archive", &mut phase);
         if let Err(error) = self.kelpie.fire_due_schedules() {
             let _ = self
                 .kelpie
@@ -2655,6 +2668,30 @@ impl Daemon {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Archive identities that have been wholly terminal past the grace.
+    ///
+    /// Store-only and Herdr-free: it reads settled rows, so it never needs a
+    /// snapshot and never touches an operation this daemon is driving.
+    fn archive_dead_identities(&mut self) {
+        if Instant::now() < self.next_identity_archive {
+            return;
+        }
+        self.next_identity_archive = Instant::now() + IDENTITY_ARCHIVE_INTERVAL;
+        let result = crate::store::store_clock_ms()
+            .map_err(|error| error.to_string())
+            .and_then(|now_ms| {
+                self.kelpie
+                    .store_mut()
+                    .archive_dead_identities(now_ms, IDENTITY_ARCHIVE_GRACE_MS)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(0) => {}
+            Ok(archived) => eprintln!("kelpied: archived {archived} dead identities"),
+            Err(error) => eprintln!("kelpied: identity archive failed: {error}"),
         }
     }
 
@@ -5735,7 +5772,7 @@ fn dispatch_ask_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceE
 fn dispatch_name_info(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<NameInfoParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
-    let info = kelpie.name_info(&params.name)?;
+    let info = kelpie.name_history(&params.name)?;
     let claimants = name_claimants_response(&info);
     let unresolved = name_unresolved_response(&info);
     Ok(serde_json::json!({
@@ -5749,14 +5786,20 @@ fn name_claimants_response(info: &crate::store::NameInfo) -> Vec<Value> {
     info.claimants
         .iter()
         .map(|claimant| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "logical_agent_id": claimant.logical_agent_id,
                 "created_at_ms": claimant.created_at_ms,
                 "delivery_transport": claimant.delivery_transport,
                 "live": claimant.has_ready_incarnation,
                 "addressable": claimant.is_addressable,
                 "unresolved_count": claimant.unresolved_count,
-            })
+            });
+            // Additive, and only when true, so unarchived claimants keep the
+            // legacy `name.info` shape byte for byte.
+            if claimant.archived {
+                value["archived"] = Value::Bool(true);
+            }
+            value
         })
         .collect()
 }

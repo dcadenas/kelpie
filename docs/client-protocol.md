@@ -589,11 +589,23 @@ or take a different name by renaming the agent in Herdr and adopting under it.
 The legacy `name.info` method and `name-info` command return exactly their
 previous result and stdout shapes.
 
+kelpied archives dead identities on its own: every 15 minutes it marks a
+`herdr_prompt` logical agent archived once every incarnation is failed, lost,
+retired, or superseded, nothing on it is unresolved (no open ask on either
+side, no pending operation, active schedule, or unfinished renew), and its last
+terminal evidence is more than 24 hours old. Nothing is deleted. An archived
+identity no longer counts as a prior claimant, so it does not block adoption or
+a create-new under its old name, and it is never in `report --active`.
+`who <name> --history` still lists it, adding `"archived": true` to that
+claimant (stdout: `archived`), and `who <name> --resolve` still selects it for
+continuation. Any new incarnation of it clears the mark.
+
 `who <name> --resolve` uses that same ordered picture to name a continuation
 target. One uniquely addressable Ready incarnation or active socket waiter wins.
 When none is addressable, the last claimant wins because claimants are ordered
-by `created_at_ms`, then logical-agent ID. Retired, lost, and failed claimants
-remain eligible for selection regardless of their last incarnation state. A
+by `created_at_ms`, then logical-agent ID. Retired, lost, and failed claimants,
+archived ones included, remain eligible for selection regardless of their last
+incarnation state. A
 selected `herdr_prompt` identity can continue with `start --logical-id`; an
 ended `socket_inbox` waiter cannot be reactivated, so a socket host registers a
 new waiter after reconciling its old obligations. More than one addressable

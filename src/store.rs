@@ -56,7 +56,7 @@ fn optional_id_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Stri
         .transpose()
 }
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 /// Backstop interval for unanswered asks, including initial launch asks.
 pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 2_700_000;
 
@@ -184,6 +184,8 @@ pub struct NameClaimant {
     pub has_ready_incarnation: bool,
     pub is_addressable: bool,
     pub unresolved_count: i64,
+    /// Archived as wholly terminal; present only in history and continuation.
+    pub archived: bool,
 }
 
 /// One unresolved obligation touching a name's claimants, with both parties
@@ -1137,7 +1139,7 @@ impl Store {
         // to the prior agent has no Ready incarnation to reach. Continue is
         // the remedy for that agent's own debts, not a way to take a name
         // somebody else is still waiting on.
-        let info = Self::name_info_on(&tx, &public_name)?;
+        let info = Self::name_info_on(&tx, &public_name, false)?;
         let continued = intent.logical_agent_id.map(|id| id.to_string());
         let foreign_unresolved = info.unresolved.iter().any(|obligation| {
             continued.as_deref() != Some(obligation.asker_agent_id.as_str())
@@ -4357,26 +4359,42 @@ impl Store {
     /// obligation touching them, with both parties resolved to names and
     /// liveness.
     ///
-    /// Read-only. This is the data behind create-new refusals and `who --history`.
+    /// Read-only. This is the data behind create-new refusals. Archived
+    /// identities are not claimants here: they are dead, owe nothing, and
+    /// must not block a new identity under their old name.
     ///
     /// # Errors
     ///
     /// Returns store errors from the underlying queries.
     pub fn name_info(&self, public_name: &str) -> Result<NameInfo, StoreError> {
-        Self::name_info_on(&self.connection, public_name)
+        Self::name_info_on(&self.connection, public_name, false)
+    }
+
+    /// Every logical agent that ever held a public name, archived included.
+    ///
+    /// Read-only. This is `who --history`: the full picture, with archived
+    /// claimants flagged rather than hidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns store errors from the underlying queries.
+    pub fn name_history(&self, public_name: &str) -> Result<NameInfo, StoreError> {
+        Self::name_info_on(&self.connection, public_name, true)
     }
 
     /// Select the claimant a name-keyed host should continue.
     ///
     /// A unique live delivery target wins. With no live target, the newest
     /// claimant wins by creation time and logical-agent id. Live ambiguity and
-    /// names with no known claimant fail closed.
+    /// names with no known claimant fail closed. Archived claimants stay
+    /// eligible: continuing a parked identity is exactly what archiving must
+    /// not prevent, and the new incarnation clears the archive mark.
     ///
     /// # Errors
     ///
     /// Returns store errors or a conflict for live ambiguity or no claimants.
     pub fn resolve_name_continue(&self, public_name: &str) -> Result<NameContinue, StoreError> {
-        let info = Self::name_info_on(&self.connection, public_name)?;
+        let info = Self::name_info_on(&self.connection, public_name, true)?;
         let addressable: Vec<&NameClaimant> = info
             .claimants
             .iter()
@@ -4420,7 +4438,11 @@ impl Store {
         })
     }
 
-    fn name_info_on(conn: &Connection, public_name: &str) -> Result<NameInfo, StoreError> {
+    fn name_info_on(
+        conn: &Connection,
+        public_name: &str,
+        include_archived: bool,
+    ) -> Result<NameInfo, StoreError> {
         let mut claimants = Vec::new();
         let mut statement = conn.prepare(
             "SELECT l.id, l.created_at_ms,
@@ -4430,12 +4452,14 @@ impl Store {
                     (l.delivery_transport = 'socket_inbox' AND l.targeting_ended_at_ms IS NULL),
                     (SELECT COUNT(*) FROM obligations o
                      WHERE o.state IN ('open', 'in_progress')
-                       AND (o.owing_agent_id = l.id OR o.waiting_agent_id = l.id))
+                       AND (o.owing_agent_id = l.id OR o.waiting_agent_id = l.id)),
+                    l.archived_at_ms IS NOT NULL
              FROM logical_agents l
              WHERE l.public_name = ?1
+               AND (?2 OR l.archived_at_ms IS NULL)
              ORDER BY l.created_at_ms ASC, l.id ASC",
         )?;
-        let rows = statement.query_map([public_name], |row| {
+        let rows = statement.query_map(params![public_name, include_archived], |row| {
             let has_ready_incarnation = row.get::<_, i64>(2)? != 0;
             let transport = row.get::<_, String>(3)?;
             let active_socket_waiter = row.get::<_, i64>(4)? != 0;
@@ -4446,11 +4470,19 @@ impl Store {
                 has_ready_incarnation,
                 active_socket_waiter,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)? != 0,
             ))
         })?;
         for row in rows {
-            let (logical_agent_id, created_at_ms, transport, ready, active_socket, unresolved) =
-                row?;
+            let (
+                logical_agent_id,
+                created_at_ms,
+                transport,
+                ready,
+                active_socket,
+                unresolved,
+                archived,
+            ) = row?;
             claimants.push(NameClaimant {
                 logical_agent_id,
                 created_at_ms,
@@ -4458,6 +4490,7 @@ impl Store {
                 has_ready_incarnation: ready,
                 is_addressable: ready || active_socket,
                 unresolved_count: unresolved,
+                archived,
             });
         }
         drop(statement);
@@ -4644,7 +4677,7 @@ impl Store {
     /// them, count what they are owed, and point at `who --history`; when it has
     /// none, keep the live-but-unadopted hint.
     fn alias_unready_message(&self, public_name: &str) -> String {
-        let Ok(info) = Self::name_info_on(&self.connection, public_name) else {
+        let Ok(info) = Self::name_info_on(&self.connection, public_name, false) else {
             return format!(
                 "no ready agent for alias {public_name}; a live Herdr agent may hold that name unadopted"
             );
@@ -9858,6 +9891,71 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Archive logical identities that are dead and have stayed dead.
+    ///
+    /// A Herdr identity qualifies when it has at least one incarnation, every
+    /// incarnation is terminal (`failed`, `lost`, `retired`, `superseded`),
+    /// nothing unresolved still names it — no open or in-progress obligation
+    /// on either side, no pending or accepted operation, no active schedule,
+    /// no live renew — and its last terminal evidence is older than
+    /// `grace_ms`. `failed` records no `terminal_at_ms`, so the latest
+    /// resolution of an operation on that incarnation stands in, then its
+    /// creation.
+    ///
+    /// Archiving is not cleanup: no row is deleted or rewritten except the
+    /// archive mark itself. It reads only rows that are already settled, so
+    /// it cannot race work the daemon is still driving. A new incarnation for
+    /// the identity clears the mark through the schema trigger. Socket
+    /// waiters have their own lifecycle and are never archived here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive mark cannot be written.
+    pub fn archive_dead_identities(
+        &mut self,
+        now_ms: i64,
+        grace_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let archived = self.connection.execute(
+            "UPDATE logical_agents SET archived_at_ms = ?1
+             WHERE archived_at_ms IS NULL
+               AND delivery_transport = 'herdr_prompt'
+               AND EXISTS (SELECT 1 FROM incarnations i WHERE i.logical_agent_id = logical_agents.id)
+               AND NOT EXISTS (
+                 SELECT 1 FROM incarnations i
+                 WHERE i.logical_agent_id = logical_agents.id
+                   AND i.state NOT IN ('failed', 'lost', 'retired', 'superseded'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM obligations ob
+                 WHERE ob.state IN ('open', 'in_progress')
+                   AND (ob.owing_agent_id = logical_agents.id
+                        OR ob.waiting_agent_id = logical_agents.id))
+               AND NOT EXISTS (
+                 SELECT 1 FROM operations o
+                 JOIN incarnations i ON i.id = o.target_incarnation_id
+                 WHERE i.logical_agent_id = logical_agents.id
+                   AND o.outcome IN ('pending', 'accepted'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM schedules sc
+                 WHERE sc.state = 'active'
+                   AND (sc.logical_agent_id = logical_agents.id
+                        OR sc.requester_agent_id = logical_agents.id))
+               AND NOT EXISTS (
+                 SELECT 1 FROM renews r
+                 WHERE r.logical_agent_id = logical_agents.id
+                   AND r.phase NOT IN ('done', 'aborted', 'terminated'))
+               AND (SELECT MAX(COALESCE(
+                          i.terminal_at_ms,
+                          (SELECT MAX(o.resolved_at_ms) FROM operations o
+                           WHERE o.target_incarnation_id = i.id),
+                          i.created_at_ms))
+                    FROM incarnations i
+                    WHERE i.logical_agent_id = logical_agents.id) <= ?1 - ?2",
+            params![now_ms, grace_ms],
+        )?;
+        Ok(archived)
+    }
+
     /// Mark every operation created from now on as owned by this live process.
     ///
     /// Startup recovery runs before a daemon serves anything, so every
@@ -10674,6 +10772,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if version == 31 {
         connection.execute_batch(include_str!("../migrations/032_ask_orphan.sql"))?;
         version = 32;
+    }
+    if version == 32 {
+        connection.execute_batch(include_str!("../migrations/033_identity_archive.sql"))?;
+        version = 33;
     }
     if version != SCHEMA_VERSION {
         return Err(StoreError::InvalidRecord(format!(
@@ -14882,6 +14984,180 @@ mod tests {
         );
     }
 
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    fn failed_start(store: &mut Store, name: &str, terminal: &str, key: &str) -> DeclaredStart {
+        let declared = store
+            .declare_start(&intent(name, terminal, key))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, key)
+            .expect("attempt");
+        store
+            .mark_rejected(
+                declared.operation_id,
+                declared.incarnation_id,
+                "launch refused",
+                DeliveryOutcome::Rejected,
+            )
+            .expect("failed");
+        declared
+    }
+
+    fn ready_start(store: &mut Store, name: &str, terminal: &str, key: &str) -> DeclaredStart {
+        let declared = store
+            .declare_start(&intent(name, terminal, key))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, key)
+            .expect("attempt");
+        let mut agent = observed_agent(terminal);
+        agent.name = Some(name.into());
+        store
+            .accept_start_ready(declared.operation_id, declared.incarnation_id, &agent, None)
+            .expect("ready");
+        declared
+    }
+
+    fn archived_at(store: &Store, agent: LogicalAgentId) -> Option<i64> {
+        store
+            .connection
+            .query_row(
+                "SELECT archived_at_ms FROM logical_agents WHERE id = ?1",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .expect("archive mark")
+    }
+
+    /// A wholly terminal identity past the grace is archived: it stops being
+    /// a claimant for new identities, stays in history, stays continuable by
+    /// name, and a new incarnation brings it back.
+    #[test]
+    fn archive_hides_a_dead_identity_but_keeps_it_continuable() {
+        let mut store = Store::in_memory().expect("store");
+        let dead = failed_start(&mut store, "storm-leaf", "term-1", "storm-1");
+        let now = now_millis().expect("clock");
+        assert_eq!(
+            store.archive_dead_identities(now, DAY_MS).expect("archive"),
+            0,
+            "a fresh failure is still inside the grace"
+        );
+        assert_eq!(
+            store
+                .archive_dead_identities(now + DAY_MS + 1, DAY_MS)
+                .expect("archive"),
+            1
+        );
+        assert!(archived_at(&store, dead.logical_agent_id).is_some());
+        assert!(
+            store
+                .name_info("storm-leaf")
+                .expect("claimants")
+                .claimants
+                .is_empty(),
+            "an archived identity must not count as a prior claimant"
+        );
+        let history = store.name_history("storm-leaf").expect("history");
+        assert_eq!(history.claimants.len(), 1);
+        assert!(history.claimants[0].archived);
+        let resolved = store
+            .resolve_name_continue("storm-leaf")
+            .expect("an archived identity still resolves for continuation");
+        assert_eq!(resolved.logical_agent_id, dead.logical_agent_id);
+        // Rows are marked, never removed.
+        assert_eq!(
+            store
+                .operation_outcome(dead.operation_id)
+                .expect("history kept"),
+            OperationOutcome::Failed
+        );
+        let mut again = intent("storm-leaf", "term-2", "storm-2");
+        again.logical_agent_id = Some(dead.logical_agent_id);
+        store.declare_start(&again).expect("continue");
+        assert_eq!(
+            archived_at(&store, dead.logical_agent_id),
+            None,
+            "a new incarnation un-archives its identity"
+        );
+    }
+
+    /// Anything not yet settled keeps an identity out of the archive: a live
+    /// or unresolved incarnation, and an obligation still open on either side.
+    #[test]
+    fn archive_leaves_identities_with_live_incarnations_or_open_obligations() {
+        let mut store = Store::in_memory().expect("store");
+        let live = ready_start(&mut store, "live-leaf", "term-1", "live-1");
+        let stalled = store
+            .declare_start(&intent("stalled-leaf", "term-2", "stalled-1"))
+            .expect("intent");
+        store
+            .begin_attempt(stalled.operation_id, stalled.incarnation_id, "stalled-1")
+            .expect("attempt");
+        store
+            .mark_unknown(stalled.operation_id, stalled.incarnation_id, "timeout")
+            .expect("unknown");
+        // A dead owner of an open ask: ready when asked, lost since.
+        let owing = ready_start(&mut store, "owing-leaf", "term-3", "owing-1");
+        let ask = store
+            .create_ask(
+                live.logical_agent_id,
+                owing.logical_agent_id,
+                owing.incarnation_id,
+                "still owed",
+                "owed-ask",
+            )
+            .expect("ask");
+        let attempt = store
+            .begin_attempt(ask.operation_id, owing.incarnation_id, "owed-ask")
+            .expect("attempt");
+        store
+            .mark_submitted(ask.operation_id, attempt, "owed-ask")
+            .expect("submitted");
+        store
+            .accept_delivery(ask.operation_id, owing.incarnation_id, "w1:p1", "term-3")
+            .expect("delivered");
+        let mut still_live = observed_agent("term-1");
+        still_live.name = Some("live-leaf".into());
+        // Still coming up under its name, so recovery keeps it `unknown`.
+        let mut still_starting = observed_agent("term-2");
+        still_starting.name = Some("stalled-leaf".into());
+        still_starting.interactive_ready = false;
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![still_live, still_starting],
+            })
+            .expect("reconcile");
+        assert_eq!(
+            store
+                .incarnation_state(owing.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+        assert_eq!(
+            store
+                .incarnation_state(stalled.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Unknown
+        );
+        let later = now_millis().expect("clock") + 30 * DAY_MS;
+        assert_eq!(
+            store
+                .archive_dead_identities(later, DAY_MS)
+                .expect("archive"),
+            0
+        );
+        for agent in [
+            live.logical_agent_id,
+            stalled.logical_agent_id,
+            owing.logical_agent_id,
+        ] {
+            assert_eq!(archived_at(&store, agent), None);
+        }
+    }
+
     /// A start Herdr accepted recorded its seat before readiness timed out.
     /// That seat going empty, with nothing live under the name either, is
     /// the same absence proof; the recorded pane must not exempt the row.
@@ -17277,6 +17553,7 @@ mod tests {
                 has_ready_incarnation: false,
                 is_addressable: false,
                 unresolved_count: 1,
+                archived: false,
             }],
             unresolved: vec![NameObligation {
                 ask_message_id: "01a008ed-ask".into(),

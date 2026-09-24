@@ -781,6 +781,18 @@ Rules:
   `Ready`.
 - Retirement MUST preserve worktrees, transcripts, messages, and artifacts by
   default. Destructive cleanup is a separate explicit operation.
+- Archiving is not destructive cleanup. kelpied MUST periodically archive a
+  `herdr_prompt` logical agent that has at least one incarnation, whose every
+  incarnation is `Failed`, `Lost`, `Retired`, or `Superseded`, that has no
+  `open` or `in_progress` obligation on either side, no pending or accepted
+  operation, no active schedule, and no unfinished renew, and whose latest
+  terminal evidence is older than a fixed grace. Archiving MUST only set an
+  archive mark: it MUST NOT delete or rewrite the identity, its incarnations,
+  messages, obligations, or operation history, and it MUST read only rows that
+  are already settled. An archived identity MUST NOT count as a claimant for
+  create-new refusals or alias adoption, and MUST remain visible in name
+  history and eligible for name-keyed continuation. A new incarnation for an
+  archived identity MUST clear its archive mark.
 - A lost Herdr binding MUST NOT delete the logical agent or its history.
 
 ### Ask and reply
@@ -1257,7 +1269,8 @@ identifier.
 - Kelpie MUST pass credential references or inherited authorization to backend
   adapters without logging secret values.
 - Destructive cleanup MUST require an explicit exact target and MUST be separate
-  from ordinary retire/recovery operations.
+  from ordinary retire/recovery operations. Automatic archiving of dead
+  identities is not destructive cleanup (see incarnation rules).
 - A message body MUST be treated as untrusted text when rendered for terminals.
   Rendering MUST escape or delimit it so it cannot alter envelope metadata.
 - Local socket possession and claimed sender name MUST NOT be described as
