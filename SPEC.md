@@ -863,6 +863,16 @@ On startup Kelpie MUST:
 Recovery MUST be idempotent. Repeating it with unchanged durable and Herdr state
 MUST produce no new external effects.
 
+Recover inside a live daemon (the post-bind retry window, periodic absence
+sweeps, and an explicit `recover` request) MUST NOT resolve an operation that
+daemon is still driving. Every operation created after the daemon bound is its
+own: a start still waiting on readiness, or a prompt or clear past its write
+boundary, MUST be left to the daemon's own outcome path, however little the
+snapshot shows of it. Operations left by an earlier process remain subject to
+the steps above. Passes whose evidence is downtime itself, such as a due wake
+elapsing while kelpied was not running or a reminder attempt interrupted by a
+restart, MUST run only during startup recovery.
+
 ## Messaging contract
 
 Kelpie MUST expose semantic operations equivalent to:

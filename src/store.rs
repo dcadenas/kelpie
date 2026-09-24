@@ -879,6 +879,9 @@ pub struct FleetReport {
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
+    /// Highest operation id that existed when a live daemon took ownership.
+    /// Operations above it are driven by that daemon, not orphaned.
+    live_operation_floor: Option<i64>,
 }
 
 impl Store {
@@ -893,7 +896,10 @@ impl Store {
         let connection = Connection::open(path)?;
         configure(&connection)?;
         migrate(&connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            live_operation_floor: None,
+        })
     }
 
     /// Create an isolated in-memory store for deterministic tests.
@@ -905,7 +911,10 @@ impl Store {
         let connection = Connection::open_in_memory()?;
         configure(&connection)?;
         migrate(&connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            live_operation_floor: None,
+        })
     }
 
     /// Atomically persist logical identity, incarnation, and start operation.
@@ -7300,6 +7309,10 @@ impl Store {
     ///
     /// Returns an error if reconciliation cannot commit atomically.
     pub fn reconcile_reminder_attempts(&mut self) -> Result<usize, StoreError> {
+        // A submitted attempt inside a live daemon is one it is still driving.
+        if self.live_operation_floor.is_some() {
+            return Ok(0);
+        }
         let now = now_millis()?;
         let tx = self.connection.transaction()?;
         tx.execute("DELETE FROM reminder_attempts WHERE phase = 'prepared'", [])?;
@@ -9845,6 +9858,31 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Mark every operation created from now on as owned by this live process.
+    ///
+    /// Startup recovery runs before a daemon serves anything, so every
+    /// unresolved operation it sees was left by a process that is gone. Once
+    /// the daemon binds, the same reconcile keeps running against fresh
+    /// snapshots (boot continuation, absence sweeps, client `recover`), and
+    /// operations created after that point are ones the daemon is still
+    /// driving: a start waiting on readiness, a prompt or clear mid-write. A
+    /// snapshot that does not yet show their result is not evidence they were
+    /// abandoned, so reconcile leaves them to the daemon that owns them.
+    /// Operation ids are `AUTOINCREMENT`, so the floor needs no clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the highest operation id cannot be read.
+    pub fn claim_live_operations(&mut self) -> Result<(), StoreError> {
+        let floor: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM operations",
+            [],
+            |row| row.get(0),
+        )?;
+        self.live_operation_floor = Some(floor);
+        Ok(())
+    }
+
     /// Reconcile interrupted operations against one fresh Herdr snapshot.
     ///
     /// This method never causes an external effect. An attempted start succeeds
@@ -9857,6 +9895,9 @@ impl Store {
     /// occupant. That is not a Herdr write and not fleet auto-adoption.
     /// Attempted prompts become `unknown` because a snapshot cannot prove
     /// terminal-input delivery. Intents with no attempt remain pending.
+    /// Inside a live daemon ([`Store::claim_live_operations`]), operations it
+    /// created are skipped, and so are the passes that presume downtime:
+    /// missed due wakes and interrupted reminder attempts.
     ///
     /// # Errors
     ///
@@ -9870,9 +9911,10 @@ impl Store {
                         EXISTS(SELECT 1 FROM operation_attempts a
                                WHERE a.operation_id = o.id AND a.phase != 'prepared')
                  FROM operations o JOIN incarnations i ON i.id = o.target_incarnation_id
-                 WHERE o.outcome IN ('pending', 'accepted')",
+                 WHERE o.outcome IN ('pending', 'accepted')
+                   AND (?1 IS NULL OR o.id <= ?1)",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([self.live_operation_floor], |row| {
                 let operation = id_text(row, 0)?;
                 let incarnation = id_text(row, 1)?;
                 Ok((
@@ -9916,7 +9958,13 @@ impl Store {
             incarnations_continued,
             native_sessions_refreshed,
             unknown_starts_settled,
-            outcomes_marked_unknown: self.reconcile_missed_due_wakes(now)?,
+            // A live daemon fires its own due wakes; one that is due but not
+            // yet fired was not missed during downtime.
+            outcomes_marked_unknown: if self.live_operation_floor.is_some() {
+                0
+            } else {
+                self.reconcile_missed_due_wakes(now)?
+            },
             ..RecoveryReport::default()
         };
         for candidate in candidates {
@@ -12929,7 +12977,10 @@ mod tests {
         assert_eq!(start["initial_message"]["sender"], 1);
         assert_eq!(start["supersedes"], 1);
 
-        let mut store = Store { connection };
+        let mut store = Store {
+            connection,
+            live_operation_floor: None,
+        };
         assert_eq!(
             store
                 .register_socket_waiter("next", Parent::Parentless, "next-agent")

@@ -783,6 +783,9 @@ it may be what that start produced — adopt it on its seat to continue the same
 logical agent.
 kelpied retries recover for two minutes after bind
 so occupants that appear after Herdr native restore can still unique-continue.
+Those retries, the periodic absence sweep, and a `recover` request sent to a
+running daemon never resolve an operation that daemon created: a start still
+waiting on readiness or a prompt mid-write is left to its own outcome.
 Recovery preserves logical identity, messages, obligations, and the recorded
 working directory. It does not auto-adopt agents Kelpie never bound.
 

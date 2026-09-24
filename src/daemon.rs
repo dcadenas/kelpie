@@ -493,6 +493,17 @@ impl Daemon {
                     "waiter clock reset failed: {error}"
                 )))
             })?;
+        // Startup recovery already settled what the previous process left.
+        // From here on, an unresolved operation this daemon created is one
+        // it is still driving, and later recovers must leave it alone.
+        kelpie
+            .store_mut()
+            .claim_live_operations()
+            .map_err(|error| {
+                DaemonError::Io(std::io::Error::other(format!(
+                    "live operation claim failed: {error}"
+                )))
+            })?;
         let herdr_exec = HerdrExec::spawn(kelpie.herdr_client().clone());
         Ok(Self {
             listener,
@@ -10323,6 +10334,199 @@ mod tests {
         )
         .expect("bind");
         (daemon, socket)
+    }
+
+    fn seated_agent(ready: bool) -> crate::herdr::AgentObservation {
+        crate::herdr::AgentObservation {
+            terminal_id: "term-1".into(),
+            pane_id: "w1:p1".into(),
+            name: Some("worker".into()),
+            agent: Some("codex".into()),
+            interactive_ready: ready,
+            launch_pending: !ready,
+            agent_session: None,
+        }
+    }
+
+    fn live_snapshot(agents: Vec<crate::herdr::AgentObservation>) -> HerdrJobResult {
+        HerdrJobResult::Snapshot(crate::herdr::Snapshot {
+            protocol: 20,
+            panes: vec![],
+            agents,
+        })
+    }
+
+    fn run_boot_continue(daemon: &mut Daemon, agents: Vec<crate::herdr::AgentObservation>) {
+        daemon.boot_continue_job = Some(9_001);
+        daemon.on_boot_continue_done(9_001, Ok(live_snapshot(agents)));
+    }
+
+    fn run_absence_sweep(daemon: &mut Daemon, agents: Vec<crate::herdr::AgentObservation>) {
+        daemon.obligation_sweep_job = Some(9_002);
+        daemon.on_obligation_sweep_done(9_002, Ok(live_snapshot(agents)));
+    }
+
+    /// Declare an attempted start on its own pane before the daemon binds,
+    /// the shape a killed process leaves behind.
+    fn orphaned_start(store: &mut Store) -> crate::store::DeclaredStart {
+        let mut intent = test_intent("orphan", "term-9", "orphaned-start");
+        intent.pane_id = "w9:p1".into();
+        let orphan = store.declare_start(&intent).expect("orphan intent");
+        store
+            .begin_attempt(orphan.operation_id, orphan.incarnation_id, "orphan-request")
+            .expect("orphan attempt");
+        store
+            .accept_start_submission(
+                orphan.operation_id,
+                orphan.incarnation_id,
+                "w9:p1",
+                "term-9",
+            )
+            .expect("orphan accepted");
+        orphan
+    }
+
+    /// Accept a start on the worker seat without readiness: the daemon is
+    /// still waiting on it.
+    fn start_in_flight(daemon: &mut Daemon) -> crate::store::DeclaredStart {
+        let store = daemon.kelpie.store_mut();
+        let declared = store
+            .declare_start(&test_intent("worker", "term-1", "live-start"))
+            .expect("intent");
+        store
+            .begin_attempt(
+                declared.operation_id,
+                declared.incarnation_id,
+                "live-request",
+            )
+            .expect("attempt");
+        store
+            .accept_start_submission(
+                declared.operation_id,
+                declared.incarnation_id,
+                "w1:p1",
+                "term-1",
+            )
+            .expect("accepted");
+        declared
+    }
+
+    fn assert_start_still_driven_then_ready(
+        daemon: &mut Daemon,
+        live: &crate::store::DeclaredStart,
+        orphan: &crate::store::DeclaredStart,
+    ) {
+        let store = daemon.kelpie.store_mut();
+        assert_eq!(
+            store.operation_outcome(live.operation_id).expect("outcome"),
+            crate::domain::OperationOutcome::Accepted,
+            "a start this daemon is driving must not be resolved by its own recover"
+        );
+        assert_eq!(
+            store.incarnation_state(live.incarnation_id).expect("state"),
+            crate::domain::IncarnationState::Starting
+        );
+        // Ownership, not timing, is the line: what a dead process left is
+        // still reconciled by the same pass.
+        assert_eq!(
+            store
+                .operation_outcome(orphan.operation_id)
+                .expect("outcome"),
+            crate::domain::OperationOutcome::Unknown
+        );
+        store
+            .accept_start_ready(
+                live.operation_id,
+                live.incarnation_id,
+                &seated_agent(true),
+                None,
+            )
+            .expect("readiness still lands after the recover");
+        assert_eq!(
+            store.incarnation_state(live.incarnation_id).expect("state"),
+            crate::domain::IncarnationState::Ready
+        );
+    }
+
+    /// The boot-continue loop recovers every few seconds for two minutes
+    /// after bind. A start that is still coming up in that window is the
+    /// daemon's own work, not something a previous process abandoned.
+    #[test]
+    fn boot_continue_recover_leaves_a_start_waiting_on_readiness() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let orphan = orphaned_start(&mut store);
+        let (mut daemon, _socket) = bind_inbox_daemon(directory.path(), store);
+        let live = start_in_flight(&mut daemon);
+        run_boot_continue(&mut daemon, vec![seated_agent(false)]);
+        assert_start_still_driven_then_ready(&mut daemon, &live, &orphan);
+    }
+
+    /// The absence sweep runs a full recover every two minutes for as long as
+    /// any obligation exists, so it lands inside slow starts routinely.
+    #[test]
+    fn absence_sweep_recover_leaves_a_start_waiting_on_readiness() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let orphan = orphaned_start(&mut store);
+        let (mut daemon, _socket) = bind_inbox_daemon(directory.path(), store);
+        let live = start_in_flight(&mut daemon);
+        run_absence_sweep(&mut daemon, vec![seated_agent(false)]);
+        assert_start_still_driven_then_ready(&mut daemon, &live, &orphan);
+    }
+
+    /// A prompt past its write boundary cannot be proved by a snapshot either
+    /// way. While this daemon is still waiting on Herdr's answer, neither live
+    /// recover may call it `unknown`.
+    #[test]
+    fn live_recovers_leave_a_prompt_mid_write() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::in_memory().expect("store");
+        let worker = store
+            .declare_start(&test_intent("worker", "term-1", "ready-worker"))
+            .expect("intent");
+        store
+            .begin_attempt(worker.operation_id, worker.incarnation_id, "worker-request")
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                worker.operation_id,
+                worker.incarnation_id,
+                &seated_agent(true),
+                None,
+            )
+            .expect("ready");
+        let (mut daemon, _socket) = bind_inbox_daemon(directory.path(), store);
+        let store = daemon.kelpie.store_mut();
+        let tell = store
+            .create_tell(
+                worker.logical_agent_id,
+                worker.logical_agent_id,
+                worker.incarnation_id,
+                "in flight",
+                "live-tell",
+            )
+            .expect("tell");
+        let attempt = store
+            .begin_attempt(tell.operation_id, worker.incarnation_id, "tell-request")
+            .expect("attempt");
+        store
+            .mark_submitted(tell.operation_id, attempt, "tell-request")
+            .expect("submitted");
+        run_boot_continue(&mut daemon, vec![seated_agent(true)]);
+        run_absence_sweep(&mut daemon, vec![seated_agent(true)]);
+        let store = daemon.kelpie.store_mut();
+        assert_eq!(
+            store.operation_outcome(tell.operation_id).expect("outcome"),
+            crate::domain::OperationOutcome::Pending
+        );
+        store
+            .accept_delivery(tell.operation_id, worker.incarnation_id, "w1:p1", "term-1")
+            .expect("Herdr's answer still commits after the recovers");
+        assert_eq!(
+            store.operation_outcome(tell.operation_id).expect("outcome"),
+            crate::domain::OperationOutcome::Succeeded
+        );
     }
 
     fn drain_reply(daemon: &mut Daemon, socket: &Path, waiter: LogicalAgentId, id: &str) -> Value {
