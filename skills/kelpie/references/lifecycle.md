@@ -74,6 +74,12 @@ Contents: [Method details](#method-details); [addressing recovery](#addressing-r
   retries recovery for two minutes to catch later Herdr restoration. For a
   later restoration, run `kelpie recover`. Recovery never launches a backend.
 
+  A start left `unknown` settles `lost` on recover once Herdr shows nothing
+  under its name and nothing on the pane and terminal it recorded, whether or
+  not Herdr accepted the launch. The start's own outcome stays `unknown`. A
+  live agent under that name or on that seat keeps it `unknown`; adopt that
+  agent on its seat to continue the same logical agent.
+
 ## Addressing recovery
 
 Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Address a

@@ -449,9 +449,19 @@ pub struct RecoveryReport {
     pub native_sessions_refreshed: usize,
     /// Missing Herdr name projections restored from Kelpie's durable identity.
     pub names_reprojected: usize,
-    /// Never-bound `unknown` starts settled `lost` because no live agent
-    /// carries the name they were trying to claim.
-    pub unbound_unknown_starts_settled: usize,
+    /// `unknown` starts settled `lost` because no live agent carries the
+    /// name they were claiming or occupies the seat Herdr accepted them on.
+    pub unknown_starts_settled: usize,
+}
+
+#[derive(Debug)]
+struct UnknownStartRow {
+    incarnation_id: String,
+    logical_agent_id: String,
+    public_name: String,
+    intended_pane_id: Option<String>,
+    observed_pane_id: Option<String>,
+    observed_terminal_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -9226,35 +9236,44 @@ impl Store {
         Ok((marked_lost, sessions_refreshed))
     }
 
-    /// Settle `unknown` starts that never bound a runtime and never will.
+    /// Settle `unknown` starts whose runtime is provably absent.
     ///
     /// A start whose readiness never resolved leaves an incarnation in
-    /// `unknown` with no observed pane. That is the honest outcome at the time
-    /// — Kelpie cannot tell a slow launch from a dead one — but it is also a
-    /// state no command moves: `retire` needs a ready binding, adoption keys
-    /// off an observed seat this row never recorded, and continuation needs a
-    /// recorded native session it never saw. The row then sits in the active
-    /// report forever, unsettled and unaddressable.
+    /// `unknown`. That is the honest outcome at the time — Kelpie cannot tell
+    /// a slow launch from a dead one — but it is also a state no command
+    /// moves: `retire` needs a ready binding, adoption needs a live agent, and
+    /// continuation needs a recorded native session the start may never have
+    /// seen. The row then sits in the active report forever, unsettled and
+    /// unaddressable.
     ///
-    /// Recovery has the evidence the poll lacked. An authoritative snapshot
-    /// with no agent anywhere under the name that start was claiming proves
-    /// Herdr holds nothing this incarnation could be, so the binding is absent
-    /// for the same reason a vanished Ready binding is, and it is marked
-    /// `lost`. This is not coercing `unknown` into failure: the operation's
-    /// own outcome stays `unknown`, the attempt history is untouched, and only
-    /// the runtime binding is settled. A live agent still carrying that name
-    /// is left alone, because it may be exactly what this start produced.
+    /// Recovery has the evidence the poll lacked. Two shapes reach here. A
+    /// start Herdr never accepted recorded no seat, so the only place its
+    /// runtime could be is under the name it was claiming. A start Herdr did
+    /// accept recorded the pane and terminal it launched into, so its runtime
+    /// could be on that seat or under that name. An authoritative snapshot
+    /// with no agent in either place proves Herdr holds nothing this
+    /// incarnation could be, so the binding is absent for the same reason a
+    /// vanished Ready binding is, and it is marked `lost`.
+    ///
+    /// This is not coercing `unknown` into failure: the operation's own
+    /// outcome stays `unknown`, the attempt history is untouched, and only the
+    /// runtime binding is settled. Any live agent on the recorded seat, or
+    /// still carrying the name, is left alone because it may be exactly what
+    /// this start produced. A seat that a different incarnation later bound
+    /// and released does not make this one `superseded`: supersession is a
+    /// handoff within one logical agent from `starting` or `ready`, and the
+    /// runtime this start aimed at is simply gone.
     ///
     /// # Errors
     ///
     /// Returns an error if the durable record cannot be read or updated.
-    fn settle_unbound_unknown_starts(&mut self, snapshot: &Snapshot) -> Result<usize, StoreError> {
+    fn settle_absent_unknown_starts(&mut self, snapshot: &Snapshot) -> Result<usize, StoreError> {
         let rows = {
             let mut statement = self.connection.prepare(
-                "SELECT i.id, i.logical_agent_id, l.public_name, i.intended_pane_id
+                "SELECT i.id, i.logical_agent_id, l.public_name, i.intended_pane_id,
+                        i.observed_pane_id, i.observed_terminal_id
                  FROM incarnations i JOIN logical_agents l ON l.id = i.logical_agent_id
                  WHERE i.state = 'unknown'
-                   AND i.observed_pane_id IS NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM operations o
                      WHERE o.target_incarnation_id = i.id
@@ -9262,31 +9281,74 @@ impl Store {
                    )",
             )?;
             let rows = statement.query_map([], |row| {
-                Ok((
-                    id_text(row, 0)?,
-                    id_text(row, 1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
+                Ok(UnknownStartRow {
+                    incarnation_id: id_text(row, 0)?,
+                    logical_agent_id: id_text(row, 1)?,
+                    public_name: row.get(2)?,
+                    intended_pane_id: row.get(3)?,
+                    observed_pane_id: row.get(4)?,
+                    observed_terminal_id: row.get(5)?,
+                })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut settled = 0;
-        for (incarnation_id, logical_agent_id, public_name, intended_pane_id) in rows {
-            if snapshot
+        for row in rows {
+            let name_live = snapshot
                 .agents
                 .iter()
-                .any(|agent| agent.name.as_deref() == Some(public_name.as_str()))
-            {
+                .any(|agent| agent.name.as_deref() == Some(row.public_name.as_str()));
+            // Any occupant of the recorded seat counts, whatever its backend
+            // or name: a launch that has not projected either yet is still
+            // the launch.
+            let seat_live = row.observed_pane_id.as_deref().is_some_and(|pane| {
+                snapshot.agents.iter().any(|agent| {
+                    agent.pane_id == pane
+                        && row
+                            .observed_terminal_id
+                            .as_deref()
+                            .is_none_or(|terminal| agent.terminal_id == terminal)
+                })
+            });
+            if name_live || seat_live {
                 continue;
             }
+            let (reason, place) = match (&row.observed_pane_id, &row.observed_terminal_id) {
+                (Some(pane), terminal) => (
+                    "unknown_start_binding_absence",
+                    format!(
+                        "no live agent carries that name or occupies its recorded pane {pane}{}",
+                        terminal
+                            .as_deref()
+                            .map(|terminal| format!(" terminal {terminal}"))
+                            .unwrap_or_default()
+                    ),
+                ),
+                (None, _) => (
+                    "unknown_start_never_bound",
+                    format!(
+                        "no live agent carries that name{}",
+                        row.intended_pane_id
+                            .as_deref()
+                            .map(|pane| format!(" (intended pane {pane})"))
+                            .unwrap_or_default()
+                    ),
+                ),
+            };
             let now = now_millis()?;
             let tx = self.connection.transaction()?;
             let changed = tx.execute(
                 "UPDATE incarnations SET state = 'lost', terminal_at_ms = ?1,
-                 terminal_reason = 'unknown_start_never_bound'
-                 WHERE id = ?2 AND state = 'unknown' AND observed_pane_id IS NULL",
-                params![now, incarnation_id],
+                 terminal_reason = ?2
+                 WHERE id = ?3 AND state = 'unknown'
+                   AND observed_pane_id IS ?4 AND observed_terminal_id IS ?5",
+                params![
+                    now,
+                    reason,
+                    row.incarnation_id,
+                    row.observed_pane_id,
+                    row.observed_terminal_id
+                ],
             )?;
             if changed != 1 {
                 continue;
@@ -9295,12 +9357,9 @@ impl Store {
                 &tx,
                 now,
                 &format!(
-                    "recovery settled incarnation {incarnation_id} of logical agent \
-                     {logical_agent_id} ({public_name}) as lost: its start outcome stayed \
-                     unknown and no live agent carries that name{}",
-                    intended_pane_id
-                        .map(|pane| format!(" (intended pane {pane})"))
-                        .unwrap_or_default()
+                    "recovery settled incarnation {} of logical agent {} ({}) as lost: its \
+                     start outcome stayed unknown and {place}",
+                    row.incarnation_id, row.logical_agent_id, row.public_name
                 ),
             )?;
             tx.commit()?;
@@ -9851,12 +9910,12 @@ impl Store {
         let (incarnations_marked_lost, native_sessions_refreshed) =
             self.reconcile_ready_incarnations(snapshot)?;
         let incarnations_continued = self.continue_restored_occupants(snapshot)?;
-        let unbound_unknown_starts_settled = self.settle_unbound_unknown_starts(snapshot)?;
+        let unknown_starts_settled = self.settle_absent_unknown_starts(snapshot)?;
         let mut report = RecoveryReport {
             incarnations_marked_lost,
             incarnations_continued,
             native_sessions_refreshed,
-            unbound_unknown_starts_settled,
+            unknown_starts_settled,
             outcomes_marked_unknown: self.reconcile_missed_due_wakes(now)?,
             ..RecoveryReport::default()
         };
@@ -14710,7 +14769,7 @@ mod tests {
                 agents: vec![other],
             })
             .expect("reconcile");
-        assert_eq!(report.unbound_unknown_starts_settled, 1);
+        assert_eq!(report.unknown_starts_settled, 1);
         assert_eq!(
             store
                 .incarnation_state(declared.incarnation_id)
@@ -14763,7 +14822,123 @@ mod tests {
                 agents: vec![stalled],
             })
             .expect("reconcile");
-        assert_eq!(report.unbound_unknown_starts_settled, 0);
+        assert_eq!(report.unknown_starts_settled, 0);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Unknown
+        );
+    }
+
+    /// A start Herdr accepted recorded its seat before readiness timed out.
+    /// That seat going empty, with nothing live under the name either, is
+    /// the same absence proof; the recorded pane must not exempt the row.
+    #[test]
+    fn recovery_settles_an_accepted_unknown_start_whose_seat_is_gone() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&intent("worker", "term-1", "accepted-then-stalled"))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, "request")
+            .expect("attempt");
+        store
+            .accept_start_submission(
+                declared.operation_id,
+                declared.incarnation_id,
+                "w1:p1",
+                "term-1",
+            )
+            .expect("accepted");
+        store
+            .mark_unknown(
+                declared.operation_id,
+                declared.incarnation_id,
+                "readiness timeout",
+            )
+            .expect("unknown");
+        let mut elsewhere = observed_agent("term-2");
+        elsewhere.pane_id = "w1:p2".into();
+        elsewhere.name = Some("somebody-else".into());
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![elsewhere],
+            })
+            .expect("reconcile");
+        assert_eq!(report.unknown_starts_settled, 1);
+        assert_eq!(
+            store
+                .incarnation_state(declared.incarnation_id)
+                .expect("state"),
+            crate::domain::IncarnationState::Lost
+        );
+        let reason: String = store
+            .connection
+            .query_row(
+                "SELECT terminal_reason FROM incarnations WHERE id = ?1",
+                [declared.incarnation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("reason");
+        assert_eq!(reason, "unknown_start_binding_absence");
+        assert_eq!(
+            store
+                .operation_outcome(declared.operation_id)
+                .expect("outcome"),
+            OperationOutcome::Unknown
+        );
+        assert!(
+            store
+                .operator_notices()
+                .expect("notices")
+                .iter()
+                .any(|notice| notice.body.contains("recorded pane w1:p1 terminal term-1")),
+            "settling an accepted start must name the seat it found empty"
+        );
+    }
+
+    /// An accepted start whose recorded seat still holds a live agent is left
+    /// alone, even when that agent has not projected the name or a backend
+    /// yet: it may be the launch, still coming up.
+    #[test]
+    fn recovery_leaves_an_accepted_unknown_start_whose_seat_is_live() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = store
+            .declare_start(&intent("worker", "term-1", "accepted-still-seated"))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, "request")
+            .expect("attempt");
+        store
+            .accept_start_submission(
+                declared.operation_id,
+                declared.incarnation_id,
+                "w1:p1",
+                "term-1",
+            )
+            .expect("accepted");
+        store
+            .mark_unknown(
+                declared.operation_id,
+                declared.incarnation_id,
+                "readiness timeout",
+            )
+            .expect("unknown");
+        let mut seated = observed_agent("term-1");
+        seated.name = None;
+        seated.agent = None;
+        seated.interactive_ready = false;
+        let report = store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![seated],
+            })
+            .expect("reconcile");
+        assert_eq!(report.unknown_starts_settled, 0);
         assert_eq!(
             store
                 .incarnation_state(declared.incarnation_id)
@@ -15711,7 +15886,7 @@ mod tests {
                 incarnations_continued: 0,
                 native_sessions_refreshed: 0,
                 names_reprojected: 0,
-                unbound_unknown_starts_settled: 0,
+                unknown_starts_settled: 0,
             }
         );
         assert_eq!(

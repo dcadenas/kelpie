@@ -766,14 +766,19 @@ Rules:
 - Herdr `idle`, `done`, `blocked`, and `unknown` are observations associated
   with a ready incarnation, not incarnation terminal states.
 - A timeout without decisive evidence MUST produce `Unknown`, not `Failed`.
-- An `Unknown` incarnation that never recorded an observed pane MUST NOT stay
-  unsettled once evidence arrives. When a fresh authoritative snapshot contains
-  no live agent under the public name that start was claiming, recovery MUST
-  mark that incarnation `Lost` and MUST record an operator notice. This settles
-  only the runtime binding: the start operation's own outcome MUST stay
-  `unknown`, and its attempt history MUST NOT be rewritten. A live agent still
-  carrying that name MUST be left alone, because it MAY be what that start
-  produced.
+- An `Unknown` incarnation with no pending or accepted operation MUST NOT stay
+  unsettled once evidence arrives, whether or not Herdr accepted its start
+  before readiness timed out. When a fresh authoritative snapshot contains no
+  live agent under the public name that start was claiming and, if the start
+  recorded an observed pane and terminal, no live agent of any name or backend
+  on that seat, recovery MUST mark that incarnation `Lost` and MUST record an
+  operator notice. This settles only the runtime binding: the start
+  operation's own outcome MUST stay `unknown`, and its attempt history MUST NOT
+  be rewritten. A live agent carrying that name or occupying that seat MUST be
+  left alone, because it MAY be what that start produced. A seat that another
+  incarnation bound after this start does not make it `Superseded`;
+  supersession is a handoff within one logical agent from `Starting` or
+  `Ready`.
 - Retirement MUST preserve worktrees, transcripts, messages, and artifacts by
   default. Destructive cleanup is a separate explicit operation.
 - A lost Herdr binding MUST NOT delete the logical agent or its history.
