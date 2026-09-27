@@ -1221,6 +1221,14 @@ operator-visible, and MUST NOT be automatically resent. Its submission
 evidence, when the transport observed it, MUST follow Submission observation
 and MUST be exposed in the launch response when it is not `observed`.
 
+Herdr readiness is not proof that a freshly launched TUI reads input: Herdr can
+report readiness while the pane is still blank, and input typed then is lost
+without evidence. kelpied MUST therefore wait a fixed settle after a start's
+readiness before writing its initial message. The initial message's durable
+row MUST exist before the settle begins, so an interruption during the settle
+leaves an unattempted delivery, not a missing one. The settle MUST NOT block
+other requests, and it MUST apply only to the initial message of a start.
+
 ## Persistence
 
 The durable store MUST provide:

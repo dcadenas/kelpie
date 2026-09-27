@@ -193,6 +193,10 @@ operation ID, and delivery outcome. A Ready incarnation does not imply that the
 initial message was delivered, and an `unknown` delivery is never resent
 automatically. When Herdr observed the initial prompt's submission and it was
 not `observed`, `initial_message` also carries `submission`.
+kelpied types the initial message 2.5 seconds after Herdr reports the runtime
+ready, not immediately: Herdr can report a fresh TUI ready before it reads
+input (herdrdev/herdr#3813), and a message typed then is lost. A start
+therefore takes about 2.5 seconds longer to answer.
 
 `herdr_prompt` deliveries carry submission evidence from Herdr's own lifecycle
 observation. A receipt reports a non-`observed` submission as

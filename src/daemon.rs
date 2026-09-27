@@ -44,6 +44,17 @@ const MAX_REPLIES_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOT_CONTINUE_WINDOW: Duration = Duration::from_mins(2);
 /// Pause between boot recover snapshots. Recover is idempotent.
 const BOOT_CONTINUE_INTERVAL: Duration = Duration::from_secs(5);
+/// Pause between a start's readiness and typing its initial message.
+///
+/// Herdr can report a freshly launched TUI ready before it reads input: for
+/// `OpenCode`, readiness can fire from a timer after process detection while
+/// the pane is still blank, and keystrokes typed then are dropped without a
+/// trace (`herdrdev/herdr#3813`). Measured on `OpenCode` 1.18.32, a prompt sent at
+/// that early readiness was lost 16 times in 16, and one sent two seconds
+/// later or more was delivered 24 times in 24. The pause applies to every
+/// backend because the same early readiness shows up, less often, for Claude
+/// Code. It spends wall clock only on starts, never on later deliveries.
+const INITIAL_MESSAGE_SETTLE: Duration = Duration::from_millis(2_500);
 /// How long an ask may wait on a required party that is gone before it is orphaned.
 const ASK_ORPHAN_GRACE_MS: i64 = 10 * 60 * 1000;
 /// Pause between absence sweeps. Runs only while obligations or claimed waiters exist.
@@ -129,6 +140,14 @@ enum StartPhase {
     },
     Busy(BusyStartRetry),
     Ready,
+    /// The initial message is durable but not yet typed: the runtime was just
+    /// reported ready and is given [`INITIAL_MESSAGE_SETTLE`] to start
+    /// listening first.
+    Settling {
+        prepared: PreparedPrompt,
+        message_id: MessageId,
+        until: Instant,
+    },
     Initial {
         prepared: PreparedPrompt,
         message_id: MessageId,
@@ -309,6 +328,7 @@ pub struct Daemon {
     obligation_sweep_job: Option<u64>,
     next_obligation_sweep: Instant,
     next_identity_archive: Instant,
+    initial_message_settle: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +569,7 @@ impl Daemon {
             obligation_sweep_job: None,
             next_obligation_sweep: Instant::now() + ASK_SWEEP_INTERVAL,
             next_identity_archive: Instant::now(),
+            initial_message_settle: INITIAL_MESSAGE_SETTLE,
         })
     }
 
@@ -3405,26 +3426,48 @@ impl Daemon {
         let intent = self.awaiting_starts[index].intent.clone();
         match self.kelpie.begin_initial_message(&intent, started) {
             Ok((prepared, message_id)) => {
-                let job_id = self.alloc_job();
-                self.submit_owned(
-                    HerdrJob::Open {
-                        job_id,
-                        pane_id: prepared.pane_id.clone(),
-                        negotiate: false,
-                    },
-                    HerdrOwner::Start,
-                );
                 let start = &mut self.awaiting_starts[index];
                 start.declared = Some(started);
-                start.herdr_job = Some(job_id);
+                start.herdr_job = None;
                 start.intent_committed = false;
-                start.phase = StartPhase::Initial {
-                    prepared,
-                    message_id,
-                };
+                if self.initial_message_settle.is_zero() {
+                    self.open_initial_message(index, prepared, message_id);
+                } else {
+                    // The message row already exists, so a kill during the
+                    // pause leaves the same durable state as one while the
+                    // pane lease is opening: an unattempted delivery.
+                    start.phase = StartPhase::Settling {
+                        prepared,
+                        message_id,
+                        until: Instant::now() + self.initial_message_settle,
+                    };
+                }
             }
             Err(error) => self.fail_start_at(index, error),
         }
+    }
+
+    fn open_initial_message(
+        &mut self,
+        index: usize,
+        prepared: PreparedPrompt,
+        message_id: MessageId,
+    ) {
+        let job_id = self.alloc_job();
+        self.submit_owned(
+            HerdrJob::Open {
+                job_id,
+                pane_id: prepared.pane_id.clone(),
+                negotiate: false,
+            },
+            HerdrOwner::Start,
+        );
+        let start = &mut self.awaiting_starts[index];
+        start.herdr_job = Some(job_id);
+        start.phase = StartPhase::Initial {
+            prepared,
+            message_id,
+        };
     }
 
     fn on_initial_opened(&mut self, index: usize, lease: std::sync::mpsc::Sender<LeaseCmd>) {
@@ -4045,6 +4088,20 @@ impl Daemon {
                 }
                 StartPhase::Ready => {
                     self.submit_start_ready_get(idx);
+                    progressed = true;
+                    idx += 1;
+                }
+                StartPhase::Settling { until, .. } if Instant::now() < until => idx += 1,
+                StartPhase::Settling { .. } => {
+                    let StartPhase::Settling {
+                        prepared,
+                        message_id,
+                        ..
+                    } = std::mem::replace(&mut self.awaiting_starts[idx].phase, StartPhase::Ready)
+                    else {
+                        unreachable!("matched Settling above");
+                    };
+                    self.open_initial_message(idx, prepared, message_id);
                     progressed = true;
                     idx += 1;
                 }
@@ -8843,6 +8900,120 @@ mod tests {
         drop(daemon);
         let _ = slow_client.join();
         drop(herdr);
+    }
+
+    /// Herdr can call a fresh TUI ready before it reads input, and keystrokes
+    /// typed then are lost (`herdrdev/herdr#3813`). The initial message waits out
+    /// a settle after readiness, without holding the loop, before it is typed.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initial_message_waits_out_the_settle_after_readiness() {
+        const SETTLE: Duration = Duration::from_millis(600);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kelpie_socket = directory.path().join("kelpie.sock");
+        let herdr_socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&herdr_socket).expect("bind fake Herdr");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(&'static str, Instant)>();
+        let herdr = thread::spawn(move || {
+            for expected in [
+                "ping",
+                "session.snapshot",
+                "agent.start",
+                "agent.get",
+                "agent.prompt",
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("request");
+                assert_eq!(request["method"], expected);
+                let agent = serde_json::json!({
+                    "terminal_id":"term-a","pane_id":"w1:p1","name":"worker",
+                    "agent":"codex","interactive_ready":true,"launch_pending":false
+                });
+                let result = match expected {
+                    "ping" => serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                    "session.snapshot" => serde_json::json!({
+                        "type":"session_snapshot",
+                        "snapshot":{"protocol":20,"panes":[{"pane_id":"w1:p1","terminal_id":"term-a","cwd":"/tmp/work"}],"agents":[]}
+                    }),
+                    "agent.start" => {
+                        serde_json::json!({"type":"agent_started","agent":agent,"argv":["codex"]})
+                    }
+                    "agent.get" => serde_json::json!({"type":"agent_info","agent":agent}),
+                    "agent.prompt" => serde_json::json!({"type":"agent_prompted","agent":agent}),
+                    _ => unreachable!(),
+                };
+                if expected == "agent.prompt" {
+                    seen_tx
+                        .send(("prompt", Instant::now()))
+                        .expect("report prompt");
+                }
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("finish");
+                if expected == "agent.get" {
+                    seen_tx
+                        .send(("ready", Instant::now()))
+                        .expect("report ready");
+                }
+            }
+        });
+        let kelpie = Kelpie::new(
+            Store::in_memory().expect("store"),
+            HerdrClient::new(&herdr_socket, Duration::from_secs(2)),
+        );
+        let mut daemon = Daemon::bind(&kelpie_socket, kelpie).expect("bind daemon");
+        daemon.initial_message_settle = SETTLE;
+        let start_socket = kelpie_socket.clone();
+        let client = thread::spawn(move || {
+            let start = test_intent("worker", "term-a", "settle-start");
+            send_request(
+                &start_socket,
+                &serde_json::json!({
+                    "id":"settle-start","method":"start",
+                    "params":serde_json::to_value(start).expect("intent")
+                }),
+            )
+        });
+        let started = Instant::now();
+        let mut saw_settling = false;
+        while !client.is_finished() {
+            daemon.poll().expect("poll");
+            saw_settling |= daemon
+                .awaiting_starts
+                .iter()
+                .any(|start| matches!(start.phase, StartPhase::Settling { .. }));
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "start never answered"
+            );
+        }
+        let response = client.join().expect("client");
+        herdr.join().expect("Herdr");
+        assert_eq!(response["result"]["initial_message"]["outcome"], "accepted");
+        assert!(
+            saw_settling,
+            "the initial message never parked in its settle"
+        );
+        let seen: HashMap<&str, Instant> = seen_rx.try_iter().collect();
+        let gap = seen["prompt"].duration_since(seen["ready"]);
+        assert!(
+            gap >= SETTLE,
+            "initial message typed {gap:?} after readiness, before the {SETTLE:?} settle"
+        );
+    }
+
+    /// The production settle must stay above the measured loss window: a
+    /// prompt two seconds past an early `OpenCode` readiness was never lost.
+    #[test]
+    fn production_initial_message_settle_covers_the_measured_window() {
+        assert!(INITIAL_MESSAGE_SETTLE >= Duration::from_secs(2));
     }
 
     #[test]
