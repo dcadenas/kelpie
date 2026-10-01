@@ -761,6 +761,12 @@ The `opencode` adapter reads OpenCode's own SQLite stores. One directory holds
 several (`opencode.db`, `opencode-local.db`, per-workspace files), so the session
 is searched for rather than assumed to live in a default file, and model identity
 is read from the newest assistant row because a session can change model mid-run.
+A session none of those stores holds is asked for through OpenCode V2's
+background service: `opencode api GET /api/session/<id>/message`, then the same
+with `opencode2` while V1 and V2 are installed side by side. The newest assistant
+message's `model` gives model, provider, and `variant` (reported as effort). A
+client that is missing, is V1, times out after 3 seconds, or does not know the
+session is not evidence; the result stays `undetermined`.
 
 `cancel` takes `requester_agent_id`, `ask_message_id`, and a non-empty `reason`.
 The requester is an unauthenticated same-user identity claim, not a waiter-only

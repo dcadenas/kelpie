@@ -49,6 +49,10 @@ pub struct SessionRoots {
     pub claude: Option<PathBuf>,
     pub codex: Option<PathBuf>,
     pub opencode: Option<PathBuf>,
+    /// `OpenCode` V2 command-line clients to ask, in order. V2 keeps sessions
+    /// behind its background service rather than in a store this process can
+    /// locate, so they are read through the service's own `api` command.
+    pub opencode_clients: Vec<PathBuf>,
 }
 
 impl SessionRoots {
@@ -60,6 +64,9 @@ impl SessionRoots {
             claude: home.as_ref().map(|home| home.join(".claude/projects")),
             codex: home.as_ref().map(|home| home.join(".codex/sessions")),
             opencode: home.as_ref().map(|home| home.join(".local/share/opencode")),
+            // `opencode` is V2 once the machine is migrated; until then V1 has
+            // no `api` command and the side-by-side `opencode2` answers.
+            opencode_clients: vec![PathBuf::from("opencode"), PathBuf::from("opencode2")],
         }
     }
 }
@@ -97,7 +104,11 @@ pub fn observe_detailed(
             observe_codex(session_id.as_deref(), roots.codex.as_deref()),
             None,
         ),
-        "opencode" => observe_opencode(session_id.as_deref(), roots.opencode.as_deref()),
+        "opencode" => observe_opencode(
+            session_id.as_deref(),
+            roots.opencode.as_deref(),
+            &roots.opencode_clients,
+        ),
         other => (undetermined(other), None),
     }
 }
@@ -203,6 +214,7 @@ fn observe_codex(session_id: Option<&str>, root: Option<&Path>) -> ObservedAttri
 fn observe_opencode(
     session_id: Option<&str>,
     root: Option<&Path>,
+    clients: &[PathBuf],
 ) -> (ObservedAttribution, Option<String>) {
     let Some(session_id) = session_id else {
         return (
@@ -210,31 +222,30 @@ fn observe_opencode(
             Some("no native session is recorded for this incarnation".into()),
         );
     };
-    let Some(root) = root else {
-        return (
-            undetermined("opencode"),
-            Some("no OpenCode session root is configured".into()),
-        );
+    let mut stores: Vec<PathBuf> = match root {
+        Some(root) => match fs::read_dir(root) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("db"))
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
     };
-    let mut stores: Vec<PathBuf> = match fs::read_dir(root) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("db"))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    if stores.is_empty() {
-        return (
-            undetermined("opencode"),
-            Some(format!("no OpenCode store under {}", root.display())),
-        );
-    }
     stores.sort();
 
     let mut session_seen = false;
-    for store in &stores {
-        match read_opencode_session(store, session_id) {
+    let lookups = stores
+        .iter()
+        .map(|store| read_opencode_session(store, session_id))
+        .chain(
+            clients
+                .iter()
+                .map(|client| read_opencode_v2_session(client, session_id)),
+        );
+    for lookup in lookups {
+        match lookup {
             OpencodeLookup::Reported {
                 model,
                 provider,
@@ -256,10 +267,90 @@ fn observe_opencode(
     }
     let reason = if session_seen {
         "session has produced no assistant turn yet; observe again after its first reply"
+    } else if stores.is_empty() && clients.is_empty() {
+        "no OpenCode store or client is configured"
     } else {
-        "session was not found in any OpenCode store"
+        "session was not found in any OpenCode store or V2 service"
     };
     (undetermined("opencode"), Some(reason.into()))
+}
+
+/// How long one V2 client may take to answer before it counts as absent.
+const OPENCODE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ask an `OpenCode` V2 client for the session's newest assistant message.
+///
+/// The service records model, provider, and variant on every assistant
+/// message, so the newest one is what is serving the session now. A client
+/// that is missing, is V1 (no `api` command), times out, or answers with
+/// anything but a message page counts as not knowing the session, never as
+/// evidence about it.
+fn read_opencode_v2_session(client: &Path, session_id: &str) -> OpencodeLookup {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return OpencodeLookup::Absent;
+    }
+    let page = |query: &str| {
+        run_bounded(
+            client,
+            &[
+                "api",
+                "GET",
+                &format!("/api/session/{session_id}/message?{query}"),
+            ],
+        )
+        .and_then(|stdout| serde_json::from_slice::<Value>(&stdout).ok())
+        .and_then(|page| page.get("data").and_then(Value::as_array).cloned())
+    };
+    let Some(assistants) = page("type=assistant&order=desc&limit=1") else {
+        return OpencodeLookup::Absent;
+    };
+    if let Some(model) = assistants.first().and_then(|message| message.get("model")) {
+        return OpencodeLookup::Reported {
+            model: nonempty_str(model.get("id")),
+            provider: nonempty_str(model.get("providerID")),
+            effort: nonempty_str(model.get("variant")),
+        };
+    }
+    // The service answered for this session, so it exists; it has just not
+    // produced an assistant turn yet.
+    OpencodeLookup::SessionWithoutTurn
+}
+
+/// Run a short read-only command and return its stdout when it exits zero in time.
+fn run_bounded(program: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + OPENCODE_CLIENT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = Vec::new();
+    child.stdout.take()?.read_to_end(&mut stdout).ok()?;
+    Some(stdout)
 }
 
 enum OpencodeLookup {
@@ -458,6 +549,100 @@ mod tests {
         assert_eq!(reason, None);
     }
 
+    /// Write an executable fake `OpenCode` client that answers `api GET` for
+    /// one session from canned pages, and fails like V1 for anything else.
+    fn fake_opencode_client(dir: &Path, name: &str, assistant_page: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = api ] || exit 1\n\
+                 case \"$3\" in\n\
+                 /api/session/ses_v2/message\\?type=assistant*) printf '%s' '{assistant_page}' ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        )
+        .expect("write fake client");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// A V2 session lives behind the service, not in a store under the root,
+    /// so the client's newest assistant message is the observation.
+    #[test]
+    fn opencode_v2_session_is_read_through_the_client_after_v1_misses() {
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path().join("opencode");
+        fs::create_dir_all(&root).expect("dir");
+        opencode_store(&root.join("opencode.db"), &[("ses_v1", "user", None, None)]);
+        let v1 = directory.path().join("v1-opencode");
+        fs::write(&v1, "#!/bin/sh\nexit 1\n").expect("v1");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&v1, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let v2 = fake_opencode_client(
+            directory.path(),
+            "opencode2",
+            r#"{"data":[{"type":"assistant","model":{"id":"gpt-6.1-sol","providerID":"openai","variant":"low"}}],"cursor":{}}"#,
+        );
+        let roots = SessionRoots {
+            opencode: Some(root),
+            opencode_clients: vec![directory.path().join("missing-client"), v1, v2],
+            ..SessionRoots::default()
+        };
+        let (observed, reason) = observe_detailed(
+            "opencode",
+            Some(&serde_json::json!({"value":"ses_v2"})),
+            &roots,
+        );
+        assert_eq!(
+            observed.model,
+            ObservedField::Reported("gpt-6.1-sol".into())
+        );
+        assert_eq!(observed.provider, ObservedField::Reported("openai".into()));
+        assert_eq!(observed.effort, ObservedField::Reported("low".into()));
+        assert_eq!(reason, None);
+    }
+
+    /// The service knowing a session that has not answered yet is the same
+    /// "ask again later" as V1's store holding only the user turn.
+    #[test]
+    fn opencode_v2_session_without_a_turn_is_worth_asking_again() {
+        let directory = tempfile::tempdir().expect("temp");
+        let v2 = fake_opencode_client(directory.path(), "opencode", r#"{"data":[],"cursor":{}}"#);
+        let roots = SessionRoots {
+            opencode_clients: vec![v2],
+            ..SessionRoots::default()
+        };
+        let (observed, reason) = observe_detailed(
+            "opencode",
+            Some(&serde_json::json!({"value":"ses_v2"})),
+            &roots,
+        );
+        assert_eq!(observed.model, ObservedField::Undetermined);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no assistant turn")),
+            "{reason:?}"
+        );
+        let (_, reason) = observe_detailed(
+            "opencode",
+            Some(&serde_json::json!({"value":"ses_other"})),
+            &roots,
+        );
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not found")),
+            "{reason:?}"
+        );
+    }
+
     #[test]
     fn opencode_separates_no_turn_yet_from_no_session() {
         let directory = tempfile::tempdir().expect("temp");
@@ -565,6 +750,7 @@ mod tests {
             claude: Some(claude_root),
             codex: Some(codex_root),
             opencode: Some(opencode_root),
+            opencode_clients: Vec::new(),
         };
         let claude = observe(
             "claude",

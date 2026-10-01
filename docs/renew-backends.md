@@ -12,7 +12,10 @@ The command is only half of an entry; the other half is when the replacement
 conversation becomes observable. Most backends rotate when cleared, so the
 rotation gates the injection. `opencode` does not: its `/clear` is a
 client-side route change that never reaches its server, and the replacement is
-allocated by the next prompt. Waiting for a rotation there would deadlock, so
+allocated by the next prompt. OpenCode V2 (2.0.18) behaves the same way: the
+recorded session survives `/clear`, and the next prompt opens a new one. That new
+session keeps the model and agent but takes the variant from OpenCode's own
+last-used state, not the cleared session's. Waiting for a rotation there would deadlock, so
 the order inverts — inject after a short gap, then require the rotation before
 the renew may complete. Rotation is the proof either way; only its position
 moves. Nothing is admitted on documentation alone, since documentation cannot
