@@ -971,11 +971,6 @@ impl Kelpie {
                 .store
                 .declare_adopt(&effective_intent, &evidence)
                 .map_err(SliceError::Store)?;
-            self.persist_observation(
-                declared.incarnation_id,
-                evidence.backend_kind.as_str(),
-                evidence.native_agent_session.as_ref(),
-            )?;
             return Ok(AdoptAfterSnapshot::Ready(declared));
         }
         let declared = self
@@ -1067,11 +1062,6 @@ impl Kelpie {
                 source,
             });
         }
-        self.persist_observation(
-            work.declared.incarnation_id,
-            work.evidence.backend_kind.as_str(),
-            agent.agent_session.as_ref(),
-        )?;
         Ok(work.declared)
     }
 
@@ -4952,40 +4942,37 @@ impl Kelpie {
         })
     }
 
-    /// Observe one incarnation again and append the result.
+    /// Learn a native session that did not exist when the incarnation bound.
     ///
-    /// Binding-time observation can only see what a backend has already written,
-    /// and some backends record the serving model only after their first turn.
-    /// Re-observing is how that becomes knowable without ever guessing: the new
-    /// observation is appended beside the old one, so an `undetermined` recorded
-    /// earlier stays in the history as the honest answer for that moment.
-    ///
-    /// Reads local backend artifacts only. It sends nothing to Herdr.
+    /// Some backends allocate their conversation only after the first prompt,
+    /// so the binding records none. Recovery's continuation keys on it, so a
+    /// caller asking for a refresh gets it filled from a Herdr snapshot. This
+    /// is Herdr's own report of the pane; no harness artifact is read.
     ///
     /// # Errors
     ///
     /// Returns a conflict when the incarnation is absent.
-    pub fn refresh_attribution(
+    pub fn refresh_native_session(
         &mut self,
         incarnation_id: crate::domain::IncarnationId,
-    ) -> Result<Option<String>, SliceError> {
+    ) -> Result<(), SliceError> {
         let evidence = self
             .store
             .attribution_evidence(incarnation_id)
             .map_err(SliceError::Store)?;
-        let mut native_session = self
+        let native_session = self
             .store
             .observed_native_session(incarnation_id)
             .map_err(SliceError::Store)?;
         if native_session.is_none()
             && evidence.incarnation_state == crate::domain::IncarnationState::Ready
         {
-            native_session = self.learn_native_session(incarnation_id, &evidence)?;
+            self.learn_native_session(incarnation_id, &evidence)?;
         }
-        self.record_refreshed_attribution(incarnation_id, &evidence, native_session.as_ref())
+        Ok(())
     }
 
-    pub(crate) fn attribution_refresh_needs_snapshot(
+    pub(crate) fn native_session_refresh_needs_snapshot(
         &self,
         incarnation_id: IncarnationId,
     ) -> Result<bool, SliceError> {
@@ -4995,37 +4982,19 @@ impl Kelpie {
             && evidence.incarnation_state == crate::domain::IncarnationState::Ready)
     }
 
-    pub(crate) fn refresh_attribution_after_snapshot(
+    pub(crate) fn refresh_native_session_after_snapshot(
         &mut self,
         incarnation_id: IncarnationId,
         snapshot: &crate::herdr::Snapshot,
-    ) -> Result<Option<String>, SliceError> {
+    ) -> Result<(), SliceError> {
         let evidence = self.store.attribution_evidence(incarnation_id)?;
-        let mut native_session = self.store.observed_native_session(incarnation_id)?;
+        let native_session = self.store.observed_native_session(incarnation_id)?;
         if native_session.is_none()
             && evidence.incarnation_state == crate::domain::IncarnationState::Ready
         {
-            native_session =
-                self.learn_native_session_after_snapshot(incarnation_id, &evidence, snapshot)?;
+            self.learn_native_session_after_snapshot(incarnation_id, &evidence, snapshot)?;
         }
-        self.record_refreshed_attribution(incarnation_id, &evidence, native_session.as_ref())
-    }
-
-    fn record_refreshed_attribution(
-        &mut self,
-        incarnation_id: IncarnationId,
-        evidence: &crate::store::AttributionEvidence,
-        native_session: Option<&serde_json::Value>,
-    ) -> Result<Option<String>, SliceError> {
-        let (observed, reason) = crate::attribution::observe_detailed(
-            &evidence.backend_kind,
-            native_session,
-            &crate::attribution::SessionRoots::from_home(),
-        );
-        self.store
-            .record_observed_attribution(incarnation_id, native_session, &observed)
-            .map_err(SliceError::Store)?;
-        Ok(reason)
+        Ok(())
     }
 
     /// Ask Herdr for a native session that did not exist at binding time.
@@ -5070,22 +5039,6 @@ impl Kelpie {
             )
             .map_err(SliceError::Store)?;
         Ok(Some(session.clone()))
-    }
-
-    fn persist_observation(
-        &mut self,
-        incarnation_id: crate::domain::IncarnationId,
-        backend_kind: &str,
-        native_session: Option<&serde_json::Value>,
-    ) -> Result<(), SliceError> {
-        let observed = crate::attribution::observe(
-            backend_kind,
-            native_session,
-            &crate::attribution::SessionRoots::from_home(),
-        );
-        self.store
-            .record_observed_attribution(incarnation_id, native_session, &observed)
-            .map_err(SliceError::Store)
     }
 
     fn should_defer(due_at_ms: Option<i64>) -> Result<bool, SliceError> {
@@ -5647,11 +5600,6 @@ impl Kelpie {
                     declared.incarnation_id,
                     &agent,
                     intent.supersedes,
-                )?;
-                self.persist_observation(
-                    declared.incarnation_id,
-                    intent.backend_kind.as_str(),
-                    agent.agent_session.as_ref(),
                 )?;
                 return Ok(Some(*declared));
             }
@@ -7173,15 +7121,6 @@ mod tests {
             evidence.requested_backend_args,
             vec!["--model".to_string(), "gpt-5.6-sol".to_string()]
         );
-        // Any observation recorded at adoption stays undetermined: the requested
-        // model must never be laundered into evidence of what actually ran.
-        for observation in &evidence.observations {
-            assert_eq!(
-                observation.observed.model,
-                crate::attribution::ObservedField::Undetermined,
-                "{evidence:?}"
-            );
-        }
         let tell = kelpie
             .tell(
                 coordinator.logical_agent_id,

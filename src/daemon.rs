@@ -1534,17 +1534,18 @@ impl Daemon {
         match self.kelpie.accept_adopt_confirm(&work, &snapshot) {
             Ok(created) => {
                 if let AdoptReply::Who { refresh } = self.awaiting_adopts[index].reply {
-                    let reason = if refresh {
-                        self.kelpie
-                            .refresh_attribution_after_snapshot(created.incarnation_id, &snapshot)
+                    let refreshed = if refresh {
+                        self.kelpie.refresh_native_session_after_snapshot(
+                            created.incarnation_id,
+                            &snapshot,
+                        )
                     } else {
-                        Ok(None)
+                        Ok(())
                     };
-                    let result = reason.and_then(|reason| {
+                    let result = refreshed.and_then(|()| {
                         who_identity_response(
                             &self.kelpie,
                             WhoIdentity::Incarnation(created.incarnation_id),
-                            reason,
                         )
                     });
                     self.answer_who_adopt_at(index, result);
@@ -1695,8 +1696,8 @@ impl Daemon {
             ) => {
                 let result = self
                     .kelpie
-                    .refresh_attribution_after_snapshot(incarnation_id, &snapshot)
-                    .and_then(|reason| attribution_response(&self.kelpie, incarnation_id, reason));
+                    .refresh_native_session_after_snapshot(incarnation_id, &snapshot)
+                    .and_then(|()| attribution_response(&self.kelpie, incarnation_id));
                 let response = respond(&read.request_id, result);
                 if let Err(error) = write_response(&mut read.stream, &response) {
                     eprintln!("kelpied: parked attribution response failed: {error}");
@@ -1708,12 +1709,11 @@ impl Daemon {
             ) => {
                 let result = self
                     .kelpie
-                    .refresh_attribution_after_snapshot(incarnation_id, &snapshot)
-                    .and_then(|reason| {
+                    .refresh_native_session_after_snapshot(incarnation_id, &snapshot)
+                    .and_then(|()| {
                         who_identity_response(
                             &self.kelpie,
                             WhoIdentity::Incarnation(incarnation_id),
-                            reason,
                         )
                     });
                 let response = respond(&read.request_id, result);
@@ -1875,17 +1875,16 @@ impl Daemon {
             .pane_adopt_after_snapshot(pane_id, lazy_key, snapshot)
         {
             Ok(AdoptAfterSnapshot::Ready(created)) => {
-                let reason = if refresh {
+                let refreshed = if refresh {
                     self.kelpie
-                        .refresh_attribution_after_snapshot(created.incarnation_id, snapshot)
+                        .refresh_native_session_after_snapshot(created.incarnation_id, snapshot)
                 } else {
-                    Ok(None)
+                    Ok(())
                 };
-                let result = reason.and_then(|reason| {
+                let result = refreshed.and_then(|()| {
                     who_identity_response(
                         &self.kelpie,
                         WhoIdentity::Incarnation(created.incarnation_id),
-                        reason,
                     )
                 });
                 let response = respond(&read.request_id, result);
@@ -5684,14 +5683,10 @@ fn who_selector_count(params: &WhoParams) -> usize {
         + usize::from(params.pane_id.is_some())
 }
 
-fn who_identity_response(
-    kelpie: &Kelpie,
-    identity: WhoIdentity,
-    reason: Option<String>,
-) -> Result<Value, SliceError> {
+fn who_identity_response(kelpie: &Kelpie, identity: WhoIdentity) -> Result<Value, SliceError> {
     match identity {
         WhoIdentity::Incarnation(incarnation_id) => {
-            let mut result = attribution_response(kelpie, incarnation_id, reason)?;
+            let mut result = attribution_response(kelpie, incarnation_id)?;
             result["delivery_transport"] = serde_json::json!("herdr_prompt");
             result["addressable"] =
                 serde_json::json!(result["incarnation_state"].as_str() == Some("ready"));
@@ -5706,8 +5701,6 @@ fn who_identity_response(
             "backend_kind": null,
             "incarnation_state": null,
             "requested": null,
-            "observed": null,
-            "observations": [],
         })),
     }
 }
@@ -5767,13 +5760,12 @@ fn dispatch_who(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError>
             "who --refresh requires an incarnation; socket waiters have no attribution".into(),
         )));
     }
-    let reason = match identity {
-        WhoIdentity::Incarnation(incarnation_id) if params.refresh => {
-            kelpie.refresh_attribution(incarnation_id)?
-        }
-        _ => None,
-    };
-    who_identity_response(kelpie, identity, reason)
+    if let WhoIdentity::Incarnation(incarnation_id) = identity
+        && params.refresh
+    {
+        kelpie.refresh_native_session(incarnation_id)?;
+    }
+    who_identity_response(kelpie, identity)
 }
 
 /// Re-read one ask's durable content and parties by its message id — the
@@ -5885,21 +5877,18 @@ fn name_unresolved_response(info: &crate::store::NameInfo) -> Vec<Value> {
         .collect()
 }
 
-/// Report requested and observed attribution for one exact incarnation.
+/// Report identity and requested attribution for one exact incarnation.
 ///
-/// Requested configuration and observed execution metadata are reported under
-/// separate keys and are never merged, so requested values can never be read as
-/// proof of what served a turn.
+/// Requested values are launch intent only; Kelpie reads no harness data to
+/// learn what actually served a turn.
 fn dispatch_attribution(params: Value, kelpie: &mut Kelpie) -> Result<Value, SliceError> {
     let params = serde_json::from_value::<WhoParams>(params)
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let incarnation_id = resolve_attribution_incarnation(&params, kelpie)?;
-    let reason = if params.refresh {
-        kelpie.refresh_attribution(incarnation_id)?
-    } else {
-        None
-    };
-    attribution_response(kelpie, incarnation_id, reason)
+    if params.refresh {
+        kelpie.refresh_native_session(incarnation_id)?;
+    }
+    attribution_response(kelpie, incarnation_id)
 }
 
 fn resolve_attribution_incarnation(
@@ -5938,14 +5927,9 @@ fn resolve_attribution_incarnation(
 fn attribution_response(
     kelpie: &Kelpie,
     incarnation_id: IncarnationId,
-    reason: Option<String>,
 ) -> Result<Value, SliceError> {
     let evidence = kelpie.store().attribution_evidence(incarnation_id)?;
-    let mut result = attribution_result(&evidence);
-    if let Some(reason) = reason {
-        result["undetermined_because"] = Value::String(reason);
-    }
-    Ok(result)
+    Ok(attribution_result(&evidence))
 }
 
 fn prepare_attribution_read(
@@ -5955,7 +5939,7 @@ fn prepare_attribution_read(
     let params = serde_json::from_value::<WhoParams>(request.params.clone())
         .map_err(|error| SliceError::Store(StoreError::InvalidRecord(error.to_string())))?;
     let incarnation_id = resolve_attribution_incarnation(&params, kelpie)?;
-    if params.refresh && kelpie.attribution_refresh_needs_snapshot(incarnation_id)? {
+    if params.refresh && kelpie.native_session_refresh_needs_snapshot(incarnation_id)? {
         Ok(Some(ClientReadKind::Attribution { incarnation_id }))
     } else {
         Ok(None)
@@ -5963,15 +5947,6 @@ fn prepare_attribution_read(
 }
 
 fn attribution_result(evidence: &crate::store::AttributionEvidence) -> Value {
-    let observation = |recorded: &crate::store::RecordedObservation| {
-        serde_json::json!({
-            "recorded_at_ms": recorded.recorded_at_ms,
-            "adapter": recorded.observed.adapter,
-            "model": recorded.observed.model,
-            "provider": recorded.observed.provider,
-            "effort": recorded.observed.effort,
-        })
-    };
     // backend_args sits inside `requested` because that is what it is: the
     // argument vector a launch asked for, stored verbatim. Kelpie does not
     // interpret it, and no backend reports whether it was honored.
@@ -5984,12 +5959,6 @@ fn attribution_result(evidence: &crate::store::AttributionEvidence) -> Value {
         "backend_kind": evidence.backend_kind,
         "incarnation_state": evidence.incarnation_state,
         "requested": requested,
-        "observed": evidence.latest().map(observation),
-        "observations": evidence
-            .observations
-            .iter()
-            .map(observation)
-            .collect::<Vec<_>>(),
     })
 }
 
@@ -6244,12 +6213,12 @@ fn finish_client_read(kelpie: &mut Kelpie, kind: &ClientReadKind) -> Result<Valu
             },
         ),
         ClientReadKind::Attribution { incarnation_id } => {
-            let reason = kelpie.refresh_attribution(*incarnation_id)?;
-            attribution_response(kelpie, *incarnation_id, reason)
+            kelpie.refresh_native_session(*incarnation_id)?;
+            attribution_response(kelpie, *incarnation_id)
         }
         ClientReadKind::WhoAttribution { incarnation_id } => {
-            let reason = kelpie.refresh_attribution(*incarnation_id)?;
-            who_identity_response(kelpie, WhoIdentity::Incarnation(*incarnation_id), reason)
+            kelpie.refresh_native_session(*incarnation_id)?;
+            who_identity_response(kelpie, WhoIdentity::Incarnation(*incarnation_id))
         }
         ClientReadKind::WhoPane {
             pane_id,
@@ -6257,16 +6226,10 @@ fn finish_client_read(kelpie: &mut Kelpie, kind: &ClientReadKind) -> Result<Valu
             refresh,
         } => {
             let identity = kelpie.resolve_or_adopt_pane(pane_id, lazy_key)?;
-            let reason = if *refresh {
-                kelpie.refresh_attribution(identity.incarnation_id)?
-            } else {
-                None
-            };
-            who_identity_response(
-                kelpie,
-                WhoIdentity::Incarnation(identity.incarnation_id),
-                reason,
-            )
+            if *refresh {
+                kelpie.refresh_native_session(identity.incarnation_id)?;
+            }
+            who_identity_response(kelpie, WhoIdentity::Incarnation(identity.incarnation_id))
         }
     }
 }
@@ -6316,7 +6279,7 @@ fn prepare_who_read(
     let identity = resolve_who_identity(&params, kelpie)?;
     if let WhoIdentity::Incarnation(incarnation_id) = identity
         && params.refresh
-        && kelpie.attribution_refresh_needs_snapshot(incarnation_id)?
+        && kelpie.native_session_refresh_needs_snapshot(incarnation_id)?
     {
         return Ok(Some(ClientReadKind::WhoAttribution { incarnation_id }));
     }
@@ -7871,25 +7834,13 @@ mod tests {
     }
 
     #[test]
-    fn attribution_reports_requested_and_observed_without_merging_them() {
+    fn attribution_reports_identity_and_requested_intent_only() {
         let directory = tempfile::tempdir().expect("tempdir");
         let socket = directory.path().join("kelpie.sock");
         let mut store = Store::in_memory().expect("store");
         let mut intent = test_intent("reviewer", "term-a", "attr-socket");
         intent.requested_model = Some("requested-only".into());
         let declared = store.declare_start(&intent).expect("declare");
-        let session = serde_json::json!({"agent":"grok","kind":"id","value":"sess-1"});
-        store
-            .record_observed_attribution(
-                declared.incarnation_id,
-                Some(&session),
-                &crate::attribution::observe(
-                    "grok",
-                    Some(&session),
-                    &crate::attribution::SessionRoots::default(),
-                ),
-            )
-            .expect("observe");
         let kelpie = Kelpie::new(
             store,
             HerdrClient::new(
@@ -7915,12 +7866,11 @@ mod tests {
         let result = &response["result"];
         assert_eq!(result["public_name"], "reviewer");
         assert_eq!(result["backend_kind"], "codex");
-        // Requested stays in its own object and never becomes observed evidence.
+        // Requested is launch intent, reported as such; Kelpie reads no harness
+        // data, so there is nothing observed to report beside it.
         assert_eq!(result["requested"]["model"], "requested-only");
-        assert_eq!(result["observed"]["adapter"], "grok");
-        assert_eq!(result["observed"]["model"]["status"], "undetermined");
-        assert!(result["observed"]["model"].get("value").is_none());
-        assert_eq!(result["observations"].as_array().expect("history").len(), 1);
+        assert!(result.get("observed").is_none(), "{result}");
+        assert!(result.get("observations").is_none(), "{result}");
 
         // The same agent id resolves to its newest incarnation.
         let by_agent = send_request(
@@ -7953,7 +7903,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_distinguishes_no_observation_from_an_absent_incarnation() {
+    fn attribution_answers_a_present_incarnation_and_refuses_an_absent_one() {
         let directory = tempfile::tempdir().expect("tempdir");
         let socket = directory.path().join("kelpie.sock");
         let mut store = Store::in_memory().expect("store");
@@ -7982,8 +7932,7 @@ mod tests {
                 "params": {"incarnation_id": declared.incarnation_id},
             }),
         );
-        assert!(none["result"]["observed"].is_null());
-        assert_eq!(none["result"]["observations"], serde_json::json!([]));
+        assert_eq!(none["result"]["public_name"], "fresh");
         assert!(none["error"].is_null());
 
         let absent = send_request(

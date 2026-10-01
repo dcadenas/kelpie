@@ -122,7 +122,7 @@ authentication boundary.
   the caller's pane id. The normal result carries `logical_agent_id`, nullable
   `incarnation_id`, `public_name`, `delivery_transport`, and `addressable`;
   Herdr-bound identities also carry `backend_kind`, `incarnation_state`,
-  `requested`, `observed`, and `observations`. `--refresh` refreshes attribution.
+  and `requested`. `--refresh` fills a missing native session from a Herdr snapshot.
   `who <alias> --history` instead returns every claimant and unresolved ask for
   that name. `who <alias> --resolve` returns the identity a name-keyed host
   should continue: the unique addressable claimant, or, when none is
@@ -525,7 +525,7 @@ notice. Each injection attempt is journaled under its own request ID.
 
 Completion replaces the recorded observed backend-native session reference,
 because the clear is what makes the prior reference false; leaving it would
-point recorded attribution at a transcript that will never grow again. Recovery does
+point continuation at a conversation that will never grow again. Recovery does
 not read that change as a replaced runtime: a session reference is not part of
 the exact live binding at all, for any agent. Over the
 clear window, deliveries addressed to that incarnation stay `queued` with their
@@ -704,8 +704,8 @@ continuity is `every_ms` plus a rising `cycle`, not a stable id.
 The report never interprets. No state is labelled healthy, stuck, or missing,
 because whether a state warrants attention is the consumer's policy. Requested
 model, provider, effort, and `backend_args` appear under `requested` on each
-incarnation and are launch intent; observed attribution is available through
-`who`, and neither is presented as the other.
+incarnation and are launch intent. Kelpie does not learn what actually served a
+turn.
 
 `live` (client `--live`) attaches Herdr's current agent status to each incarnation
 under `live`, matched by exact observed pane and terminal so a replaced runtime
@@ -718,19 +718,13 @@ is why it is opt-in and timestamped. The client command is `kelpie report
 Two selectors are `invalid_request`; an absent target is `conflict`.
 
 The result carries `logical_agent_id`, `incarnation_id`, `public_name`,
-`backend_kind`, `incarnation_state`, a `requested` object, the latest
-`observed` observation, and the full append-only `observations` history oldest
-first. `requested` and `observed` are separate keys and are never merged:
-requested is launch intent, observed is evidence. Three states are distinct and
-a verifier must not conflate them — `observed` is `null` with an empty
-`observations` when nothing has been observed; an observed field is
-`{"status":"undetermined"}` when an adapter ran but could not determine it; and
-it is `{"status":"reported","value":…}` when it did. Adapters exist for
-`claude`, `codex`, and `opencode`; every other backend kind records
-`undetermined`. The client command is
-`kelpie who [alias] | --pane ID | --agent-id ID | --incarnation-id ID`,
+`backend_kind`, `incarnation_state`, and a `requested` object. `requested` is
+launch intent: what the start asked for, never evidence of what served a turn.
+Kelpie is harness-agnostic and reads no backend's sessions, transcripts, or
+APIs to learn that; a launch's model setting is best effort. The client command
+is `kelpie who [alias] | --pane ID | --agent-id ID | --incarnation-id ID`,
 defaulting to `$HERDR_PANE_ID`. The legacy `attribution` and `whoami` commands
-remain available with exactly their previous result and stdout shapes.
+remain available with the same identity and `requested` fields.
 
 The typed client also accepts `handoff --replace <alias>`. It first uses plain
 `who <alias>` to require one Ready Herdr incarnation, then supplies that exact
@@ -740,33 +734,13 @@ dead claimant, or ambiguous live alias is refused with a pointer to
 syntax does not make handoff continue an unavailable runtime or reactivate an
 ended socket waiter.
 
-Binding-time observation only sees what a backend has already written, and a
-backend may record its serving model only after its first turn. `--refresh`
-(param `refresh`) observes again and appends the result, so an earlier
-`undetermined` stays in the history as the honest answer for that moment
-instead of being rewritten. A refresh reads local backend artifacts and, when no
-native session was recorded yet, takes one read-only Herdr snapshot to learn it;
-it mutates nothing in Herdr. The session is accepted only from a live agent
-still matching that incarnation's exact pane, terminal, backend kind, and public
-name, and only while the recorded session is empty, so a replacement in the same
-pane cannot donate its session to an older identity.
-
-A refresh that still determines nothing reports `undetermined_because`, which is
-diagnostic rather than evidence and is not stored. It distinguishes a session
-that has produced no assistant turn yet — ask again after its first reply — from
-one absent from every store, from an incarnation with no native session recorded
-at all. `undetermined` is never softened into a guess.
-
-The `opencode` adapter reads OpenCode's own SQLite stores. One directory holds
-several (`opencode.db`, `opencode-local.db`, per-workspace files), so the session
-is searched for rather than assumed to live in a default file, and model identity
-is read from the newest assistant row because a session can change model mid-run.
-OpenCode V2 keeps sessions in its background service's store, under
-`~/.local/share/opencode-v2` (a migrated V1 store may hold V2 tables too), so
-every store in both directories is also read through V2's schema: the newest
-assistant row in `session_message` gives model, provider, and `variant`
-(reported as effort). Kelpie reads the store rather than V2's HTTP API because
-kelpied's sandbox allows no TCP.
+Some backends allocate their native conversation only after the first prompt,
+so a binding can record none. `--refresh` (param `refresh`) takes one read-only
+Herdr snapshot to learn it while the recorded session is empty; recovery's
+continuation keys on that session. It mutates nothing in Herdr. The session is
+accepted only from a live agent still matching that incarnation's exact pane,
+terminal, backend kind, and public name, so a replacement in the same pane
+cannot donate its session to an older identity.
 
 `cancel` takes `requester_agent_id`, `ask_message_id`, and a non-empty `reason`.
 The requester is an unauthenticated same-user identity claim, not a waiter-only

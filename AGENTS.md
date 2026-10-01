@@ -97,9 +97,9 @@ explicitly. Do not rename them to match the package.
   only what gets typed into a terminal.
 - `name.rs` — Herdr's name grammar (lowercase-leading, ≤32 chars) and cwd-basename
   derivation used by adoption.
-- `attribution.rs` — keeps *requested* model/provider/effort strictly separate from
-  *observed* execution metadata. Requested config is never reported as proof of what
-  served a turn.
+- `attribution.rs` — *requested* model/provider/effort, recorded as launch intent.
+  Kelpie is harness-agnostic: it never reads a backend's sessions, transcripts, or
+  APIs to learn what served a turn, and never reports requested config as proof.
 - `paths.rs` — XDG defaults: DB at `$XDG_STATE_HOME/kelpie/kelpie.sqlite3`, socket at
   `$XDG_RUNTIME_DIR/kelpie/kelpie.sock`, Herdr socket from `$HERDR_SOCKET_PATH` then
   `$XDG_CONFIG_HOME/herdr/herdr.sock`.

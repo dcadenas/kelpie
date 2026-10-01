@@ -88,8 +88,8 @@ an agent, read [lifecycle](references/lifecycle.md) and reconcile its recorded
 logical identity with the exact live pane and terminal. Read runtime-start and
 initial-message outcomes separately; readiness does not prove delivery.
 
-Requested model/provider/effort is intent, never observed attribution. Consult
-[inspection](references/inspection.md) only when execution evidence is needed.
+Requested model/provider/effort is launch intent only. Kelpie does not read any
+harness to learn which model actually ran, so do not ask it to verify one.
 
 ## Reminders and cancellation
 

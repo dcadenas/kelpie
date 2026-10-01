@@ -50,14 +50,14 @@ and elapsed time proves nothing at all.
 
 That rotation also makes the recorded observed native session false, so a
 completed renew replaces it. It is the only operation permitted to overwrite
-that write-once evidence, and it does so because the alternative is an
-`attribution` record pointing at a transcript that will never grow again.
+that write-once evidence, and it does so because the alternative is a recorded
+session reference naming a conversation that will never grow again.
 
 ## Backend-native session references
 
 Herdr reports the backend's own conversation reference for an agent. Kelpie
-records it and uses it for attribution: it names the transcript an adapter reads
-to learn which model actually served a turn.
+records it so recovery can continue a logical agent onto a Herdr-restored
+occupant by that reference. Kelpie never opens the conversation it names.
 
 It is not runtime identity and is not part of a binding. A live agent rotates it
 on its own — Herdr's terminal state machine recognises `startup`, `clear`,

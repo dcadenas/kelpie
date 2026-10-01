@@ -1190,19 +1190,15 @@ A parsed launch request MUST contain:
   daemon policy.
 
 Requested model, provider, and reasoning effort MAY be part of backend
-arguments. Kelpie MUST record requested configuration separately from observed
-backend execution metadata. Requested configuration MUST NOT be reported as
-proof of what served a turn.
+arguments. Kelpie MUST record requested configuration as launch intent and
+MUST NOT report it as proof of what served a turn. Kelpie is harness-agnostic:
+it MUST NOT read any backend's session stores, transcripts, or server APIs to
+learn which model, provider, or effort actually ran. Whether a backend honored
+its launch configuration is best effort and outside Kelpie's record.
 
-Recorded attribution MUST be readable for an exact incarnation without opening
-the durable store by hand, because a caller that cannot read the evidence
-cannot verify it. A report MUST keep requested and observed under separate
-fields and MUST NOT merge or substitute one for the other. It MUST distinguish
-three states that are not interchangeable: no observation has been recorded, an
-adapter recorded an explicitly `undetermined` field, and an adapter reported a
-value. An absent incarnation MUST be an error, never an empty report. An agent's
-self-report about its own model is not observed attribution and MUST NOT be
-recorded as such.
+Requested attribution MUST be readable for an exact incarnation without
+opening the durable store by hand. An absent incarnation MUST be an error,
+never an empty report.
 
 An implementation MAY compose several Herdr calls to create topology
 and start an agent. It MUST journal the intended sequence and every accepted

@@ -721,19 +721,10 @@ pub struct DueRenew {
     pub prepare_settled_at_ms: Option<i64>,
 }
 
-/// One append-only observation with the time it was recorded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordedObservation {
-    pub recorded_at_ms: i64,
-    pub observed: crate::attribution::ObservedAttribution,
-}
-
-/// Attribution evidence for one exact incarnation.
+/// Identity and requested launch configuration for one exact incarnation.
 ///
-/// Requested configuration and observed execution metadata are separate fields
-/// and are never merged. An empty [`Self::observations`] means no adapter has
-/// reported yet, which is distinct from an observation whose fields are
-/// `Undetermined`.
+/// Requested values are launch intent only. Kelpie does not read any
+/// harness's sessions to learn what actually served a turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributionEvidence {
     pub logical_agent_id: LogicalAgentId,
@@ -746,16 +737,6 @@ pub struct AttributionEvidence {
     ///
     /// Launch intent, never evidence: nothing here proves a backend honored it.
     pub requested_backend_args: Vec<String>,
-    /// Append-only observations, oldest first.
-    pub observations: Vec<RecordedObservation>,
-}
-
-impl AttributionEvidence {
-    /// Most recent observation, or `None` when nothing has been observed.
-    #[must_use]
-    pub fn latest(&self) -> Option<&RecordedObservation> {
-        self.observations.last()
-    }
 }
 
 /// One incarnation as reported, without judgement about what its state means.
@@ -8405,112 +8386,6 @@ impl Store {
         Ok(next)
     }
 
-    /// Earliest remaining queued due time, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the lookup fails.
-    /// Append one adapter observation. Does not overwrite prior rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the incarnation is missing or the insert fails.
-    pub fn record_observed_attribution(
-        &mut self,
-        incarnation_id: IncarnationId,
-        native_session: Option<&serde_json::Value>,
-        observed: &crate::attribution::ObservedAttribution,
-    ) -> Result<(), StoreError> {
-        let now = now_millis()?;
-        let exists: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT id FROM incarnations WHERE id = ?1",
-                [incarnation_id.to_string()],
-                |row| id_text(row, 0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(StoreError::Conflict(format!(
-                "incarnation {incarnation_id} is absent"
-            )));
-        }
-        self.connection.execute(
-            "INSERT INTO observed_attributions (
-                incarnation_id, recorded_at_ms, adapter, native_session_json,
-                model_status, model_value, provider_status, provider_value,
-                effort_status, effort_value
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                incarnation_id.to_string(),
-                now,
-                observed.adapter,
-                native_session.map(ToString::to_string),
-                observed_status(&observed.model),
-                observed_value(&observed.model),
-                observed_status(&observed.provider),
-                observed_value(&observed.provider),
-                observed_status(&observed.effort),
-                observed_value(&observed.effort),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Latest append-only observation for one incarnation, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the row is malformed.
-    pub fn latest_observed_attribution(
-        &self,
-        incarnation_id: IncarnationId,
-    ) -> Result<Option<crate::attribution::ObservedAttribution>, StoreError> {
-        type ObservedRow = (
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        );
-        let row: Option<ObservedRow> = self
-            .connection
-            .query_row(
-                "SELECT adapter, model_status, model_value, provider_status, provider_value,
-                        effort_status, effort_value
-                 FROM observed_attributions
-                 WHERE incarnation_id = ?1
-                 ORDER BY recorded_at_ms DESC, id DESC
-                 LIMIT 1",
-                [incarnation_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(
-            |(adapter, model_s, model_v, provider_s, provider_v, effort_s, effort_v)| {
-                Ok(crate::attribution::ObservedAttribution {
-                    adapter,
-                    model: parse_observed_field(&model_s, model_v)?,
-                    provider: parse_observed_field(&provider_s, provider_v)?,
-                    effort: parse_observed_field(&effort_s, effort_v)?,
-                })
-            },
-        )
-        .transpose()
-    }
-
     /// Requested launch configuration for one incarnation.
     ///
     /// # Errors
@@ -8828,11 +8703,7 @@ impl Store {
             .ok_or_else(|| StoreError::InvalidRecord(format!("invalid incarnation id {newest}")))
     }
 
-    /// Requested and observed attribution for one exact incarnation.
-    ///
-    /// Observations are append-only and returned oldest first. An empty list
-    /// means nothing has been observed, which callers must not read as an
-    /// `Undetermined` observation.
+    /// Identity and requested attribution for one exact incarnation.
     ///
     /// # Errors
     ///
@@ -8885,40 +8756,6 @@ impl Store {
         let logical_agent_id = LogicalAgentId::parse(&agent)
             .ok_or_else(|| StoreError::InvalidRecord(format!("invalid agent id {agent}")))?;
 
-        let mut statement = self.connection.prepare(
-            "SELECT recorded_at_ms, adapter, model_status, model_value,
-                    provider_status, provider_value, effort_status, effort_value
-             FROM observed_attributions
-             WHERE incarnation_id = ?1
-             ORDER BY recorded_at_ms ASC, id ASC",
-        )?;
-        let rows = statement.query_map([incarnation_id.to_string()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ))
-        })?;
-        let mut observations = Vec::new();
-        for row in rows {
-            let (recorded_at_ms, adapter, model_s, model_v, provider_s, provider_v, eff_s, eff_v) =
-                row?;
-            observations.push(RecordedObservation {
-                recorded_at_ms,
-                observed: crate::attribution::ObservedAttribution {
-                    adapter,
-                    model: parse_observed_field(&model_s, model_v)?,
-                    provider: parse_observed_field(&provider_s, provider_v)?,
-                    effort: parse_observed_field(&eff_s, eff_v)?,
-                },
-            });
-        }
-
         Ok(AttributionEvidence {
             logical_agent_id,
             incarnation_id,
@@ -8932,7 +8769,6 @@ impl Store {
             },
             requested_backend_args: serde_json::from_str(&backend_args)
                 .map_err(|error| invalid_json(&error))?,
-            observations,
         })
     }
 
@@ -10852,33 +10688,6 @@ fn empty_to_none(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn observed_status(field: &crate::attribution::ObservedField) -> &'static str {
-    match field {
-        crate::attribution::ObservedField::Undetermined => "undetermined",
-        crate::attribution::ObservedField::Reported(_) => "reported",
-    }
-}
-
-fn observed_value(field: &crate::attribution::ObservedField) -> Option<&str> {
-    match field {
-        crate::attribution::ObservedField::Undetermined => None,
-        crate::attribution::ObservedField::Reported(value) => Some(value.as_str()),
-    }
-}
-
-fn parse_observed_field(
-    status: &str,
-    value: Option<String>,
-) -> Result<crate::attribution::ObservedField, StoreError> {
-    match (status, value) {
-        ("undetermined", None) => Ok(crate::attribution::ObservedField::Undetermined),
-        ("reported", Some(value)) => Ok(crate::attribution::ObservedField::Reported(value)),
-        _ => Err(StoreError::InvalidRecord(format!(
-            "invalid observed field status {status}"
-        ))),
-    }
-}
-
 fn native_session_id_value(value: Option<&serde_json::Value>) -> Option<String> {
     value?
         .get("value")
@@ -11837,7 +11646,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_is_not_observed_and_start_ready_persists_native_session() {
+    fn start_ready_persists_native_session_and_requested_intent() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
         let mut intent = intent("worker", "term-1", "start-attr");
@@ -11882,57 +11691,6 @@ mod tests {
             .requested_attribution(declared.incarnation_id)
             .expect("requested");
         assert_eq!(requested.model.as_deref(), Some("requested-model"));
-        assert!(
-            store
-                .latest_observed_attribution(declared.incarnation_id)
-                .expect("no row yet")
-                .is_none()
-        );
-        store
-            .record_observed_attribution(
-                declared.incarnation_id,
-                Some(&session),
-                &crate::attribution::observe(
-                    "grok",
-                    Some(&session),
-                    &crate::attribution::SessionRoots::default(),
-                ),
-            )
-            .expect("observe");
-        let observed = store
-            .latest_observed_attribution(declared.incarnation_id)
-            .expect("latest")
-            .expect("row");
-        assert_eq!(
-            observed.model,
-            crate::attribution::ObservedField::Undetermined
-        );
-        assert_ne!(requested.model.as_deref(), Some(""));
-        let requested_json = serde_json::to_value(&requested).expect("req json");
-        let observed_json = serde_json::to_value(&observed.model).expect("obs json");
-        assert_ne!(requested_json["model"], observed_json);
-        store
-            .record_observed_attribution(
-                declared.incarnation_id,
-                Some(&session),
-                &crate::attribution::observe(
-                    "codex",
-                    Some(&session),
-                    &crate::attribution::SessionRoots::default(),
-                ),
-            )
-            .expect("second");
-        assert_eq!(
-            store
-                .connection
-                .query_row(
-                    "SELECT COUNT(*) FROM observed_attributions WHERE incarnation_id = ?1",
-                    [declared.incarnation_id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("count"),
-            2
-        );
     }
 
     #[test]
@@ -12283,7 +12041,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_evidence_separates_no_data_undetermined_and_absent() {
+    fn attribution_evidence_reports_identity_and_requested_intent() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
         let mut intent = intent("worker", "term-1", "evidence-1");
@@ -12291,85 +12049,21 @@ mod tests {
         intent.requested_effort = Some("high".into());
         let declared = store.declare_start(&intent).expect("declare");
 
-        // No adapter has reported yet: an empty history, never Undetermined.
         let evidence = store
             .attribution_evidence(declared.incarnation_id)
             .expect("evidence");
-        assert!(evidence.observations.is_empty());
-        assert!(evidence.latest().is_none());
         assert_eq!(evidence.requested.model.as_deref(), Some("requested-model"));
+        assert_eq!(evidence.requested.effort.as_deref(), Some("high"));
+        assert_eq!(evidence.requested.provider, None);
         assert_eq!(evidence.backend_kind, "codex");
         assert_eq!(evidence.public_name, "worker");
         assert_eq!(evidence.logical_agent_id, declared.logical_agent_id);
-
-        let session = serde_json::json!({"agent":"grok","kind":"id","value":"sess-1"});
-        store
-            .record_observed_attribution(
-                declared.incarnation_id,
-                Some(&session),
-                &crate::attribution::observe(
-                    "grok",
-                    Some(&session),
-                    &crate::attribution::SessionRoots::default(),
-                ),
-            )
-            .expect("observe grok");
-
-        // An adapter reported Undetermined: present in history, distinct from none.
-        let evidence = store
-            .attribution_evidence(declared.incarnation_id)
-            .expect("evidence");
-        assert_eq!(evidence.observations.len(), 1);
-        let latest = evidence.latest().expect("latest");
-        assert_eq!(latest.observed.adapter, "grok");
-        assert_eq!(
-            latest.observed.model,
-            crate::attribution::ObservedField::Undetermined
-        );
-
-        // Requested must never be mistaken for observed evidence.
-        assert_ne!(
-            serde_json::to_value(&evidence.requested).expect("req")["model"],
-            serde_json::to_value(&latest.observed.model).expect("obs")
-        );
 
         // An absent incarnation is a conflict, not an empty answer.
         let absent = store
             .attribution_evidence(IncarnationId::test())
             .expect_err("absent incarnation");
         assert!(matches!(absent, StoreError::Conflict(_)));
-    }
-
-    #[test]
-    fn attribution_history_is_append_only_and_oldest_first() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let mut store = Store::open(directory.path().join("kelpie.sqlite3")).expect("store");
-        let declared = store
-            .declare_start(&intent("worker", "term-1", "evidence-2"))
-            .expect("declare");
-        let roots = crate::attribution::SessionRoots::default();
-        for adapter in ["grok", "codex", "claude"] {
-            store
-                .record_observed_attribution(
-                    declared.incarnation_id,
-                    None,
-                    &crate::attribution::observe(adapter, None, &roots),
-                )
-                .expect("observe");
-        }
-        let evidence = store
-            .attribution_evidence(declared.incarnation_id)
-            .expect("evidence");
-        let adapters: Vec<&str> = evidence
-            .observations
-            .iter()
-            .map(|recorded| recorded.observed.adapter.as_str())
-            .collect();
-        assert_eq!(adapters, ["grok", "codex", "claude"]);
-        assert_eq!(
-            evidence.latest().expect("latest").observed.adapter,
-            "claude"
-        );
     }
 
     #[test]

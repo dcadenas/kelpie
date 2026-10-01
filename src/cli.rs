@@ -2174,19 +2174,6 @@ pub fn attribution_params(target: &AttributionTarget) -> Value {
     }
 }
 
-/// Render one observed field as `undetermined` or its reported value.
-fn observed_field(observation: &Value, name: &str) -> String {
-    match observation.get(name).and_then(|field| field.get("status")) {
-        Some(Value::String(status)) if status == "reported" => observation[name]
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or("-")
-            .to_string(),
-        Some(Value::String(status)) => status.clone(),
-        _ => "-".into(),
-    }
-}
-
 /// Render name-info: every claimant of a name and every unresolved ask touching
 /// them, with both parties named and marked live or not. Facts only — a name's
 /// history belongs to whoever reads it, not to a verdict.
@@ -2559,30 +2546,18 @@ fn render_agent<'a>(
     }
 }
 
-/// Render attribution with requested and observed on separate lines.
+/// Render attribution: identity, then the launch's requested configuration.
 ///
-/// They are never merged: requested is launch intent, observed is evidence.
+/// Requested is launch intent only; Kelpie does not learn what served a turn.
 fn render_attribution(result: &Value) -> String {
     let requested = &result["requested"];
     let backend_args = requested
         .get("backend_args")
         .map_or_else(|| "[]".to_string(), ToString::to_string);
-    let observed = match result.get("observed") {
-        Some(observed) if !observed.is_null() => format!(
-            "observed adapter={} model={} provider={} effort={} recorded-at-ms={}",
-            field(observed, "adapter"),
-            observed_field(observed, "model"),
-            observed_field(observed, "provider"),
-            observed_field(observed, "effort"),
-            field(observed, "recorded_at_ms")
-        ),
-        _ => "observed none".into(),
-    };
     format!(
         "attribution name={} agent={} incarnation={} backend={} state={}\n\
          requested model={} provider={} effort={}\n\
-         requested-args {backend_args}\n\
-         {observed}\n",
+         requested-args {backend_args}\n",
         field(result, "public_name"),
         field(result, "logical_agent_id"),
         field(result, "incarnation_id"),
@@ -3673,7 +3648,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_receipt_keeps_requested_and_observed_apart() {
+    fn attribution_receipt_reports_requested_intent_and_nothing_observed() {
         let reported = format_receipt(
             "attribution",
             &json!({"result": {
@@ -3682,14 +3657,7 @@ mod tests {
                 "incarnation_id": "inc-1",
                 "backend_kind": "codex",
                 "incarnation_state": "ready",
-                "requested": {"model": "requested-only"},
-                "observed": {
-                    "recorded_at_ms": 42,
-                    "adapter": "codex",
-                    "model": {"status": "reported", "value": "o3"},
-                    "provider": {"status": "reported", "value": "openai"},
-                    "effort": {"status": "undetermined"}
-                }
+                "requested": {"model": "requested-only", "backend_args": ["--model", "o3"]}
             }}),
         );
         assert!(
@@ -3697,16 +3665,10 @@ mod tests {
             "{reported}"
         );
         assert!(
-            reported
-                .contains("observed adapter=codex model=o3 provider=openai effort=undetermined"),
+            reported.contains(r#"requested-args ["--model","o3"]"#),
             "{reported}"
         );
-        // The requested value must never appear on the observed line.
-        let observed_line = reported
-            .lines()
-            .find(|line| line.starts_with("observed"))
-            .expect("observed line");
-        assert!(!observed_line.contains("requested-only"));
+        assert!(!reported.contains("observed"), "{reported}");
 
         let none = format_receipt(
             "attribution",
@@ -3716,12 +3678,9 @@ mod tests {
                 "incarnation_id": "inc-1",
                 "backend_kind": "grok",
                 "incarnation_state": "declared",
-                "requested": {},
-                "observed": null,
-                "observations": []
+                "requested": {}
             }}),
         );
-        assert!(none.contains("observed none"), "{none}");
         assert!(
             none.contains("requested model=- provider=- effort=-"),
             "{none}"
@@ -3740,9 +3699,7 @@ mod tests {
                 "addressable": true,
                 "backend_kind": "codex",
                 "incarnation_state": "ready",
-                "requested": {},
-                "observed": null,
-                "observations": []
+                "requested": {}
             }}),
         );
         assert!(
@@ -3751,7 +3708,8 @@ mod tests {
         );
         assert!(pane.contains("transport=herdr_prompt"), "{pane}");
         assert!(pane.contains("addressable=true"), "{pane}");
-        assert!(pane.contains("observed none"), "{pane}");
+        assert!(pane.contains("requested model=-"), "{pane}");
+        assert!(!pane.contains("observed"), "{pane}");
 
         let waiter = format_receipt(
             "who",
