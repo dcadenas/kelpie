@@ -485,6 +485,12 @@ fn is_retryable_start_rejection(error: &HerdrError) -> bool {
 /// "an agent already lives here" as `agent_pane_busy`, so without this a caller
 /// cannot tell a transient race from a mistake, and a retry loop would wait out
 /// its whole budget on a pane that will never come free.
+/// Whether two recorded working directories name the same folder.
+fn same_directory(left: &str, right: &str) -> bool {
+    let trim = |path: &str| path.trim_end_matches('/').to_string();
+    trim(left) == trim(right)
+}
+
 pub(crate) fn check_pane_matches_intent(
     snapshot: &crate::herdr::Snapshot,
     intent: &StartIntent,
@@ -929,18 +935,22 @@ impl Kelpie {
             effective_intent.logical_agent_id = Some(logical_agent_id);
             effective_intent.public_name = Some(recorded_name);
         }
+        self.continue_adopted_name(&mut effective_intent, agent.name.as_deref())?;
         let backend_kind = agent.agent.clone().unwrap_or_default();
         let working_directory = pane.cwd.clone().unwrap_or_default();
-        let public_name = match agent.name.as_deref() {
-            Some(name) if !name.is_empty() => name.to_string(),
-            _ if effective_intent.logical_agent_id.is_some() => {
-                effective_intent.public_name.clone().ok_or_else(|| {
-                    SliceError::LiveConflict(
-                        "continuing an unnamed occupant requires the recorded public name".into(),
-                    )
-                })?
+        let public_name = match (
+            agent.name.as_deref().filter(|name| !name.is_empty()),
+            effective_intent.logical_agent_id,
+            effective_intent.public_name.clone(),
+        ) {
+            (Some(live), _, _) => live.to_string(),
+            (None, Some(_), Some(requested)) => requested,
+            // The name is the identity: continuing one by id onto an unnamed
+            // pane restores the name it holds.
+            (None, Some(logical_agent_id), None) => self.store.agent_address(logical_agent_id)?,
+            (None, None, _) => {
+                self.derived_claim_name(&effective_intent, snapshot, &working_directory)?
             }
-            _ => self.derived_claim_name(&effective_intent, snapshot, &working_directory)?,
         };
         let evidence = AdoptEvidence {
             pane_id: agent.pane_id.clone(),
@@ -1201,10 +1211,70 @@ impl Kelpie {
     ) -> Result<(DeclaredStart, Instant, Instant), SliceError> {
         check_pane_matches_intent(snapshot, intent)?;
         self.refuse_start_over_live_ready(intent, snapshot)?;
+        let intent = &self.continue_identity_by_name(intent)?;
         let deadline = Instant::now() + Duration::from_millis(intent.readiness_timeout_ms);
         let declared = self.store.declare_start(intent)?;
         let busy_deadline = deadline.min(Instant::now() + BUSY_PANE_RETRY_BUDGET);
         Ok((declared, deadline, busy_deadline))
+    }
+
+    /// Point an adoption at the identity that holds the name it adopts under.
+    ///
+    /// The name is the identity. Adopting a pane under a name some identity
+    /// already holds is that identity being taken up again, wherever it last
+    /// worked: adopt is the deliberate way to move a name, so it continues the
+    /// holder instead of minting a stranger with its name.
+    fn continue_adopted_name(
+        &self,
+        intent: &mut AdoptIntent,
+        live_name: Option<&str>,
+    ) -> Result<(), SliceError> {
+        if intent.logical_agent_id.is_some() {
+            return Ok(());
+        }
+        let Some(name) = live_name
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| intent.public_name.clone())
+        else {
+            return Ok(());
+        };
+        if let Some((holder, _)) = self.store.name_holder_for_start(&name)? {
+            intent.logical_agent_id = Some(holder);
+            intent.public_name = Some(name);
+        }
+        Ok(())
+    }
+
+    /// Resolve a start's name to the identity it names.
+    ///
+    /// The name is the identity; the logical id only follows renames. When no
+    /// live agent holds the name (the caller already refused that case), a
+    /// start in the folder the holder last worked in is that identity coming
+    /// back and continues it. A start elsewhere is refused, so a different
+    /// worker cannot silently take over someone's name and history; moving an
+    /// identity to a new checkout stays possible by naming it with
+    /// `--logical-id` or by adopting its pane. Explicit continuations and
+    /// handoffs already name their identity and pass through unchanged.
+    fn continue_identity_by_name(&self, intent: &StartIntent) -> Result<StartIntent, SliceError> {
+        let mut resolved = intent.clone();
+        if intent.logical_agent_id.is_some() || intent.supersedes.is_some() {
+            return Ok(resolved);
+        }
+        let Some((holder, directory)) = self.store.name_holder_for_start(&intent.public_name)?
+        else {
+            return Ok(resolved);
+        };
+        if same_directory(&directory, &intent.working_directory) {
+            resolved.logical_agent_id = Some(holder);
+            return Ok(resolved);
+        }
+        Err(SliceError::Store(StoreError::Conflict(format!(
+            "name {} belongs to logical agent {holder}, which last worked in {directory}, not \
+             {}; to move that identity here start with --logical-id {holder}, adopt its pane \
+             with kelpie adopt --logical-id {holder}, or choose another name",
+            intent.public_name, intent.working_directory
+        ))))
     }
 
     /// Refuse a start that would collide with a Ready agent Herdr still has.
@@ -1228,6 +1298,13 @@ impl Kelpie {
         for (incarnation_id, logical_agent_id, pane_id, terminal_id) in claims {
             if intent.supersedes == Some(incarnation_id) {
                 continue;
+            }
+            if pane_id.is_empty() {
+                return Err(SliceError::Store(StoreError::Conflict(format!(
+                    "logical agent {logical_agent_id} is still starting as incarnation \
+                     {incarnation_id}, holding the identity or name this start claims; wait \
+                     for that start to finish"
+                ))));
             }
             let live = snapshot
                 .agents
@@ -5989,6 +6066,96 @@ mod tests {
             .expect("stale Ready does not block");
     }
 
+    /// The name is the identity. With its holder gone, a start under that name
+    /// in the folder the holder last worked in is the same identity coming
+    /// back; elsewhere it is refused; and a start still in flight holds the
+    /// name like a live agent.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_start_under_a_held_name_continues_or_refuses_by_folder() {
+        let mut store = Store::in_memory().expect("store");
+        let mut first = e2e_intent();
+        first.pane_id = "w9:p1".into();
+        first.expected_terminal_id = "term-9".into();
+        first.idempotency_key = "first-holder".into();
+        let holder = store.declare_start(&first).expect("declare");
+        store
+            .begin_attempt(holder.operation_id, holder.incarnation_id, "first-holder")
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                holder.operation_id,
+                holder.incarnation_id,
+                &AgentObservation {
+                    terminal_id: "term-9".into(),
+                    pane_id: "w9:p1".into(),
+                    name: Some("worker".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        // Its pane is gone: recovery marks it lost.
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+        let fresh_pane = |intent: &StartIntent| crate::herdr::Snapshot {
+            protocol: 20,
+            panes: vec![crate::herdr::PaneObservation {
+                pane_id: intent.pane_id.clone(),
+                terminal_id: intent.expected_terminal_id.clone(),
+                cwd: Some(intent.working_directory.clone()),
+            }],
+            agents: vec![],
+        };
+
+        // Another folder: a different worker must not take the name silently.
+        let mut elsewhere = e2e_intent();
+        elsewhere.idempotency_key = "elsewhere".into();
+        elsewhere.working_directory = "/tmp/other-checkout".into();
+        let error = kelpie
+            .declare_start_from_snapshot(&elsewhere, &fresh_pane(&elsewhere))
+            .expect_err("different folder");
+        assert!(
+            error
+                .to_string()
+                .contains(&holder.logical_agent_id.to_string()),
+            "{error}"
+        );
+
+        // Same folder: the identity comes back under its name.
+        let mut again = e2e_intent();
+        again.idempotency_key = "same-folder".into();
+        let (declared, _, _) = kelpie
+            .declare_start_from_snapshot(&again, &fresh_pane(&again))
+            .expect("same folder continues");
+        assert_eq!(declared.logical_agent_id, holder.logical_agent_id);
+
+        // That start is now in flight and holds the name.
+        kelpie
+            .store_mut()
+            .begin_attempt(
+                declared.operation_id,
+                declared.incarnation_id,
+                "same-folder",
+            )
+            .expect("attempt");
+        let mut racing = e2e_intent();
+        racing.idempotency_key = "racing".into();
+        let error = kelpie
+            .declare_start_from_snapshot(&racing, &fresh_pane(&racing))
+            .expect_err("a start in flight holds the name");
+        assert!(error.to_string().contains("still starting"), "{error}");
+    }
+
     #[test]
     fn a_busy_pane_is_retried_within_its_budget() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -7567,6 +7734,183 @@ mod tests {
         );
         let replay = kelpie.adopt(&intent).expect("replay");
         assert_eq!(replay, first);
+        server.join().expect("server");
+    }
+
+    /// Continuing an identity by id onto an unnamed pane restores the name it
+    /// holds; the caller does not have to repeat it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn adopt_by_logical_id_restores_the_identity_name_on_an_unnamed_pane() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let pane =
+            serde_json::json!({"pane_id":"w7:p2","terminal_id":"term-back","cwd":"/tmp/work"});
+        let unnamed = serde_json::json!({
+            "terminal_id":"term-back","pane_id":"w7:p2",
+            "agent":"codex","interactive_ready":true,"launch_pending":false
+        });
+        let named = serde_json::json!({
+            "terminal_id":"term-back","pane_id":"w7:p2","name":"task-x",
+            "agent":"codex","interactive_ready":true,"launch_pending":false
+        });
+        let server = thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({"type":"session_snapshot","snapshot":{
+                        "protocol":20,"panes":[pane.clone()],"agents":[unnamed]
+                    }}),
+                ),
+                (
+                    "agent.rename",
+                    serde_json::json!({"type":"agent_renamed","agent":named.clone()}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({"type":"session_snapshot","snapshot":{
+                        "protocol":20,"panes":[pane],"agents":[named]
+                    }}),
+                ),
+            ];
+            for (method, result) in exchanges {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("json");
+                assert_eq!(request["method"], method);
+                if method == "agent.rename" {
+                    assert_eq!(request["params"]["name"], "task-x");
+                }
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("nl");
+            }
+        });
+        let mut store = Store::in_memory().expect("store");
+        let mut original = e2e_intent();
+        original.public_name = "task-x".into();
+        original.idempotency_key = "task-x-original".into();
+        let lost = store.declare_start(&original).expect("declare");
+        store
+            .begin_attempt(lost.operation_id, lost.incarnation_id, "task-x-original")
+            .expect("attempt");
+        store
+            .accept_start_ready(
+                lost.operation_id,
+                lost.incarnation_id,
+                &AgentObservation {
+                    terminal_id: "term-1".into(),
+                    pane_id: "w1:p1".into(),
+                    name: Some("task-x".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        store
+            .reconcile(&crate::herdr::Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+        let intent = crate::domain::AdoptIntent {
+            pane_id: "w7:p2".into(),
+            expected_terminal_id: "term-back".into(),
+            public_name: None,
+            logical_agent_id: Some(lost.logical_agent_id),
+            parent: Parent::Parentless,
+            herdr_session: "default".into(),
+            backend_kind: Some("codex".into()),
+            backend_args: Vec::new(),
+            requested_model: None,
+            requested_provider: None,
+            requested_effort: None,
+            idempotency_key: "adopt-task-x".into(),
+        };
+        let adopted = kelpie.adopt(&intent).expect("adopt by id");
+        assert_eq!(adopted.logical_agent_id, lost.logical_agent_id);
+        server.join().expect("server");
+    }
+
+    /// Adopting a pane that carries a name some identity holds takes that
+    /// identity up again instead of minting a stranger under its name.
+    #[test]
+    fn adopt_of_a_named_pane_continues_the_identity_holding_that_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({"type":"session_snapshot","snapshot":{
+                        "protocol":20,
+                        "panes":[{"pane_id":"w8:p1","terminal_id":"term-new","cwd":"/tmp/elsewhere"}],
+                        "agents":[{
+                            "terminal_id":"term-new","pane_id":"w8:p1","name":"task-y",
+                            "agent":"codex","interactive_ready":true,"launch_pending":false
+                        }]
+                    }}),
+                ),
+            ];
+            for (method, result) in exchanges {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("json");
+                assert_eq!(request["method"], method);
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("nl");
+            }
+        });
+        let mut store = Store::in_memory().expect("store");
+        let mut original = e2e_intent();
+        original.public_name = "task-y".into();
+        original.idempotency_key = "task-y-original".into();
+        let holder = store.declare_start(&original).expect("declare");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+        let intent = crate::domain::AdoptIntent {
+            pane_id: "w8:p1".into(),
+            expected_terminal_id: "term-new".into(),
+            public_name: None,
+            logical_agent_id: None,
+            parent: Parent::Parentless,
+            herdr_session: "default".into(),
+            backend_kind: Some("codex".into()),
+            backend_args: Vec::new(),
+            requested_model: None,
+            requested_provider: None,
+            requested_effort: None,
+            idempotency_key: "adopt-task-y".into(),
+        };
+        let adopted = kelpie.adopt(&intent).expect("adopt by name");
+        assert_eq!(adopted.logical_agent_id, holder.logical_agent_id);
         server.join().expect("server");
     }
 

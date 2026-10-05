@@ -199,8 +199,19 @@ It MUST contain:
 - creation time;
 - application-owned optional metadata that does not become Kelpie policy.
 
-A public name MUST NOT be the primary key. Reuse of a name MUST NOT cause old
-messages, operations, or obligations to refer to the new owner.
+The public name is the agent's identity. The logical-agent ID is the durable
+handle that follows that identity through renames, and the storage key. A
+name belongs to the identity whose current name it is and that was bound under
+it most recently ("last wins"); an identity renamed away never answers to its
+former name. While a live agent or an in-flight start holds a name, nothing
+else may claim it. Once no live agent holds it, a start under that name in the
+working directory its identity last used MUST continue that identity, keeping
+its messages, operations, and obligations, which serve as a debug record since
+the agent itself may have compacted or restarted. A start under that name in
+another working directory MUST be refused with guidance: naming the identity
+with `--logical-id`, a handoff, or an adoption moves it deliberately. Adoption
+of a pane under a held name continues that identity wherever it last worked.
+Parentage is recorded by logical-agent ID, so it follows the parent's name.
 
 A LogicalAgent MAY exist with no Herdr pane. That pane-less agent is a legal
 delivery target. Creating it MUST NOT mint a fake pane occupant or a fake
@@ -618,8 +629,8 @@ disposition. Both prompts MUST be durable before the first Herdr write, so an
 interrupted renew can be completed from stored state alone.
 
 A renew MUST identify its target by exact logical agent and incarnation. It MUST
-NOT resolve a public name. A public name is a reusable live alias that MAY be
-held by a different agent than the caller meant, and the cost of that mistake is
+NOT resolve a public name. A name MAY by then name a different incarnation, or
+a different identity after a rename, than the caller meant, and the cost of that mistake is
 not one misdelivered message: a policy clears its target's context once per
 cycle, and only the target or the requester can undo it. An interface that
 offers no alias for a renew MUST NOT be worked around by resolving one first
@@ -1077,9 +1088,11 @@ Adoption MUST:
    snapshot shows the same pane, terminal, backend, and name. Rejected or
    unknown rename outcomes MUST NOT be retried blindly;
 4. NOT issue `agent.start` or otherwise mutate Herdr topology;
-5. treat public names as aliases: create-new never inherits history of a prior
-   logical agent that used the same name; continue reuses only an explicit
-   logical-agent ID. Continue MUST refuse a logical agent whose
+5. treat the public name as the identity: an occupant carrying, or asked to
+   claim, a name some identity holds continues that identity rather than
+   creating a new one; create-new happens only for a name no identity holds,
+   and an explicit logical-agent ID continues exactly that agent, restoring its
+   name on an unnamed occupant. Continue MUST refuse a logical agent whose
    `delivery_transport` is `socket_inbox`. Because create-new inherits nothing,
    it MUST fail closed when a logical agent already holding that public name has
    an obligation in `open` or `in_progress`, owing or waiting, and the refusal
@@ -1127,7 +1140,15 @@ hide an older continuable session. The new incarnation MUST bind
 the live pane and terminal, MUST copy `backend_args` and requested
 model/provider/effort from the continuable row, and MUST record an operator
 notice. Recovery MUST NOT call `agent.start` or type a backend resume command;
-Herdr already owns revive. It MUST fail closed — no start, no guess — when the
+Herdr already owns revive. When several continuable identities recorded the
+same session, the name decides: a restored agent still carrying a name continues
+the identity with that name, and an unnamed one continues the identity bound
+most recently; only an exact tie fails closed. An identity with no matching
+session continues by its recorded pane, which a Herdr restart keeps while it
+replaces the terminal: the pane's most recent incarnation, in any state, decides
+whose pane it is, and its identity continues onto the pane's single unnamed
+occupant (or one carrying its name) only when that occupant runs the same
+backend in the same working directory. It MUST fail closed — no start, no guess — when the
 occupant has no session id, zero incarnations match, two or more logical
 agents match (the notice MUST name those ids), the live name belongs to a
 different alias, the agent is a socket waiter, or the incarnation is

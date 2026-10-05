@@ -118,8 +118,11 @@ explicitly. Do not rename them to match the package.
   renew's resume prompt, which is retried until accepted because its recipient
   has no context left to notice a duplicate and no way to survive its absence.
 - **Exact incarnation targeting.** A delayed result for an old incarnation must not
-  mutate a newer one, even when the pane, terminal, or public name was reused.
-  Public names are reusable live aliases, never primary keys.
+  mutate a newer one, even when the pane or terminal was reused.
+- **The name is the identity.** The logical-agent ID is the handle that follows it
+  through renames. A name belongs to the identity bound under it most recently;
+  a live holder or in-flight start blocks it, and with none, a start in the same
+  working directory or an adoption continues that identity.
 - **Obligations outlive runtimes.** An ask's obligation survives Kelpie and Herdr
   restarts. A progress reply sets `in_progress` but never resolves; a final reply
   resolves only on *accepted* delivery, and only for the obligation named by

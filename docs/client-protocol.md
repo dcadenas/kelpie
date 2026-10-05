@@ -99,11 +99,18 @@ authentication boundary.
 
 - Durable IDs (`logical_agent_id`, `incarnation_id`, `message_id`, operation and
   delivery IDs) are immutable primary handles.
-- Public names are reusable live aliases. They are never primary keys.
-- `start` without `logical_agent_id` creates a new logical agent. With
-  `logical_agent_id`, Kelpie continues that exact agent in a new incarnation and
-  preserves its obligations and history. A new logical agent that reuses a
-  public name does not inherit prior history.
+- The public name is the identity; `logical_agent_id` is its durable handle and
+  follows it through renames. A name belongs to the identity bound under it most
+  recently. A live agent or an in-flight start holding a name refuses any other
+  claim (`conflict`).
+- `start` without `logical_agent_id` continues the identity that holds its name
+  when that identity last worked in the same `working_directory`, creates a new
+  logical agent when no identity holds the name, and is refused with guidance
+  when the holder worked elsewhere. With `logical_agent_id`, Kelpie continues
+  that exact agent wherever it starts. Either way the identity keeps its
+  messages and obligations as a debug record.
+- `adopt` of a pane under a name an identity holds continues that identity;
+  `adopt --logical-id` onto an unnamed pane restores the identity's name.
 - `ask` and `clear` accept either exact `recipient` +
   `recipient_incarnation`, or `recipient_alias` resolved once at send time to
   the unique Ready Herdr agent for that public name.

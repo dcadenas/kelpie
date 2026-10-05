@@ -479,7 +479,6 @@ struct RecoveryCandidate {
 
 #[derive(Debug)]
 struct ContinuableSessionRow {
-    #[allow(dead_code)]
     incarnation_id: String,
     logical_agent_id: String,
     public_name: String,
@@ -493,9 +492,9 @@ struct ContinuableSessionRow {
     observed_pane_id: Option<String>,
     observed_terminal_id: Option<String>,
     session_id: Option<String>,
-    #[allow(dead_code)]
     created_at_ms: i64,
     state: String,
+    backend_kind: String,
 }
 
 /// One durable operator-inbox entry.
@@ -5413,6 +5412,39 @@ impl Store {
         Ok(notices)
     }
 
+    /// The identity a name currently names, with the folder it last worked in.
+    ///
+    /// The name is the identity: among Herdr agents whose current name this
+    /// is, archived ones included, the one bound most recently wins. `None`
+    /// means no identity holds the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn name_holder_for_start(
+        &self,
+        public_name: &str,
+    ) -> Result<Option<(LogicalAgentId, String)>, StoreError> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT i.logical_agent_id, i.working_directory
+                 FROM incarnations i JOIN logical_agents l ON l.id = i.logical_agent_id
+                 WHERE l.public_name = ?1 AND l.delivery_transport = 'herdr_prompt'
+                 ORDER BY i.created_at_ms DESC, i.id DESC
+                 LIMIT 1",
+                [public_name],
+                |row| Ok((id_text(row, 0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(agent, directory)| {
+            LogicalAgentId::parse(&agent)
+                .map(|id| (id, directory))
+                .ok_or_else(|| StoreError::InvalidRecord(format!("invalid agent id {agent}")))
+        })
+        .transpose()
+    }
+
     /// Ready incarnations a new start would collide with: the logical agent it
     /// continues, or whoever holds the public name it claims, with each one's
     /// recorded seat.
@@ -5425,11 +5457,16 @@ impl Store {
         logical_agent_id: Option<LogicalAgentId>,
         public_name: &str,
     ) -> Result<Vec<(IncarnationId, LogicalAgentId, String, String)>, StoreError> {
+        // A start still in flight holds its name as surely as a live agent, so
+        // it is reported with an empty seat, which no snapshot can clear.
         let mut statement = self.connection.prepare(
-            "SELECT i.id, i.logical_agent_id, i.observed_pane_id, i.observed_terminal_id
+            "SELECT i.id, i.logical_agent_id,
+                    CASE WHEN i.state = 'starting' THEN '' ELSE i.observed_pane_id END,
+                    CASE WHEN i.state = 'starting' THEN '' ELSE i.observed_terminal_id END
              FROM incarnations i JOIN logical_agents l ON l.id = i.logical_agent_id
-             WHERE i.state = 'ready'
-               AND i.observed_pane_id IS NOT NULL AND i.observed_terminal_id IS NOT NULL
+             WHERE ((i.state = 'ready'
+                     AND i.observed_pane_id IS NOT NULL AND i.observed_terminal_id IS NOT NULL)
+                    OR i.state = 'starting')
                AND (i.logical_agent_id = ?1 OR l.public_name = ?2)",
         )?;
         let rows = statement.query_map(
@@ -9467,7 +9504,9 @@ impl Store {
                 })
                 .or_insert(row);
         }
-        if last_by_agent.is_empty() {
+        let seat_rows = self.continuable_seat_rows()?;
+        let pane_holders = self.newest_incarnation_by_pane()?;
+        if last_by_agent.is_empty() && seat_rows.is_empty() {
             return Ok(0);
         }
         let ready_seats = self.ready_seat_keys()?;
@@ -9506,7 +9545,7 @@ impl Store {
                 .iter()
                 .map(|row| row.logical_agent_id.clone())
                 .collect();
-            if occupants.len() != 1 || logical_ids.len() != 1 {
+            if occupants.len() != 1 || logical_ids.is_empty() {
                 if logical_ids.len() >= 2 {
                     insert_restore_notice(
                         &tx,
@@ -9517,7 +9556,28 @@ impl Store {
                 continue;
             }
             let agent = occupants[0];
-            let source = matches[0];
+            // The name is the identity. A restored agent still carrying a name
+            // is that identity; an unnamed one goes to the most recent binding
+            // of this session, since identities that held it earlier were left
+            // behind when it was adopted or renamed into the newest. Only an
+            // exact tie is still ambiguous.
+            let named: Vec<&ContinuableSessionRow> =
+                match agent.name.as_deref().filter(|name| !name.is_empty()) {
+                    Some(live) => matches
+                        .iter()
+                        .copied()
+                        .filter(|row| row.public_name == live)
+                        .collect(),
+                    None => matches.clone(),
+                };
+            let Some(source) = newest_strictly(&named) else {
+                insert_restore_notice(
+                    &tx,
+                    now,
+                    &ambiguous_restore_notice(occupants, &logical_ids),
+                )?;
+                continue;
+            };
             let logical_agent_id = &source.logical_agent_id;
             let seat = (agent.pane_id.as_str(), agent.terminal_id.as_str());
             if ready_seats
@@ -9543,6 +9603,40 @@ impl Store {
                 continue;
             }
             pending.push((agent, source, backend_kind));
+        }
+        // A session that never became known, or no longer matches, leaves the
+        // recorded pane. Pane ids survive a Herdr restart while terminals do
+        // not, so the pane's most recent identity continues onto its unnamed
+        // occupant when that occupant runs the same backend in the same
+        // folder. Each pane belongs to its newest identity only, whether or
+        // not that one qualifies: an older identity never takes over a pane
+        // someone else held after it.
+        let session_continued: HashSet<String> = pending
+            .iter()
+            .map(|(_, source, _)| source.logical_agent_id.clone())
+            .collect();
+        for row in &seat_rows {
+            let Some(pane_id) = row.observed_pane_id.as_deref() else {
+                continue;
+            };
+            if pane_holders.get(pane_id) != Some(&row.incarnation_id) {
+                continue;
+            }
+            if blocked.contains(&row.logical_agent_id)
+                || session_continued.contains(&row.logical_agent_id)
+                || ready_agents.iter().any(|id| id == &row.logical_agent_id)
+            {
+                continue;
+            }
+            if let Some(agent) = seat_occupant(snapshot, row) {
+                if ready_seats
+                    .iter()
+                    .any(|key| key.0 == agent.pane_id && key.1 == agent.terminal_id)
+                {
+                    continue;
+                }
+                pending.push((agent, row, row.backend_kind.as_str()));
+            }
         }
         let mut alias_claimants: HashMap<String, Vec<String>> = HashMap::new();
         for (_, source, _) in &pending {
@@ -9652,7 +9746,7 @@ impl Store {
                     i.herdr_session, i.backend_args_json, i.working_directory,
                     i.requested_model, i.requested_provider, i.requested_effort,
                     i.observed_pane_id, i.observed_terminal_id,
-                    i.observed_native_session_json, i.created_at_ms, i.state
+                    i.observed_native_session_json, i.created_at_ms, i.state, i.backend_kind
              FROM incarnations i
              JOIN logical_agents l ON l.id = i.logical_agent_id
              WHERE i.state IN ('lost', 'unknown', 'declared', 'failed')
@@ -9676,6 +9770,7 @@ impl Store {
                 session_id: session_json.as_deref().and_then(native_session_id_stored),
                 created_at_ms: row.get(13)?,
                 state: row.get(14)?,
+                backend_kind: row.get(15)?,
             })
         })?;
         let mut values = Vec::new();
@@ -9688,13 +9783,79 @@ impl Store {
         Ok(values)
     }
 
+    /// Continuable incarnations that recorded a seat, newest per pane first.
+    ///
+    /// A Herdr restart keeps pane ids and replaces terminals, so the recorded
+    /// pane is how an identity whose session never became known finds its way
+    /// back. Socket waiters have no pane and are excluded.
+    fn continuable_seat_rows(&self) -> Result<Vec<ContinuableSessionRow>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.id, i.logical_agent_id, l.public_name, l.delivery_transport,
+                    i.herdr_session, i.backend_args_json, i.working_directory,
+                    i.requested_model, i.requested_provider, i.requested_effort,
+                    i.observed_pane_id, i.observed_terminal_id,
+                    i.observed_native_session_json, i.created_at_ms, i.state, i.backend_kind
+             FROM incarnations i
+             JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state IN ('lost', 'unknown', 'declared', 'failed')
+               AND i.observed_pane_id IS NOT NULL
+               AND l.delivery_transport = 'herdr_prompt'
+             ORDER BY i.created_at_ms DESC, i.id DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let session_json: Option<String> = row.get(12)?;
+            Ok(ContinuableSessionRow {
+                incarnation_id: id_text(row, 0)?,
+                logical_agent_id: id_text(row, 1)?,
+                public_name: row.get(2)?,
+                delivery_transport: row.get(3)?,
+                herdr_session: row.get(4)?,
+                backend_args_json: row.get(5)?,
+                working_directory: row.get(6)?,
+                requested_model: row.get(7)?,
+                requested_provider: row.get(8)?,
+                requested_effort: row.get(9)?,
+                observed_pane_id: row.get(10)?,
+                observed_terminal_id: row.get(11)?,
+                session_id: session_json.as_deref().and_then(native_session_id_stored),
+                created_at_ms: row.get(13)?,
+                state: row.get(14)?,
+                backend_kind: row.get(15)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// The most recent incarnation, in any state, recorded on each pane.
+    ///
+    /// A pane belongs to whoever held it last. An identity that held it earlier
+    /// never continues onto it, even when the last holder retired on purpose.
+    fn newest_incarnation_by_pane(&self) -> Result<HashMap<String, String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT observed_pane_id, id FROM (
+                SELECT observed_pane_id, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY observed_pane_id
+                           ORDER BY created_at_ms DESC, id DESC
+                       ) AS rank
+                FROM incarnations
+                WHERE observed_pane_id IS NOT NULL
+             ) WHERE rank = 1",
+        )?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get::<_, String>(0)?, id_text(row, 1)?)))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
     fn newest_incarnation_rows(&self) -> Result<Vec<ContinuableSessionRow>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT i.id, i.logical_agent_id, l.public_name, l.delivery_transport,
                     i.herdr_session, i.backend_args_json, i.working_directory,
                     i.requested_model, i.requested_provider, i.requested_effort,
                     i.observed_pane_id, i.observed_terminal_id,
-                    i.observed_native_session_json, i.created_at_ms, i.state
+                    i.observed_native_session_json, i.created_at_ms, i.state, i.backend_kind
              FROM incarnations i
              JOIN logical_agents l ON l.id = i.logical_agent_id
              WHERE NOT EXISTS (
@@ -9722,6 +9883,7 @@ impl Store {
                 session_id: session_json.as_deref().and_then(native_session_id_stored),
                 created_at_ms: row.get(13)?,
                 state: row.get(14)?,
+                backend_kind: row.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -10814,6 +10976,52 @@ fn learn_missing_native_session(
          WHERE id = ?2 AND state = 'ready' AND observed_native_session_json IS NULL",
         params![live.to_string(), incarnation_id],
     )?)
+}
+
+/// The single row whose binding is strictly the most recent, if there is one.
+fn newest_strictly<'a>(rows: &[&'a ContinuableSessionRow]) -> Option<&'a ContinuableSessionRow> {
+    let key = |row: &ContinuableSessionRow| {
+        (
+            row.created_at_ms,
+            row.incarnation_id.parse::<i64>().unwrap_or_default(),
+        )
+    };
+    let newest = rows.iter().copied().max_by_key(|row| key(row))?;
+    let ties = rows.iter().filter(|row| key(row) == key(newest)).count();
+    (ties == 1).then_some(newest)
+}
+
+/// The live agent a lost identity may continue onto at its recorded pane.
+///
+/// It must be the pane's only settled agent, on a new terminal (the same
+/// terminal is not a restore), running the same backend in the same folder,
+/// and either unnamed or already carrying this identity's name.
+fn seat_occupant<'a>(
+    snapshot: &'a Snapshot,
+    row: &ContinuableSessionRow,
+) -> Option<&'a crate::herdr::AgentObservation> {
+    let pane_id = row.observed_pane_id.as_deref()?;
+    let mut occupants = snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.pane_id == pane_id && !agent.launch_pending);
+    let agent = occupants.next()?;
+    if occupants.next().is_some()
+        || row.observed_terminal_id.as_deref() == Some(agent.terminal_id.as_str())
+        || agent.agent.as_deref() != Some(row.backend_kind.as_str())
+        || agent
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty() && name != row.public_name)
+    {
+        return None;
+    }
+    let cwd = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .and_then(|pane| pane.cwd.as_deref())?;
+    (cwd.trim_end_matches('/') == row.working_directory.trim_end_matches('/')).then_some(agent)
 }
 
 fn exact_live_binding(
@@ -15498,8 +15706,144 @@ mod tests {
         assert_eq!(notice_bodies(&store).len(), bodies.len());
     }
 
+    /// Lose a Ready identity bound on pane w1:p1 terminal term-1 in /tmp/work.
+    fn lost_on_seat(
+        store: &mut Store,
+        name: &str,
+        key: &str,
+        session: Option<&str>,
+    ) -> DeclaredStart {
+        let declared = store
+            .declare_start(&intent(name, "term-1", key))
+            .expect("intent");
+        store
+            .begin_attempt(declared.operation_id, declared.incarnation_id, key)
+            .expect("attempt");
+        let mut agent = observed_agent("term-1");
+        agent.name = Some(name.into());
+        agent.agent_session = session.map(|value| serde_json::json!({"value": value}));
+        store
+            .accept_start_ready(declared.operation_id, declared.incarnation_id, &agent, None)
+            .expect("ready");
+        store
+            .reconcile(&Snapshot {
+                protocol: 20,
+                panes: vec![],
+                agents: vec![],
+            })
+            .expect("lose");
+        declared
+    }
+
+    /// Herdr after a restart: pane w1:p1 is back on a new terminal in `cwd`,
+    /// running `backend`, with no name.
+    fn restarted_pane(backend: &str, cwd: &str, session: Option<&str>) -> Snapshot {
+        let mut agent = observed_agent("term-restored");
+        agent.name = None;
+        agent.agent = Some(backend.into());
+        agent.agent_session = session.map(|value| serde_json::json!({"value": value}));
+        Snapshot {
+            protocol: 20,
+            panes: vec![crate::herdr::PaneObservation {
+                pane_id: "w1:p1".into(),
+                terminal_id: "term-restored".into(),
+                cwd: Some(cwd.into()),
+            }],
+            agents: vec![agent],
+        }
+    }
+
+    /// Two identities recorded the same session; the restored agent lost its
+    /// name. The most recent binding is the identity that comes back.
     #[test]
-    fn recovery_does_not_continue_two_lost_rows_with_the_same_session() {
+    fn a_shared_session_on_an_unnamed_occupant_continues_the_newest_identity() {
+        let mut store = Store::in_memory().expect("store");
+        let older = lost_on_seat(&mut store, "old-name", "shared-old", Some("sess-shared"));
+        let newer = lost_on_seat(&mut store, "new-name", "shared-new", Some("sess-shared"));
+        let report = store
+            .reconcile(&restarted_pane("codex", "/tmp/work", Some("sess-shared")))
+            .expect("reconcile");
+        assert_eq!(report.incarnations_continued, 1);
+        assert!(
+            store
+                .resolve_ready_incarnation(newer.logical_agent_id)
+                .is_ok()
+        );
+        assert!(
+            store
+                .resolve_ready_incarnation(older.logical_agent_id)
+                .is_err()
+        );
+    }
+
+    /// An identity whose session never became known comes back by its recorded
+    /// pane: same pane id, new terminal, same backend, same folder, no name.
+    #[test]
+    fn a_sessionless_identity_continues_onto_its_restored_pane() {
+        let mut store = Store::in_memory().expect("store");
+        let lost = lost_on_seat(&mut store, "task-x", "seat-only", None);
+        let report = store
+            .reconcile(&restarted_pane("codex", "/tmp/work/", None))
+            .expect("reconcile");
+        assert_eq!(report.incarnations_continued, 1);
+        let continued = store
+            .resolve_ready_incarnation(lost.logical_agent_id)
+            .expect("continued");
+        assert_eq!(
+            store
+                .agent_address(lost.logical_agent_id)
+                .expect("name kept"),
+            "task-x"
+        );
+        assert_ne!(continued, lost.incarnation_id);
+    }
+
+    /// The pane alone is not enough: another folder or another backend is
+    /// different work, and a pane belongs only to the identity that held it
+    /// last.
+    #[test]
+    fn a_restored_pane_is_not_continued_for_different_work_or_an_older_identity() {
+        for snapshot in [
+            restarted_pane("codex", "/tmp/elsewhere", None),
+            restarted_pane("claude", "/tmp/work", None),
+        ] {
+            let mut store = Store::in_memory().expect("store");
+            let lost = lost_on_seat(&mut store, "task-x", "seat-mismatch", None);
+            let report = store.reconcile(&snapshot).expect("reconcile");
+            assert_eq!(report.incarnations_continued, 0);
+            assert!(
+                store
+                    .resolve_ready_incarnation(lost.logical_agent_id)
+                    .is_err()
+            );
+        }
+
+        let mut store = Store::in_memory().expect("store");
+        let older = lost_on_seat(&mut store, "task-old", "seat-old", None);
+        let newer = lost_on_seat(&mut store, "task-new", "seat-new", None);
+        store
+            .connection
+            .execute(
+                "UPDATE incarnations SET state = 'retired' WHERE id = ?1",
+                [newer.incarnation_id.to_string()],
+            )
+            .expect("newest holder retired on purpose");
+        let report = store
+            .reconcile(&restarted_pane("codex", "/tmp/work", None))
+            .expect("reconcile");
+        assert_eq!(
+            report.incarnations_continued, 0,
+            "the pane's last holder retired, so an older identity does not take it"
+        );
+        assert!(
+            store
+                .resolve_ready_incarnation(older.logical_agent_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_shared_session_continues_the_identity_whose_name_the_occupant_carries() {
         let mut store = Store::in_memory().expect("store");
         let first = ready_with_session(&mut store, "restore-amb-1", Some("sess-1"));
         store
@@ -15531,27 +15875,19 @@ mod tests {
         let report = store
             .reconcile(&snapshot_of(restored_to("sess-1", "term-restored")))
             .expect("reconcile");
-        assert_eq!(report.incarnations_continued, 0);
-        assert_eq!(
-            store
-                .incarnation_state(first.incarnation_id)
-                .expect("first"),
-            crate::domain::IncarnationState::Lost
-        );
-        assert_eq!(
-            store
-                .incarnation_state(second.incarnation_id)
-                .expect("second"),
-            crate::domain::IncarnationState::Lost
-        );
-        let bodies = notice_bodies(&store);
+        // Both lost identities recorded sess-1, but the restored agent still
+        // answers to "worker": the name is the identity, so the older one
+        // whose name it carries is continued and "other" stays lost.
+        assert_eq!(report.incarnations_continued, 1);
         assert!(
-            bodies.iter().any(|body| {
-                body.contains(&first.logical_agent_id.to_string())
-                    && body.contains(&second.logical_agent_id.to_string())
-                    && body.contains("did not continue")
-            }),
-            "{bodies:?}"
+            store
+                .resolve_ready_incarnation(first.logical_agent_id)
+                .is_ok()
+        );
+        assert!(
+            store
+                .resolve_ready_incarnation(second.logical_agent_id)
+                .is_err()
         );
     }
 

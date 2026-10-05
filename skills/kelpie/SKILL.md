@@ -67,8 +67,10 @@ recipient with either its live alias or both `--recipient-id` and
 
 Preserve returned message, logical-agent, incarnation, and schedule IDs exactly.
 IDs are positive decimal integers. UUIDs and zero are not valid Kelpie IDs.
-A public name is a reusable live alias. Continuing a logical agent preserves its
-obligations; a new agent with that name does not inherit them.
+The public name is the identity. Starting or adopting under a name continues the
+identity that holds it, with its obligations, in the same working directory; a
+start under that name elsewhere is refused with guidance. A live holder blocks
+the name entirely.
 
 `unknown`, a timeout, or a lost client response is not proof of failure. Inspect
 the recorded receipt before retrying. Never blindly resend submitted, accepted,
