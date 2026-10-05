@@ -1200,10 +1200,49 @@ impl Kelpie {
         snapshot: &crate::herdr::Snapshot,
     ) -> Result<(DeclaredStart, Instant, Instant), SliceError> {
         check_pane_matches_intent(snapshot, intent)?;
+        self.refuse_start_over_live_ready(intent, snapshot)?;
         let deadline = Instant::now() + Duration::from_millis(intent.readiness_timeout_ms);
         let declared = self.store.declare_start(intent)?;
         let busy_deadline = deadline.min(Instant::now() + BUSY_PANE_RETRY_BUDGET);
         Ok((declared, deadline, busy_deadline))
+    }
+
+    /// Refuse a start that would collide with a Ready agent Herdr still has.
+    ///
+    /// Continuing a logical agent that is already Ready, or claiming a name a
+    /// live Ready agent holds, can only end in Herdr's `agent_name_taken` or a
+    /// second Ready incarnation for one identity. Refusing here, before any
+    /// intent is written, keeps that from minting a failed incarnation per
+    /// attempt. A Ready row whose seat is gone from the snapshot does not
+    /// block: recovery settles it, and the start is the caller's replacement.
+    /// A handoff's superseded incarnation is the one being replaced, so it
+    /// never blocks its own handoff.
+    fn refuse_start_over_live_ready(
+        &self,
+        intent: &StartIntent,
+        snapshot: &crate::herdr::Snapshot,
+    ) -> Result<(), SliceError> {
+        let claims = self
+            .store
+            .ready_claims_for_start(intent.logical_agent_id, &intent.public_name)?;
+        for (incarnation_id, logical_agent_id, pane_id, terminal_id) in claims {
+            if intent.supersedes == Some(incarnation_id) {
+                continue;
+            }
+            let live = snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.pane_id == pane_id && agent.terminal_id == terminal_id);
+            if live {
+                return Err(SliceError::Store(StoreError::Conflict(format!(
+                    "logical agent {logical_agent_id} is already Ready as incarnation \
+                     {incarnation_id} on pane {pane_id} terminal {terminal_id}, holding the \
+                     identity or name this start claims; address it as it is, or replace it \
+                     with `kelpie handoff --replace {incarnation_id}`"
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Write-boundary marker for `agent.start` after the Herdr socket is open.
@@ -5833,6 +5872,121 @@ mod tests {
                 .is_none()
         );
         server.join().expect("server");
+    }
+
+    /// A start that continues a Ready identity, or claims a name a Ready agent
+    /// holds, is refused before any intent while Herdr still has that agent;
+    /// a handoff replacing it, or a Ready row whose seat is gone, is not.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_start_over_a_live_ready_agent_is_refused_before_any_intent() {
+        let mut store = Store::in_memory().expect("store");
+        let mut first = e2e_intent();
+        first.pane_id = "w9:p1".into();
+        first.expected_terminal_id = "term-9".into();
+        first.idempotency_key = "live-ready".into();
+        let ready = store.declare_start(&first).expect("declare");
+        store
+            .begin_attempt(ready.operation_id, ready.incarnation_id, "live-ready")
+            .expect("attempt");
+        let live_agent = AgentObservation {
+            terminal_id: "term-9".into(),
+            pane_id: "w9:p1".into(),
+            name: Some("worker".into()),
+            agent: Some("codex".into()),
+            interactive_ready: true,
+            launch_pending: false,
+            agent_session: None,
+        };
+        store
+            .accept_start_ready(ready.operation_id, ready.incarnation_id, &live_agent, None)
+            .expect("ready");
+        let mut kelpie = Kelpie::new(store, HerdrClient::new("/unused", Duration::from_secs(1)));
+
+        let mut cold = e2e_intent();
+        cold.logical_agent_id = Some(ready.logical_agent_id);
+        cold.idempotency_key = "cold-resume".into();
+        let target_pane = crate::herdr::PaneObservation {
+            pane_id: cold.pane_id.clone(),
+            terminal_id: cold.expected_terminal_id.clone(),
+            cwd: Some(cold.working_directory.clone()),
+        };
+        let live = crate::herdr::Snapshot {
+            protocol: 20,
+            panes: vec![target_pane.clone()],
+            agents: vec![live_agent],
+        };
+        let error = kelpie
+            .declare_start_from_snapshot(&cold, &live)
+            .expect_err("continuing a live Ready identity");
+        assert!(
+            matches!(error, SliceError::Store(StoreError::Conflict(_))),
+            "{error:?}"
+        );
+        assert!(
+            kelpie
+                .store_mut()
+                .declared_by_idempotency_key("cold-resume")
+                .expect("lookup")
+                .is_none(),
+            "a refused start mints nothing"
+        );
+        // A fresh identity claiming the live agent's name is the same collision.
+        let mut squatter = e2e_intent();
+        squatter.idempotency_key = "same-name".into();
+        assert!(
+            kelpie
+                .declare_start_from_snapshot(&squatter, &live)
+                .is_err()
+        );
+
+        // A handoff replaces exactly that incarnation, so it is not blocked.
+        let mut handoff = cold.clone();
+        handoff.idempotency_key = "handoff".into();
+        handoff.supersedes = Some(ready.incarnation_id);
+        kelpie
+            .declare_start_from_snapshot(&handoff, &live)
+            .expect("handoff proceeds");
+
+        // A Ready row whose seat Herdr no longer has does not block a start.
+        let mut stale_store = Store::in_memory().expect("store");
+        let stale = stale_store.declare_start(&first).expect("declare");
+        stale_store
+            .begin_attempt(stale.operation_id, stale.incarnation_id, "stale")
+            .expect("attempt");
+        stale_store
+            .accept_start_ready(
+                stale.operation_id,
+                stale.incarnation_id,
+                &AgentObservation {
+                    terminal_id: "term-9".into(),
+                    pane_id: "w9:p1".into(),
+                    name: Some("worker".into()),
+                    agent: Some("codex".into()),
+                    interactive_ready: true,
+                    launch_pending: false,
+                    agent_session: None,
+                },
+                None,
+            )
+            .expect("ready");
+        let mut stale_kelpie = Kelpie::new(
+            stale_store,
+            HerdrClient::new("/unused", Duration::from_secs(1)),
+        );
+        let mut replacement = e2e_intent();
+        replacement.logical_agent_id = Some(stale.logical_agent_id);
+        replacement.idempotency_key = "replacement".into();
+        stale_kelpie
+            .declare_start_from_snapshot(
+                &replacement,
+                &crate::herdr::Snapshot {
+                    protocol: 20,
+                    panes: vec![target_pane],
+                    agents: vec![],
+                },
+            )
+            .expect("stale Ready does not block");
     }
 
     #[test]

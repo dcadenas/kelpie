@@ -62,16 +62,12 @@ pub(crate) const DEFAULT_REMINDER_INTERVAL_MS: i64 = 2_700_000;
 
 const ACTIVE_REPORT_CTE: &str = "WITH RECURSIVE
     active_roots(logical_agent_id) AS (
-        SELECT i.logical_agent_id
+        -- Any live-or-pending incarnation makes its agent active, whatever was
+        -- created after it: a failed start minted later does not end a Ready
+        -- binding, and stale `unknown` rows are settled by recovery.
+        SELECT DISTINCT i.logical_agent_id
         FROM incarnations i
         WHERE i.state IN ('ready', 'starting', 'unknown')
-          AND NOT EXISTS (
-            SELECT 1
-            FROM incarnations newer
-            WHERE newer.logical_agent_id = i.logical_agent_id
-              AND (newer.created_at_ms > i.created_at_ms
-                   OR (newer.created_at_ms = i.created_at_ms AND newer.id > i.id))
-        )
     ),
     active_agents(id) AS (
         SELECT logical_agent_id
@@ -5415,6 +5411,53 @@ impl Store {
             });
         }
         Ok(notices)
+    }
+
+    /// Ready incarnations a new start would collide with: the logical agent it
+    /// continues, or whoever holds the public name it claims, with each one's
+    /// recorded seat.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn ready_claims_for_start(
+        &self,
+        logical_agent_id: Option<LogicalAgentId>,
+        public_name: &str,
+    ) -> Result<Vec<(IncarnationId, LogicalAgentId, String, String)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.id, i.logical_agent_id, i.observed_pane_id, i.observed_terminal_id
+             FROM incarnations i JOIN logical_agents l ON l.id = i.logical_agent_id
+             WHERE i.state = 'ready'
+               AND i.observed_pane_id IS NOT NULL AND i.observed_terminal_id IS NOT NULL
+               AND (i.logical_agent_id = ?1 OR l.public_name = ?2)",
+        )?;
+        let rows = statement.query_map(
+            params![logical_agent_id.map(|id| id.to_string()), public_name],
+            |row| {
+                Ok((
+                    id_text(row, 0)?,
+                    id_text(row, 1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut claims = Vec::new();
+        for row in rows {
+            let (incarnation, agent, pane, terminal) = row?;
+            claims.push((
+                IncarnationId::parse(&incarnation).ok_or_else(|| {
+                    StoreError::InvalidRecord(format!("invalid incarnation id {incarnation}"))
+                })?,
+                LogicalAgentId::parse(&agent).ok_or_else(|| {
+                    StoreError::InvalidRecord(format!("invalid agent id {agent}"))
+                })?,
+                pane,
+                terminal,
+            ));
+        }
+        Ok(claims)
     }
 
     /// Read the exact observed binding for a ready incarnation.
@@ -11851,6 +11894,44 @@ mod tests {
         assert!(
             store.report().is_err(),
             "the full report still loads and validates retired history"
+        );
+    }
+
+    /// A failed start minted after a Ready binding does not end it: the agent
+    /// stays in the active report while any incarnation is still live.
+    #[test]
+    fn active_report_keeps_a_ready_agent_despite_a_newer_failed_start() {
+        let mut store = Store::in_memory().expect("store");
+        let ready = store
+            .declare_start(&intent("worker", "term-1", "active-ready"))
+            .expect("ready");
+        mark_ready(&mut store, ready, "worker", "term-1");
+        let mut retry = intent("worker", "term-2", "active-failed-retry");
+        retry.logical_agent_id = Some(ready.logical_agent_id);
+        let failed = store.declare_start(&retry).expect("retry");
+        store
+            .begin_attempt(failed.operation_id, failed.incarnation_id, "retry")
+            .expect("attempt");
+        store
+            .mark_rejected(
+                failed.operation_id,
+                failed.incarnation_id,
+                "agent_name_taken",
+                DeliveryOutcome::Rejected,
+            )
+            .expect("failed");
+        let report = store.active_report().expect("active report");
+        let agent = report
+            .agents
+            .iter()
+            .find(|agent| agent.id == ready.logical_agent_id)
+            .expect("the Ready agent stays active");
+        assert!(
+            agent
+                .incarnations
+                .iter()
+                .any(|incarnation| incarnation.state == crate::domain::IncarnationState::Ready),
+            "{agent:?}"
         );
     }
 

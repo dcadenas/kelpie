@@ -1210,6 +1210,12 @@ and start an agent. It MUST journal the intended sequence and every accepted
 resource ID so partial failure can be reconciled. It MUST NOT imply that a
 multi-call launch is atomic.
 
+A start MUST be refused before any durable intent when a fresh snapshot shows a
+Ready incarnation it would collide with still live on its recorded seat: the
+logical agent the start continues, or the holder of the public name it claims.
+The incarnation a handoff supersedes MUST NOT block that handoff, and a Ready
+record whose seat is absent from the snapshot MUST NOT block a start.
+
 Runtime start and initial-message delivery are separate durable operations. An
 incarnation MAY become `ready` regardless of the initial-message delivery
 outcome. A launch response MUST expose the runtime-start outcome and the

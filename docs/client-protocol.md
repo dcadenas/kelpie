@@ -186,6 +186,13 @@ Error bodies carry a stable `class` and, where one exists, a finer `code`:
 Herdr's own rejection code passed through unaltered, or a Kelpie code such as
 `pane_occupied`. Branch on `class` and `code`, never on `message`.
 
+`start` is refused with `conflict`, before any intent is recorded, when a Ready
+incarnation it would collide with is live on its recorded seat in the fresh
+snapshot: the logical agent named by `logical_agent_id`, or whoever holds the
+claimed public name. Herdr would refuse that launch with `agent_name_taken` or
+leave one identity with two Ready incarnations. A handoff's `supersedes`
+incarnation never blocks it, and a Ready row whose seat is gone does not block.
+
 `start` is a composed launch request. Its result reports `runtime_start` and
 `initial_message` separately. `runtime_start` contains its operation ID and
 outcome. `initial_message` contains its immutable message ID, independent

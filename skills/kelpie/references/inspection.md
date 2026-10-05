@@ -35,7 +35,7 @@ Contents: [Method details](#method-details).
   logical agent outlives them. Incarnations come newest first. It reports facts
   and never judges them, so decide for yourself what a state means. `--live`
   adds the Herdr column, taken at report time rather than stored. `--active`
-  keeps only agents that still exist — newest incarnation ready, starting, or
-  unknown — plus the ancestors that explain who started them, which is usually
+  keeps only agents that still exist — any incarnation ready, starting, or
+  unknown, whatever failed after it — plus the ancestors that explain who started them, which is usually
   what you want and a fraction of the output. `--json` gives the graph for
   anything that wants to render it.
