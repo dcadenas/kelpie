@@ -763,7 +763,8 @@ projection drift: Kelpie records the intent, restores its desired name through
 backend replacement marks the incarnation Lost, but a later adoption on the
 same recorded seat continues its logical agent without requiring the backend to
 match. Native sessions are refreshed observations while the seat remains
-Ready. After that seat is gone, a unique native-session match continues the
+Ready, and a Ready binding that bound before its backend allocated a session
+gets the one Herdr reports for its exact binding (`native_sessions_learned`). After that seat is gone, a unique native-session match continues the
 same logical agent onto the Herdr-restored occupant and reports the count as
 `incarnations_continued`. A start whose readiness never resolved leaves an
 incarnation `unknown`, which no other command can move, whether or not Herdr

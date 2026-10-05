@@ -449,6 +449,10 @@ pub struct RecoveryReport {
     /// Ready bindings whose recorded conversation reference was stale and
     /// replaced with the live one. A rotation, not a loss.
     pub native_sessions_refreshed: usize,
+    /// Ready bindings that had no recorded conversation reference and got the
+    /// one Herdr now reports for their exact binding. Recovery continues an
+    /// identity across a Herdr restart by this reference.
+    pub native_sessions_learned: usize,
     /// Missing Herdr name projections restored from Kelpie's durable identity.
     pub names_reprojected: usize,
     /// `unknown` starts settled `lost` because no live agent carries the
@@ -8994,10 +8998,11 @@ impl Store {
             .map_err(StoreError::Sql)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reconcile_ready_incarnations(
         &mut self,
         snapshot: &Snapshot,
-    ) -> Result<(usize, usize), StoreError> {
+    ) -> Result<(usize, usize, usize), StoreError> {
         let ready = {
             let mut statement = self.connection.prepare(
                 "SELECT i.id, i.observed_pane_id, i.observed_terminal_id,
@@ -9023,6 +9028,7 @@ impl Store {
         let tx = self.connection.transaction()?;
         let mut marked_lost = 0;
         let mut sessions_refreshed = 0;
+        let mut sessions_learned = 0;
         for row in ready {
             let exact_live = snapshot.agents.iter().find(|agent| {
                 exact_live_binding(
@@ -9056,8 +9062,8 @@ impl Store {
             // only its association with this incarnation. A live runtime
             // rotates that reference on its own — clear, resume, compaction,
             // fork — so a change is not evidence the runtime was replaced. It
-            // is evidence that the recorded value has gone stale, and
-            // attribution reads it to find the transcript to observe.
+            // is evidence that the recorded value has gone stale, and recovery
+            // continues an identity onto a restored occupant by that value.
             // Herdr reporting no session at all is not evidence of a change,
             // so only a reported value that differs from a recorded one is a
             // rotation.
@@ -9083,6 +9089,9 @@ impl Store {
                      WHERE id = ?3 AND state = 'ready'",
                     params![live, now, row.id],
                 )?;
+            }
+            if row.native_session.is_none() {
+                sessions_learned += learn_missing_native_session(&tx, &row.id, exact_live)?;
             }
             if renamed_live.is_some() {
                 let target = row.pending_rename_to.as_deref().unwrap_or_default();
@@ -9115,7 +9124,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok((marked_lost, sessions_refreshed))
+        Ok((marked_lost, sessions_refreshed, sessions_learned))
     }
 
     /// Settle `unknown` starts whose runtime is provably absent.
@@ -9883,7 +9892,7 @@ impl Store {
         };
 
         let now = now_millis()?;
-        let (incarnations_marked_lost, native_sessions_refreshed) =
+        let (incarnations_marked_lost, native_sessions_refreshed, native_sessions_learned) =
             self.reconcile_ready_incarnations(snapshot)?;
         let incarnations_continued = self.continue_restored_occupants(snapshot)?;
         let unknown_starts_settled = self.settle_absent_unknown_starts(snapshot)?;
@@ -9891,6 +9900,7 @@ impl Store {
             incarnations_marked_lost,
             incarnations_continued,
             native_sessions_refreshed,
+            native_sessions_learned,
             unknown_starts_settled,
             // A live daemon fires its own due wakes; one that is due but not
             // yet fired was not missed during downtime.
@@ -10738,6 +10748,31 @@ fn ambiguous_restore_notice(
 /// conversation, not a runtime, and a live agent rotates it on clear, resume,
 /// compaction, or fork. Requiring it to match read those rotations as proof the
 /// runtime had gone.
+/// Record the session Herdr reports for a Ready binding that has none yet.
+///
+/// Some backends allocate their conversation only at the first prompt, so a
+/// binding often records none. Without it, a Herdr restart (new terminal ids
+/// on the restored panes) leaves nothing to continue the identity by, and it is
+/// stranded `lost` beside its own live agent. The caller passes only the exact
+/// binding — pane, terminal, backend, and public name — so a replacement on the
+/// same seat cannot donate its session. A first sighting is not a rotation, so
+/// no conversation boundary is stamped, and the row guard keeps an
+/// already-recorded session untouched.
+fn learn_missing_native_session(
+    tx: &Transaction<'_>,
+    incarnation_id: &str,
+    exact_live: Option<&crate::herdr::AgentObservation>,
+) -> Result<usize, StoreError> {
+    let Some(live) = exact_live.and_then(|agent| agent.agent_session.as_ref()) else {
+        return Ok(0);
+    };
+    Ok(tx.execute(
+        "UPDATE incarnations SET observed_native_session_json = ?1
+         WHERE id = ?2 AND state = 'ready' AND observed_native_session_json IS NULL",
+        params![live.to_string(), incarnation_id],
+    )?)
+}
+
 fn exact_live_binding(
     agent: &crate::herdr::AgentObservation,
     pane_id: &str,
@@ -15270,6 +15305,75 @@ mod tests {
         declared
     }
 
+    /// A backend that allocates its conversation only at the first prompt
+    /// binds with no session. The sweep learns it once Herdr reports it on the
+    /// exact binding, so a later Herdr restart, which restores the pane on a
+    /// new terminal, continues the identity instead of stranding it `lost`.
+    #[test]
+    fn a_late_session_is_learned_and_carries_the_identity_across_a_herdr_restart() {
+        let mut store = Store::in_memory().expect("store");
+        let declared = ready_with_session(&mut store, "late-session", None);
+        assert_eq!(
+            store
+                .observed_native_session(declared.incarnation_id)
+                .expect("session"),
+            None
+        );
+
+        let learned = store
+            .reconcile(&snapshot_of(rotated_to("sess-late")))
+            .expect("learn");
+        assert_eq!(learned.native_sessions_learned, 1);
+        assert_eq!(
+            learned.native_sessions_refreshed, 0,
+            "a first sighting is no rotation"
+        );
+        assert_eq!(learned.incarnations_marked_lost, 0);
+        assert_eq!(
+            store
+                .observed_native_session(declared.incarnation_id)
+                .expect("session"),
+            Some(serde_json::json!({"value": "sess-late"}))
+        );
+        let again = store
+            .reconcile(&snapshot_of(rotated_to("sess-late")))
+            .expect("idempotent");
+        assert_eq!(again.native_sessions_learned, 0);
+
+        // Herdr restarts: the pane comes back on a new terminal id.
+        let restarted = store
+            .reconcile(&snapshot_of(restored_to("sess-late", "term-restored")))
+            .expect("restart");
+        assert_eq!(restarted.incarnations_marked_lost, 1);
+        assert_eq!(restarted.incarnations_continued, 1);
+        let continued = store
+            .resolve_ready_incarnation(declared.logical_agent_id)
+            .expect("continued onto the restored pane");
+        assert_ne!(continued, declared.incarnation_id);
+    }
+
+    /// Only the exact binding may supply a missing session: a different agent
+    /// on the same seat, or the right agent under another name, donates none.
+    #[test]
+    fn a_missing_session_is_not_learned_from_a_foreign_occupant() {
+        let mut renamed = rotated_to("sess-foreign");
+        renamed.name = Some("someone-else".into());
+        let mut other_backend = rotated_to("sess-foreign");
+        other_backend.agent = Some("claude".into());
+        for occupant in [renamed, other_backend] {
+            let mut store = Store::in_memory().expect("store");
+            let declared = ready_with_session(&mut store, "foreign-session", None);
+            let report = store.reconcile(&snapshot_of(occupant)).expect("reconcile");
+            assert_eq!(report.native_sessions_learned, 0);
+            assert_eq!(
+                store
+                    .observed_native_session(declared.incarnation_id)
+                    .expect("session"),
+                None
+            );
+        }
+    }
+
     #[test]
     fn recovery_continues_a_unique_lost_agent_onto_a_restored_session() {
         let mut store = Store::in_memory().expect("store");
@@ -15906,6 +16010,7 @@ mod tests {
                 incarnations_marked_lost: 0,
                 incarnations_continued: 0,
                 native_sessions_refreshed: 0,
+                native_sessions_learned: 0,
                 names_reprojected: 0,
                 unknown_starts_settled: 0,
             }

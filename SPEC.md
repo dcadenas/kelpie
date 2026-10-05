@@ -1102,8 +1102,13 @@ own (clear, resume, compaction, fork). Recovery MUST NOT require a later
 snapshot to present the same session, and MUST NOT treat a changed session as
 absence or replacement. When the binding is otherwise exact and a fresh
 authoritative snapshot reports a different session, Kelpie MUST replace the
-recorded reference with the reported one, so attribution reads the live
-conversation rather than an abandoned one.
+recorded reference with the reported one, so continuation follows the live
+conversation rather than an abandoned one. When a Ready binding has no recorded
+reference and an authoritative snapshot reports one for the exact binding
+(pane, terminal, backend kind, and public name), recovery MUST record it, so a
+backend that allocates its conversation only at the first prompt can still be
+continued after a Herdr restart. A first recording is not a rotation, and an
+occupant that does not match the exact binding MUST NOT supply it.
 
 Using that session as a continuation key is allowed only after the recorded
 seat is gone. When a fresh snapshot has no exact pane and terminal for a Ready
