@@ -63,6 +63,13 @@ Caller identity defaults to the Ready binding for `$HERDR_PANE_ID`. Address a
 recipient with either its live alias or both `--recipient-id` and
 `--recipient-incarnation`, never a fake alias alongside exact addressing.
 
+If `$HERDR_PANE_ID` is empty (OpenCode V2 runs shell tools outside the pane),
+pass your identity explicitly with `--sender-id ID`, or `--pane ID` when you
+know your pane for certain. Never identify yourself with `herdr pane current`:
+without the pane id it returns whichever pane is focused on screen, which may be
+someone else. If you know neither, ask. See [lifecycle](references/lifecycle.md)
+to name a session that has no identity yet.
+
 ## Preserve identity and outcomes
 
 Preserve returned message, logical-agent, incarnation, and schedule IDs exactly.

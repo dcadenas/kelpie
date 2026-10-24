@@ -93,9 +93,25 @@ regains that alias. Several continuable identities or a different live name
 fail closed; backend kind is runtime evidence rather than an identity condition.
 
 A missing recipient alias can similarly continue a unique unnamed live agent
-on its recorded seat. Cwd-derived adoption creates a new identity only when the
-name has no prior claimant. Named occupants require explicit binding: a reused
-Herdr name alone does not prove identity.
+on its recorded seat. The name is the identity: adopting a pane under a name an
+identity holds continues that identity. An unnamed pane is named after its
+folder; if a dead identity holds that name and last worked in the same folder,
+it continues, and if it worked elsewhere the pane takes the pane-suffixed name
+instead.
+
+To give a session that has no identity yet a name of your choosing, adopt its
+exact pane and terminal under that name:
+
+```sh
+kelpie adopt --pane PANE --terminal TERMINAL --name task-foo
+```
+
+The name must be legal for Herdr and not held by a live agent; an identity that
+already holds it is continued, not duplicated. Get PANE and TERMINAL from
+`$HERDR_PANE_ID` and `herdr pane list`, or from the person who started the
+session. When `$HERDR_PANE_ID` is empty (shell tools under OpenCode V2), do not
+use `herdr pane current`: it reports the focused pane, not yours. Once adopted,
+pass `--sender-id` with the returned agent id on later commands.
 
 For `no ready agent for alias X`, inspect Herdr and Kelpie before choosing a
 recovery operation:

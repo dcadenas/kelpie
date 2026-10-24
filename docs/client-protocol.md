@@ -111,6 +111,10 @@ authentication boundary.
   messages and obligations as a debug record.
 - `adopt` of a pane under a name an identity holds continues that identity;
   `adopt --logical-id` onto an unnamed pane restores the identity's name.
+  On an unnamed pane, `adopt --name` claims the requested name when it is legal
+  and no live agent holds it. Without a name, the pane is named after its
+  folder: a dead identity holding that name continues when it last worked in the
+  same folder; otherwise the pane takes the pane-suffixed name.
 - `ask` and `clear` accept either exact `recipient` +
   `recipient_incarnation`, or `recipient_alias` resolved once at send time to
   the unique Ready Herdr agent for that public name.

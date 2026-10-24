@@ -949,7 +949,10 @@ impl Kelpie {
             // pane restores the name it holds.
             (None, Some(logical_agent_id), None) => self.store.agent_address(logical_agent_id)?,
             (None, None, _) => {
-                self.derived_claim_name(&effective_intent, snapshot, &working_directory)?
+                let (name, holder) =
+                    self.claim_name_for_unbound(&effective_intent, snapshot, &working_directory)?;
+                effective_intent.logical_agent_id = holder;
+                name
             }
         };
         let evidence = AdoptEvidence {
@@ -993,12 +996,22 @@ impl Kelpie {
         }))
     }
 
-    fn derived_claim_name(
+    /// Choose the name an unnamed occupant is adopted under when no identity
+    /// was named, and the identity it continues, if any.
+    ///
+    /// The name is the identity. A name the caller asked for is used as long as
+    /// it is legal and no live agent holds it; an identity already holding it
+    /// was continued before this point. Without one, the name comes from the
+    /// working directory: a dead identity that holds it and last worked in this
+    /// same folder is that worker coming back and is continued, while one that
+    /// worked elsewhere keeps its name, so this pane takes the pane-suffixed
+    /// form instead of a second identity under the same name.
+    fn claim_name_for_unbound(
         &self,
         intent: &AdoptIntent,
         snapshot: &crate::herdr::Snapshot,
         working_directory: &str,
-    ) -> Result<String, SliceError> {
+    ) -> Result<(String, Option<LogicalAgentId>), SliceError> {
         let mut taken: Vec<String> = snapshot
             .agents
             .iter()
@@ -1008,17 +1021,36 @@ impl Kelpie {
             .filter_map(|agent| agent.name.clone())
             .collect();
         taken.extend(self.store.active_aliases()?);
-        let derived = crate::name::aligned_live_name(working_directory, &intent.pane_id, taken)
-            .map_err(|error| SliceError::LiveConflict(error.0))?;
-        if let Some(expected) = intent.public_name.as_deref()
-            && expected != derived
-        {
-            return Err(SliceError::LiveConflict(format!(
-                "derived live name {derived} does not match requested {expected}; rename the \
-                 live Herdr agent to {expected} first, then adopt it"
-            )));
+        if let Some(requested) = intent.public_name.as_deref() {
+            if !crate::name::valid_herdr_name(requested) {
+                return Err(SliceError::LiveConflict(format!(
+                    "{requested} is not a legal Herdr name (lowercase first, at most 32 \
+                     characters)"
+                )));
+            }
+            if taken.iter().any(|name| name == requested) {
+                return Err(SliceError::LiveConflict(format!(
+                    "{requested} is held by a live agent; choose another name"
+                )));
+            }
+            return Ok((requested.to_string(), None));
         }
-        Ok(derived)
+        for _ in 0..2 {
+            let derived =
+                crate::name::aligned_live_name(working_directory, &intent.pane_id, &taken)
+                    .map_err(|error| SliceError::LiveConflict(error.0))?;
+            match self.store.name_holder_for_start(&derived)? {
+                None => return Ok((derived, None)),
+                Some((holder, directory)) if same_directory(&directory, working_directory) => {
+                    return Ok((derived, Some(holder)));
+                }
+                Some(_) => taken.push(derived),
+            }
+        }
+        Err(SliceError::LiveConflict(format!(
+            "the names derived from {working_directory} belong to identities that worked \
+             elsewhere; adopt with --name to choose one"
+        )))
     }
 
     pub(crate) fn submit_adopt_rename_intent(
@@ -7912,6 +7944,159 @@ mod tests {
         let adopted = kelpie.adopt(&intent).expect("adopt by name");
         assert_eq!(adopted.logical_agent_id, holder.logical_agent_id);
         server.join().expect("server");
+    }
+
+    /// Adopt an unnamed occupant against a fake Herdr that asserts the name
+    /// the adoption claims, then confirms it.
+    fn adopt_unnamed_claiming(
+        store: Store,
+        cwd: &str,
+        requested: Option<&str>,
+        expected_name: &str,
+    ) -> (DeclaredStart, Kelpie) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let pane = serde_json::json!({"pane_id":"w7:p3","terminal_id":"term-fresh","cwd":cwd});
+        let unnamed = serde_json::json!({
+            "terminal_id":"term-fresh","pane_id":"w7:p3",
+            "agent":"codex","interactive_ready":true,"launch_pending":false
+        });
+        let named = serde_json::json!({
+            "terminal_id":"term-fresh","pane_id":"w7:p3","name":expected_name,
+            "agent":"codex","interactive_ready":true,"launch_pending":false
+        });
+        let expected = expected_name.to_string();
+        let server = thread::spawn(move || {
+            let exchanges = [
+                (
+                    "ping",
+                    serde_json::json!({"type":"pong","version":"test","protocol":20}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({"type":"session_snapshot","snapshot":{
+                        "protocol":20,"panes":[pane.clone()],"agents":[unnamed]
+                    }}),
+                ),
+                (
+                    "agent.rename",
+                    serde_json::json!({"type":"agent_renamed","agent":named.clone()}),
+                ),
+                (
+                    "session.snapshot",
+                    serde_json::json!({"type":"session_snapshot","snapshot":{
+                        "protocol":20,"panes":[pane],"agents":[named]
+                    }}),
+                ),
+            ];
+            for (method, result) in exchanges {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read");
+                let request: Value = serde_json::from_str(&line).expect("json");
+                assert_eq!(request["method"], method);
+                if method == "agent.rename" {
+                    assert_eq!(request["params"]["name"], expected.as_str());
+                }
+                serde_json::to_writer(
+                    &mut stream,
+                    &serde_json::json!({"id":request["id"],"result":result}),
+                )
+                .expect("write");
+                stream.write_all(b"\n").expect("nl");
+            }
+        });
+        let mut kelpie = Kelpie::new(store, HerdrClient::new(&socket, Duration::from_secs(1)));
+        let intent = crate::domain::AdoptIntent {
+            pane_id: "w7:p3".into(),
+            expected_terminal_id: "term-fresh".into(),
+            public_name: requested.map(ToOwned::to_owned),
+            logical_agent_id: None,
+            parent: Parent::Parentless,
+            herdr_session: "default".into(),
+            backend_kind: Some("codex".into()),
+            backend_args: Vec::new(),
+            requested_model: None,
+            requested_provider: None,
+            requested_effort: None,
+            idempotency_key: format!("adopt-{expected_name}"),
+        };
+        let adopted = kelpie.adopt(&intent).expect("adopt");
+        server.join().expect("server");
+        (adopted, kelpie)
+    }
+
+    /// A dead identity named after a folder, last seen in `cwd`.
+    fn dead_identity(store: &mut Store, name: &str, cwd: &str, key: &str) -> DeclaredStart {
+        let mut intent = e2e_intent();
+        intent.public_name = name.into();
+        intent.working_directory = cwd.into();
+        intent.idempotency_key = key.into();
+        store.declare_start(&intent).expect("declare")
+    }
+
+    /// The name a session asks for is the name it gets on an unnamed pane,
+    /// even when its folder would suggest another.
+    #[test]
+    fn adopt_claims_the_requested_name_on_an_unnamed_pane() {
+        let (adopted, kelpie) = adopt_unnamed_claiming(
+            Store::in_memory().expect("store"),
+            "/tmp/divine-funnelcake",
+            Some("task-outage"),
+            "task-outage",
+        );
+        assert_eq!(
+            kelpie
+                .store()
+                .agent_address(adopted.logical_agent_id)
+                .expect("name"),
+            "task-outage"
+        );
+    }
+
+    /// A folder-derived name that a dead identity from the same folder holds
+    /// is that worker coming back.
+    #[test]
+    fn adopt_of_an_unnamed_pane_continues_the_dead_identity_of_its_folder() {
+        let mut store = Store::in_memory().expect("store");
+        let dead = dead_identity(
+            &mut store,
+            "lists-feedback",
+            "/tmp/lists-feedback",
+            "dead-same",
+        );
+        let (adopted, _) =
+            adopt_unnamed_claiming(store, "/tmp/lists-feedback", None, "lists-feedback");
+        assert_eq!(adopted.logical_agent_id, dead.logical_agent_id);
+    }
+
+    /// The same folder name held by an identity that worked somewhere else is
+    /// not this worker: the pane takes the suffixed name as a new identity.
+    #[test]
+    fn adopt_of_an_unnamed_pane_does_not_take_a_name_from_another_folder() {
+        let mut store = Store::in_memory().expect("store");
+        let other = dead_identity(
+            &mut store,
+            "lists-feedback",
+            "/elsewhere/lists-feedback",
+            "dead-other",
+        );
+        let suffixed =
+            crate::name::aligned_live_name("/tmp/lists-feedback", "w7:p3", ["lists-feedback"])
+                .expect("suffixed name");
+        let (adopted, kelpie) =
+            adopt_unnamed_claiming(store, "/tmp/lists-feedback", None, &suffixed);
+        assert_ne!(adopted.logical_agent_id, other.logical_agent_id);
+        assert_eq!(
+            kelpie
+                .store()
+                .agent_address(adopted.logical_agent_id)
+                .expect("name"),
+            suffixed
+        );
     }
 
     #[test]

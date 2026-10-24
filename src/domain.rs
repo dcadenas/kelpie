@@ -358,7 +358,8 @@ pub struct StartIntent {
 pub struct AdoptIntent {
     pub pane_id: String,
     pub expected_terminal_id: String,
-    /// When set, must equal the live Herdr name or the derived claim name.
+    /// When set on an unnamed occupant, the name to claim (it must be legal and
+    /// not held by a live agent). On a named occupant it must equal the live name.
     /// When absent, adopt uses the observed Herdr name or a cwd-derived claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_name: Option<String>,
